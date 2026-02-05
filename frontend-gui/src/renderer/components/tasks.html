@@ -1,0 +1,80 @@
+<h2 data-i18n="TAB_TASKS"></h2>
+
+<!-- Task Creation -->
+<div class="panel-card">
+  <form id="task-form" class="panel-form">
+    <div class="panel-form-group" style="flex: 2;">
+        <input id="task-title" type="text" data-placeholder="TASK_TITLE_PLACEHOLDER" required />
+    </div>
+    <div class="panel-form-group">
+        <input id="task-expectation" type="number" data-placeholder="TASK_EXPECTATION_PLACEHOLDER" data-attrs="TASK_EXPECTATION_ID" />
+    </div>
+    <button class="panel-button panel-button--primary" type="submit" data-i18n="TASK_CREATE_BTN"></button>
+  </form>
+</div>
+
+<!-- Task List -->
+<div class="panel-block" style="background: transparent; border: none; padding: 0; box-shadow: none;">
+  <div class="panel-card-header">
+    <div class="panel-inline">
+        <strong data-i18n="TASKS_RECENT_LABEL"></strong>
+        <div class="task-filter panel-inline">
+            <span class="task-filter-label" data-i18n="TASK_FILTER_DATE_LABEL"></span>
+            <input id="task-filter-date" type="date" />
+            <span class="task-filter-label" data-i18n="TASK_FILTER_DAYS_LABEL"></span>
+            <input id="task-filter-days" type="number" value="1" data-placeholder="TASK_FILTER_DAYS_PLACEHOLDER" data-attrs="TASK_FILTER_DAYS" />
+            <button id="task-filter-clear" class="panel-button panel-button--small" data-i18n="TASK_FILTER_CLEAR_BTN"></button>
+        </div>
+        <button id="task-list-refresh" class="panel-button panel-button--small" data-i18n="BUTTON_REFRESH"></button>
+    </div>
+  </div>
+  
+  <!-- New Card List Container -->
+  <div id="task-list" class="task-card-list"></div>
+</div>
+
+<!-- Task Detail Drawer (Overlay) -->
+<div id="task-drawer" class="drawer-overlay">
+  <div class="drawer-panel">
+    <div class="drawer-header">
+      <h3 id="drawer-title" class="drawer-title" data-i18n="TASK_DRAWER_TITLE_PLACEHOLDER"></h3>
+      <button id="drawer-close" class="panel-button panel-button--small" data-i18n="BUTTON_CLOSE"></button>
+    </div>
+    
+    <div class="drawer-content">
+      <!-- Status & Actions -->
+      <div class="detail-section">
+        <h3 data-i18n="TASK_DRAWER_ACTIONS_TITLE"></h3>
+        <div class="panel-form-row" style="margin-bottom: 12px;">
+            <span id="drawer-status" class="panel-tag"></span>
+            <span id="drawer-time" style="font-size: 12px; color: var(--color_muted);"></span>
+        </div>
+        <div class="panel-inline">
+            <button id="action-done" class="panel-button panel-button--small" data-i18n="TASK_DONE_LABEL"></button>
+            <button id="action-cancel" class="panel-button panel-button--small" data-i18n="TASK_CANCEL_LABEL"></button>
+            <button id="action-resume" class="panel-button panel-button--small panel-button--primary" data-i18n="TASK_RESUME_LABEL"></button>
+        </div>
+      </div>
+
+      <!-- Execution Log / Steps -->
+      <div class="detail-section">
+        <h3 data-i18n="TASK_DRAWER_STEPS_TITLE"></h3>
+        <div id="drawer-steps" class="panel-list" style="max-height: none; border: none; background: transparent; padding: 0;">
+            <!-- Steps will be rendered here -->
+        </div>
+      </div>
+
+      <!-- Timeline -->
+      <div class="detail-section">
+        <h3 data-i18n="TASK_DRAWER_TIMELINE_TITLE"></h3>
+        <div id="drawer-timeline">
+            <!-- Timeline items -->
+        </div>
+      </div>
+    </div>
+    
+    <div class="drawer-footer">
+      <!-- Optional footer actions -->
+    </div>
+  </div>
+</div>

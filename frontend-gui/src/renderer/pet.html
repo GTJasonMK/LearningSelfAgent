@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN" class="pet-window-html">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="pet-window.css" />
+    <link rel="stylesheet" href="pet-animations.css" />
+    <title></title>
+  </head>
+  <body class="pet-window-body">
+    <div class="pet-layout">
+      <div class="pet-plan is-hidden">
+        <div class="pet-plan-slot" data-role="done"></div>
+        <div class="pet-plan-slot" data-role="running"></div>
+        <div class="pet-plan-slot" data-role="next"></div>
+        <div class="pet-plan-slot" data-role="next2"></div>
+      </div>
+
+      <div class="pet pet-window">
+        <img
+          class="pet-image"
+          src="../../public/image/leim.png"
+          alt="pet"
+          draggable="false"
+        />
+      </div>
+
+      <div class="pet-bubble pet-bubble-info is-hidden">
+        <div class="pet-bubble-content"></div>
+        <div class="pet-bubble-actions is-hidden">
+          <button class="pet-bubble-action pet-bubble-action-yes" type="button" data-i18n="BUTTON_YES"></button>
+          <button class="pet-bubble-action pet-bubble-action-no" type="button" data-i18n="BUTTON_NO"></button>
+        </div>
+      </div>
+
+      <div class="pet-chat is-hidden">
+        <input class="pet-chat-input" type="text" data-placeholder="PET_CHAT_PLACEHOLDER" />
+        <button class="pet-chat-send" type="button" data-i18n="BUTTON_SEND"></button>
+      </div>
+    </div>
+    <script type="module" src="pet.js"></script>
+  </body>
+</html>

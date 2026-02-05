@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="graph-visualizer.css" />
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <title data-i18n="PANEL_TITLE"></title>
+  </head>
+  <body class="panel-body">
+    <header class="panel-topbar">
+      <div class="panel-topbar-tabs is-hidden">
+        <button id="page-tab-world" class="panel-top-tab is-active" type="button" data-i18n="PAGE_WORLD"></button>
+        <button id="page-tab-state" class="panel-top-tab" type="button" data-i18n="PAGE_STATE"></button>
+      </div>
+      <div class="panel-topbar-right">
+        <div class="panel-window-controls">
+          <button id="panel-win-minimize" class="panel-window-button" type="button" data-title="WINDOW_MINIMIZE_TITLE">-</button>
+          <button id="panel-win-maximize" class="panel-window-button" type="button" data-title="WINDOW_MAXIMIZE_TITLE">[]</button>
+          <button id="panel-win-close" class="panel-window-button panel-window-button--danger" type="button" data-title="WINDOW_CLOSE_TITLE">x</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="panel-pages">
+      <!-- 首页：仅展示“进入主页面”，不直接暴露世界/状态标签（后续可演进为用户系统） -->
+      <div id="page-home" class="page is-visible">
+        <div class="panel-home">
+          <div class="panel-home-card">
+            <h1 class="panel-home-title" data-i18n="PANEL_HOME_TITLE"></h1>
+            <p class="panel-home-desc" data-i18n="PANEL_HOME_DESC"></p>
+            <button id="panel-enter-main" class="panel-button panel-button--primary panel-home-enter" type="button" data-i18n="PANEL_HOME_ENTER"></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 世界页：Agent 交互空间（按参考图布局） -->
+      <div id="page-world" class="page">
+        <div class="world-root">
+          <div class="world-main">
+            <div class="world-col-left">
+              <div class="world-box">
+                <div class="world-box-title" data-i18n="WORLD_TASK_PLAN_TITLE"></div>
+                <div id="world-task-plan" class="world-box-content"></div>
+              </div>
+              <div class="world-box">
+                <div class="world-box-title" data-i18n="WORLD_EVAL_PLAN_TITLE"></div>
+                <div id="world-eval-plan" class="world-box-content"></div>
+              </div>
+            </div>
+
+            <div class="world-col-center">
+              <div class="world-box world-box--fill">
+                <div class="world-box-title" data-i18n="WORLD_RESULT_TITLE"></div>
+                <div id="world-result" class="world-box-content">
+                  <div id="world-chat" class="world-chat"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="world-col-right">
+              <div class="world-box world-box--fill">
+                <div class="world-box-title" data-i18n="WORLD_THOUGHTS_TITLE"></div>
+                <div id="world-thoughts" class="world-box-content"></div>
+              </div>
+              <div class="world-box world-box--pet">
+                <div class="world-box-title" data-i18n="WORLD_PET_TITLE"></div>
+                <div class="world-pet-box">
+                  <img class="world-pet-image" src="../../public/image/leim.png" alt="pet" draggable="false" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="world-bottom">
+            <button id="world-upload" class="world-bottom-upload" type="button" data-i18n="WORLD_UPLOAD_BTN"></button>
+            <input id="world-input" class="world-bottom-input" type="text" data-placeholder="WORLD_INPUT_PLACEHOLDER" />
+            <button id="world-send" class="world-bottom-send" type="button" data-i18n="BUTTON_SEND"></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 状态页：复用当前主面板（包含所有现有标签页） -->
+      <div id="page-state" class="page">
+        <div class="app-shell">
+        <!-- Sidebar Navigation -->
+        <aside class="app-sidebar">
+          <nav class="app-nav">
+            <button class="nav-item is-active" data-target="tab-dashboard">
+              <span data-i18n="TAB_DASHBOARD"></span>
+            </button>
+            <button class="nav-item" data-target="tab-tasks">
+              <span data-i18n="TAB_TASKS"></span>
+            </button>
+            <button class="nav-item" data-target="tab-memory">
+              <span data-i18n="TAB_MEMORY"></span>
+            </button>
+            <button class="nav-item" data-target="tab-skills">
+              <span data-i18n="TAB_SKILLS"></span>
+            </button>
+            <button class="nav-item" data-target="tab-graph">
+              <span data-i18n="TAB_GRAPH"></span>
+            </button>
+            <button class="nav-item" data-target="tab-eval">
+              <span data-i18n="TAB_EVAL"></span>
+            </button>
+            <button class="nav-item" data-target="tab-system">
+              <span data-i18n="TAB_SYSTEM"></span>
+            </button>
+            <button class="nav-item" data-target="tab-settings">
+              <span data-i18n="TAB_SETTINGS"></span>
+            </button>
+          </nav>
+        </aside>
+
+        <!-- Main Content Wrapper -->
+        <div class="app-content-wrapper">
+          <main class="app-main">
+            <section id="tab-dashboard" class="panel-section is-visible" data-src="components/dashboard.html"></section>
+            <section id="tab-tasks" class="panel-section" data-src="components/tasks.html"></section>
+            <section id="tab-memory" class="panel-section" data-src="components/memory.html"></section>
+            <section id="tab-skills" class="panel-section" data-src="components/skills.html"></section>
+            <section id="tab-graph" class="panel-section" data-src="components/graph.html"></section>
+            <section id="tab-eval" class="panel-section" data-src="components/eval.html"></section>
+            <section id="tab-system" class="panel-section" data-src="components/system.html"></section>
+            <section id="tab-settings" class="panel-section" data-src="components/settings.html"></section>
+          </main>
+        </div>
+      </div>
+      </div>
+    </div>
+    <script type="module" src="panel.js"></script>
+  </body>
+</html>

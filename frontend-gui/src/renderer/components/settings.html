@@ -1,0 +1,57 @@
+<h2 data-i18n="TAB_SETTINGS"></h2>
+<div class="panel-card settings-card">
+  <p class="settings-desc" data-i18n="SETTINGS_DESC"></p>
+
+  <div class="settings-section">
+    <div class="settings-section-header">
+      <div class="settings-section-title" data-i18n="SETTINGS_LLM_TITLE"></div>
+      <div class="settings-section-status">
+        <span data-i18n="CONFIG_STATUS_LABEL"></span>
+        <span id="llm-config-status" class="settings-status-pill" data-i18n="DASH"></span>
+      </div>
+    </div>
+
+    <form id="llm-config-form" class="settings-form">
+      <div class="settings-row">
+        <label class="settings-label" for="llm-config-provider" data-i18n="LLM_CONFIG_PROVIDER_LABEL"></label>
+        <input id="llm-config-provider" type="text" data-placeholder="LLM_CONFIG_PROVIDER_PLACEHOLDER" />
+        <label class="settings-clear">
+          <input id="llm-config-provider-clear" type="checkbox" />
+          <span data-i18n="LLM_CONFIG_CLEAR_LABEL"></span>
+        </label>
+      </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="llm-config-api-key" data-i18n="LLM_CONFIG_API_KEY_LABEL"></label>
+        <input id="llm-config-api-key" type="password" data-placeholder="LLM_CONFIG_API_KEY_PLACEHOLDER" />
+        <label class="settings-clear">
+          <input id="llm-config-api-key-clear" type="checkbox" />
+          <span data-i18n="LLM_CONFIG_CLEAR_LABEL"></span>
+        </label>
+      </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="llm-config-base-url" data-i18n="LLM_CONFIG_BASE_URL_LABEL"></label>
+        <input id="llm-config-base-url" type="text" data-placeholder="LLM_CONFIG_BASE_URL_PLACEHOLDER" />
+        <label class="settings-clear">
+          <input id="llm-config-base-url-clear" type="checkbox" />
+          <span data-i18n="LLM_CONFIG_CLEAR_LABEL"></span>
+        </label>
+      </div>
+
+      <div class="settings-row">
+        <label class="settings-label" for="llm-config-model" data-i18n="LLM_CONFIG_MODEL_LABEL"></label>
+        <input id="llm-config-model" type="text" data-placeholder="LLM_CONFIG_MODEL_PLACEHOLDER" />
+        <label class="settings-clear">
+          <input id="llm-config-model-clear" type="checkbox" />
+          <span data-i18n="LLM_CONFIG_CLEAR_LABEL"></span>
+        </label>
+      </div>
+
+      <div class="settings-actions">
+        <button id="llm-config-load" class="panel-button" type="button" data-i18n="LLM_CONFIG_LOAD_LABEL"></button>
+        <button id="llm-config-save" class="panel-button panel-button--primary" type="submit" data-i18n="LLM_CONFIG_SAVE_LABEL"></button>
+      </div>
+    </form>
+  </div>
+</div>

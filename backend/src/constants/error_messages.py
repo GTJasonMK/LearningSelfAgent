@@ -1,0 +1,65 @@
+# -*- coding: utf-8 -*-
+"""
+错误代码和错误信息常量。
+
+包含：
+- HTTP_STATUS_*: HTTP 状态码
+- ERROR_CODE_*: 业务错误代码
+- ERROR_MESSAGE_*: 错误信息
+"""
+
+from typing import Final
+
+# HTTP 状态码
+HTTP_STATUS_BAD_REQUEST: Final = 400
+HTTP_STATUS_FORBIDDEN: Final = 403
+HTTP_STATUS_NOT_FOUND: Final = 404
+
+# 错误代码
+ERROR_CODE_NOT_FOUND: Final = "NOT_FOUND"
+ERROR_CODE_INVALID_GRAPH_EDGE: Final = "INVALID_GRAPH_EDGE"
+ERROR_CODE_INVALID_REQUEST: Final = "INVALID_REQUEST"
+ERROR_CODE_FORBIDDEN: Final = "FORBIDDEN"
+
+# 错误信息 - 任务相关
+ERROR_MESSAGE_TASK_NOT_FOUND: Final = "任务不存在"
+ERROR_MESSAGE_TASK_STEP_NOT_FOUND: Final = "步骤不存在"
+ERROR_MESSAGE_PERMISSION_DENIED: Final = "权限不足"
+ERROR_MESSAGE_INVALID_STATUS: Final = "非法状态"
+
+# 错误信息 - Prompt 相关
+ERROR_MESSAGE_PROMPT_NOT_FOUND: Final = "提示词不存在"
+ERROR_MESSAGE_PROMPT_RENDER_FAILED: Final = "提示词渲染失败"
+
+# 错误信息 - LLM 相关
+ERROR_MESSAGE_LLM_PROVIDER_UNAVAILABLE: Final = "LLM调用不可用"
+ERROR_MESSAGE_LLM_SDK_MISSING: Final = "OpenAI SDK 未安装"
+ERROR_MESSAGE_LLM_API_KEY_MISSING: Final = "OPENAI_API_KEY 未配置"
+ERROR_MESSAGE_LLM_CALL_FAILED: Final = "LLM调用失败"
+ERROR_MESSAGE_LLM_CHAT_MESSAGE_MISSING: Final = "缺少 message/messages"
+
+# 错误信息 - Chat 相关
+ERROR_MESSAGE_CHAT_MESSAGE_MISSING: Final = "聊天内容不能为空"
+ERROR_MESSAGE_CHAT_ROLE_INVALID: Final = "role 只能是 system/user/assistant"
+ERROR_MESSAGE_CHAT_QUERY_MISSING: Final = "q 不能为空"
+
+# 错误信息 - Action 相关
+ERROR_MESSAGE_ACTION_UNSUPPORTED: Final = "不支持的动作类型"
+ERROR_MESSAGE_COMMAND_FAILED: Final = "命令执行失败"
+
+# 错误信息 - 知识相关
+ERROR_MESSAGE_EXPECTATION_NOT_FOUND: Final = "期望不存在"
+ERROR_MESSAGE_EVAL_NOT_FOUND: Final = "评估不存在"
+ERROR_MESSAGE_MEMORY_NOT_FOUND: Final = "记忆不存在"
+ERROR_MESSAGE_MEMORY_CONTENT_MISSING: Final = "记忆内容不能为空"
+ERROR_MESSAGE_SKILL_NOT_FOUND: Final = "技能不存在"
+ERROR_MESSAGE_NODE_NOT_FOUND: Final = "节点不存在"
+ERROR_MESSAGE_EDGE_NOT_FOUND: Final = "关系不存在"
+ERROR_MESSAGE_RECORD_NOT_FOUND: Final = "记录不存在"
+
+# 错误信息 - 工具相关
+ERROR_MESSAGE_TOOL_NOT_FOUND: Final = "工具不存在"
+ERROR_MESSAGE_TOOL_REQUIRED: Final = "缺少工具标识"
+
+# 错误信息 - 通用
+ERROR_MESSAGE_NOT_FOUND: Final = "资源不存在"

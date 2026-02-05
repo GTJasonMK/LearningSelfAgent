@@ -1,0 +1,66 @@
+<h2 data-i18n="TAB_GRAPH"></h2>
+<div class="panel-block">
+  <div data-i18n="GRAPH_DESC"></div>
+
+  <!-- 可视化区域 -->
+  <div class="graph-container" id="graph-visualizer-container">
+    <div class="graph-toolbar">
+      <button id="graph-zoom-in" class="graph-toolbar-btn" data-title="GRAPH_ZOOM_IN_TITLE">+</button>
+      <button id="graph-zoom-out" class="graph-toolbar-btn" data-title="GRAPH_ZOOM_OUT_TITLE">-</button>
+      <button id="graph-reset" class="graph-toolbar-btn" data-title="GRAPH_ZOOM_RESET_TITLE">O</button>
+    </div>
+  </div>
+
+  <!-- 统计信息 -->
+  <div class="panel-status">
+    <span data-i18n="GRAPH_NODES_COUNT_LABEL"></span><span id="graph-nodes" data-i18n="DASH"></span>
+    <span data-i18n="GRAPH_EDGES_COUNT_LABEL"></span><span id="graph-edges" data-i18n="DASH"></span>
+    <button id="graph-refresh" class="panel-button panel-button--small" data-i18n="BUTTON_REFRESH"></button>
+  </div>
+
+  <!-- 节点管理 -->
+  <details class="panel-details">
+    <summary data-i18n="GRAPH_NODES_LIST_LABEL"></summary>
+    <form id="graph-node-form" class="panel-form">
+      <input id="graph-node-label" type="text" data-placeholder="GRAPH_NODE_LABEL_PLACEHOLDER" required />
+      <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_ADD_NODE"></button>
+    </form>
+    <div class="panel-status">
+      <span data-i18n="GRAPH_NODES_LIST_LABEL"></span>
+      <button id="graph-nodes-refresh" class="panel-button panel-button--small" data-i18n="BUTTON_REFRESH"></button>
+    </div>
+    <ul id="graph-nodes-list" class="panel-list"></ul>
+    <details class="panel-details">
+      <summary data-i18n="GRAPH_NODE_UPDATE_TITLE"></summary>
+      <form id="graph-node-update-form" class="panel-form">
+        <input id="graph-node-update-id" type="number" data-placeholder="GRAPH_NODE_UPDATE_ID_PLACEHOLDER" data-attrs="GRAPH_NODE_ID" required />
+        <input id="graph-node-update-label" type="text" data-placeholder="GRAPH_NODE_UPDATE_LABEL_PLACEHOLDER" required />
+        <button class="panel-button" type="submit" data-i18n="BUTTON_UPDATE_NODE"></button>
+      </form>
+    </details>
+  </details>
+
+  <!-- 关系管理 -->
+  <details class="panel-details">
+    <summary data-i18n="GRAPH_EDGES_LIST_LABEL"></summary>
+    <form id="graph-edge-form" class="panel-form">
+      <input id="graph-edge-source" type="number" data-placeholder="GRAPH_EDGE_SOURCE_PLACEHOLDER" data-attrs="GRAPH_EDGE_SOURCE" required />
+      <input id="graph-edge-target" type="number" data-placeholder="GRAPH_EDGE_TARGET_PLACEHOLDER" data-attrs="GRAPH_EDGE_TARGET" required />
+      <input id="graph-edge-relation" type="text" data-placeholder="GRAPH_EDGE_RELATION_PLACEHOLDER" required />
+      <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_ADD_EDGE"></button>
+    </form>
+    <div class="panel-status">
+      <span data-i18n="GRAPH_EDGES_LIST_LABEL"></span>
+      <button id="graph-edges-refresh" class="panel-button panel-button--small" data-i18n="BUTTON_REFRESH"></button>
+    </div>
+    <ul id="graph-edges-list" class="panel-list"></ul>
+    <details class="panel-details">
+      <summary data-i18n="GRAPH_EDGE_UPDATE_TITLE"></summary>
+      <form id="graph-edge-update-form" class="panel-form">
+        <input id="graph-edge-update-id" type="number" data-placeholder="GRAPH_EDGE_UPDATE_ID_PLACEHOLDER" data-attrs="GRAPH_EDGE_ID" required />
+        <input id="graph-edge-update-relation" type="text" data-placeholder="GRAPH_EDGE_UPDATE_RELATION_PLACEHOLDER" required />
+        <button class="panel-button" type="submit" data-i18n="BUTTON_UPDATE_EDGE"></button>
+      </form>
+    </details>
+  </details>
+</div>

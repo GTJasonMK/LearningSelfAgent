@@ -1,0 +1,57 @@
+<h2 data-i18n="TAB_DASHBOARD"></h2>
+<div class="dashboard-grid">
+  <!-- Status Card -->
+  <div class="panel-card dashboard-card">
+    <div class="panel-card-header">
+      <span class="panel-card-title" data-i18n="STATUS_BACKEND_LABEL"></span>
+      <span id="dashboard-backend-status" class="panel-tag panel-tag--accent" data-i18n="LOADING"></span>
+    </div>
+    <div class="panel-card-body">
+      <div class="dashboard-stat">
+        <span class="dashboard-stat-label" data-i18n="STATUS_TASK_COUNT_LABEL"></span>
+        <strong id="dashboard-task-count" class="dashboard-stat-value" data-i18n="DASH"></strong>
+      </div>
+      <div class="dashboard-stat">
+        <span class="dashboard-stat-label" data-i18n="STATUS_TASK_CURRENT_LABEL"></span>
+        <strong id="dashboard-task-current" class="dashboard-stat-value" data-i18n="DASH"></strong>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quick Actions -->
+  <div class="panel-card dashboard-card">
+    <div class="panel-card-header">
+      <span class="panel-card-title" data-i18n="DASHBOARD_QUICK_ACTIONS"></span>
+    </div>
+    <div class="panel-card-body dashboard-actions">
+      <button class="panel-button panel-button--primary" onclick="document.querySelector('[data-target=tab-tasks]').click()">
+        + <span data-i18n="TASK_NEW_LABEL"></span>
+      </button>
+      <button class="panel-button" id="dashboard-refresh-btn" data-i18n="DASHBOARD_REFRESH_STATUS"></button>
+    </div>
+  </div>
+</div>
+
+<div class="panel-card dashboard-wide-card">
+  <div class="panel-card-header">
+    <span class="panel-card-title" data-i18n="DASHBOARD_AGENT_BRAIN_TITLE"></span>
+  </div>
+  <div class="panel-card-body">
+    <div class="dashboard-brain-meta" id="dashboard-agent-meta" data-i18n="DASHBOARD_AGENT_BRAIN_PLACEHOLDER"></div>
+    <div class="dashboard-brain-grid">
+      <div class="dashboard-brain-col">
+        <div class="dashboard-brain-title" data-i18n="DASHBOARD_AGENT_PLAN_TITLE"></div>
+        <div id="dashboard-agent-plan" class="panel-list"></div>
+      </div>
+      <div class="dashboard-brain-col">
+        <div class="dashboard-brain-title" data-i18n="DASHBOARD_AGENT_THOUGHTS_TITLE"></div>
+        <div id="dashboard-agent-thoughts" class="panel-list"></div>
+      </div>
+    </div>
+
+    <div class="dashboard-brain-activity">
+      <div class="dashboard-brain-title" data-i18n="DASHBOARD_ACTIVITY_TITLE"></div>
+      <div id="dashboard-activity" class="panel-list"></div>
+    </div>
+  </div>
+</div>

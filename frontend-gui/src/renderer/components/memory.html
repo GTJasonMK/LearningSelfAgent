@@ -1,0 +1,48 @@
+<h2 data-i18n="TAB_MEMORY"></h2>
+
+<!-- Write Memory -->
+<div class="panel-card">
+  <form id="memory-form" class="panel-form" style="align-items: flex-end;">
+    <div class="panel-form-group" style="flex: 1;">
+        <textarea id="memory-content" data-placeholder="MEMORY_CONTENT_PLACEHOLDER" required rows="2" style="min-height: 80px;"></textarea>
+    </div>
+    <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_WRITE"></button>
+  </form>
+</div>
+
+<!-- Search & List -->
+<div class="panel-block" style="background: transparent; border: none; padding: 0; box-shadow: none;">
+  <div class="panel-card-header">
+    <div class="panel-inline" style="flex: 1;">
+        <strong data-i18n="MEMORY_LIST_LABEL"></strong>
+        <span id="memory-count" class="panel-tag" data-i18n="DASH"></span>
+    </div>
+    <form id="memory-search-form" class="panel-inline" style="flex: 1; justify-content: flex-end;">
+        <input id="memory-search" type="text" data-placeholder="MEMORY_SEARCH_PLACEHOLDER" style="width: 200px;" />
+        <button class="panel-button panel-button--small" type="submit" data-i18n="BUTTON_SEARCH"></button>
+        <button id="memory-list-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+    </form>
+  </div>
+  
+  <div id="memory-list" class="note-card-list">
+      <!-- Memory items will be here -->
+  </div>
+</div>
+
+<!-- Memory Detail Drawer -->
+<div id="memory-drawer" class="drawer-overlay">
+  <div class="drawer-panel" style="width: 560px;">
+    <div class="drawer-header">
+      <h3 id="drawer-memory-title" class="drawer-title" data-i18n="MEMORY_DRAWER_TITLE_PLACEHOLDER"></h3>
+      <button id="drawer-memory-close" class="panel-button panel-button--small" data-i18n="BUTTON_CLOSE"></button>
+    </div>
+    <div class="drawer-content">
+      <div id="drawer-memory-meta" class="panel-inline" style="gap: 8px; flex-wrap: wrap;"></div>
+      <pre id="drawer-memory-content" class="panel-pre" style="margin-top: 12px;"></pre>
+    </div>
+    <div class="drawer-footer">
+      <button id="drawer-memory-copy" class="panel-button panel-button--small" data-i18n="BUTTON_COPY"></button>
+      <button id="drawer-memory-delete" class="panel-button panel-button--small" data-i18n="BUTTON_DELETE"></button>
+    </div>
+  </div>
+</div>

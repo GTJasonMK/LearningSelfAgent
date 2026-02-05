@@ -1,0 +1,409 @@
+.pet-window-html {
+  /* 桌宠窗口布局参数（只要改这里就能整体微调相对位置/尺寸） */
+  --pet-body-padding: 8px;
+  --pet-grid-col-plan: 150px;
+  --pet-grid-col-pet: 190px;
+  --pet-grid-gap-x: 12px;
+  --pet-grid-gap-y: 8px;
+
+  --pet-image-width: 150px;
+
+  /* 气泡：位置与尺寸 */
+  --pet-bubble-grid-column: 2;
+  --pet-bubble-min-width: 160px;
+  --pet-bubble-max-width: 420px;
+  /* 气泡最大高度上限（视觉上别太高），实际还会再被“row1 剩余空间”限制，确保不压到输入框。 */
+  --pet-bubble-max-height-cap: 300px;
+  --pet-bubble-offset-x: 150px;
+  --pet-bubble-offset-y: 200px;
+
+  /* 规划栏：顶部对齐到气泡顶部，且不压到输入框（超出则滚动） */
+  --pet-plan-offset-x: 30px;
+  --pet-plan-offset-y: 250px;
+  --pet-plan-max-height-cap: 300px;
+
+  /* 输入框：位置与尺寸 */
+  --pet-chat-grid-column: 2 / -1;
+  --pet-chat-width: 420px;
+  --pet-chat-offset-x: -150px;
+  --pet-chat-input-height: 28px;
+  --pet-chat-font-size: 13px;
+  --pet-chat-gap: 6px;
+}
+
+.pet-window-html,
+.pet-window-body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+  box-sizing: border-box;
+}
+
+.pet-window-html *,
+.pet-window-html *::before,
+.pet-window-html *::after {
+  box-sizing: border-box;
+}
+
+.pet-window-body {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: var(--pet-body-padding);
+  color: var(--color_ink);
+  font-family: var(--font_primary);
+}
+
+.pet-layout {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  /*
+   * 按草图的相对关系排布：
+   * - 左：规划栏（竖条）
+   * - 中：桌宠形象
+   * - 右上：消息气泡
+   * - 底部：用户输入框（横向一条）
+   */
+  grid-template-columns: var(--pet-grid-col-plan) var(--pet-grid-col-pet) minmax(0, 1fr);
+  grid-template-rows: 1fr auto;
+  column-gap: var(--pet-grid-gap-x);
+  row-gap: var(--pet-grid-gap-y);
+  align-items: stretch;
+  justify-items: start;
+}
+
+.pet-plan {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: start;
+  width: 100%;
+  height: auto;
+  max-height: min(
+    var(--pet-plan-max-height-cap),
+    calc(100% - var(--pet-plan-offset-y))
+  );
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--color_bubble_border);
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 10px 24px var(--color_shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.2;
+  z-index: 2;
+  /* 计划栏仅展示：不参与交互，避免挡住用户点击 */
+  pointer-events: none;
+  user-select: none;
+  /* 防止内容溢出到输入框区域：超出则在框内滚动（仅展示滚动条，不参与交互） */
+  overflow: auto;
+  transform: translate(var(--pet-plan-offset-x), var(--pet-plan-offset-y));
+}
+
+.pet-plan.is-hidden {
+  display: none;
+}
+
+.pet-plan-slot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pet-plan-slot:empty {
+  /* 不强求显示 4 条：没有内容的 slot 直接隐藏，避免“只有点没文字”的空占位 */
+  display: none;
+}
+
+.pet-plan-slot::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--color_muted);
+  flex: 0 0 auto;
+}
+
+.pet-plan-slot[data-status="done"] {
+  opacity: 0.9;
+}
+.pet-plan-slot[data-status="done"]::before {
+  background: var(--color_accent_deep);
+}
+
+.pet-plan-slot[data-status="running"] {
+  opacity: 1;
+  font-weight: 600;
+}
+.pet-plan-slot[data-status="running"]::before {
+  background: var(--color_accent);
+}
+
+.pet-plan-slot[data-status="pending"] {
+  opacity: 0.75;
+}
+.pet-plan-slot[data-status="pending"]::before {
+  background: var(--color_muted);
+}
+
+.pet-plan-slot[data-status="failed"] {
+  opacity: 1;
+}
+.pet-plan-slot[data-status="failed"]::before {
+  background: var(--color_border);
+}
+
+.pet-window {
+  grid-column: 2;
+  grid-row: 1;
+  width: var(--pet-grid-col-pet);
+  height: 100%;
+  background: transparent;
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.pet-image {
+  display: block;
+  width: var(--pet-image-width);
+  height: auto;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+.pet-bubble {
+  grid-column: var(--pet-bubble-grid-column);
+  grid-row: 1;
+  /* 关键：气泡尺寸变化时只向右/下扩展（锚定左上角），避免文字变长时整体向左“顶回去” */
+  justify-self: start;
+  align-self: start;
+  /* 让气泡宽度随内容变化：短内容更紧凑，长内容自动换行且不无限变宽 */
+  display: flex;
+  flex-direction: column;
+  width: fit-content;
+  min-width: var(--pet-bubble-min-width);
+  max-width: min(var(--pet-bubble-max-width), 100%);
+  /* 不能超过输入框所在位置：max-height 受 row1 剩余空间限制；达到上限后内部滚动 */
+  max-height: min(
+    var(--pet-bubble-max-height-cap),
+    calc(100% - var(--pet-bubble-offset-y))
+  );
+  padding: 0;
+  border-radius: 16px;
+  border: 1px solid var(--color_bubble_border);
+  background: var(--color_bubble);
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--color_ink);
+  text-align: left;
+  box-shadow: 0 10px 24px var(--color_shadow);
+  overflow: hidden;
+  /* 允许选中文字并复制 */
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+  z-index: 2;
+  transform-origin: top left;
+  transform: translate(var(--pet-bubble-offset-x), var(--pet-bubble-offset-y));
+}
+
+.pet-bubble-content {
+  padding: 10px 14px;
+  /* 在 max-height 受限时，仅正文区域滚动，按钮固定在底部 */
+  overflow: auto;
+  min-height: 0;
+  /* Markdown 渲染后由 HTML 控制换行；软换行由渲染器插入 <br> */
+  white-space: normal;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* Markdown 基础样式（桌宠气泡） */
+.pet-bubble-content.md {
+  line-height: 1.45;
+}
+
+.pet-bubble-content.md p {
+  margin: 0 0 8px;
+}
+.pet-bubble-content.md p:last-child {
+  margin-bottom: 0;
+}
+
+.pet-bubble-content.md h1,
+.pet-bubble-content.md h2,
+.pet-bubble-content.md h3,
+.pet-bubble-content.md h4,
+.pet-bubble-content.md h5,
+.pet-bubble-content.md h6 {
+  margin: 8px 0 6px;
+  font-size: 12px;
+  line-height: 1.25;
+}
+.pet-bubble-content.md h1 { font-size: 14px; }
+.pet-bubble-content.md h2 { font-size: 13px; }
+
+.pet-bubble-content.md ul,
+.pet-bubble-content.md ol {
+  margin: 6px 0 6px 18px;
+  padding: 0;
+}
+.pet-bubble-content.md li {
+  margin: 2px 0;
+}
+
+.pet-bubble-content.md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 6px;
+  background: rgba(31, 28, 23, 0.08);
+}
+
+.pet-bubble-content.md pre {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(31, 28, 23, 0.06);
+  overflow: auto;
+}
+.pet-bubble-content.md pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.pet-bubble-content.md blockquote {
+  margin: 8px 0;
+  padding: 6px 10px;
+  border-left: 3px solid rgba(31, 28, 23, 0.18);
+  color: rgba(31, 28, 23, 0.78);
+  background: rgba(31, 28, 23, 0.04);
+  border-radius: 10px;
+}
+
+.pet-bubble-content.md a {
+  color: var(--color_accent_deep);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.pet-bubble-content.md hr {
+  border: 0;
+  border-top: 1px solid rgba(31, 28, 23, 0.14);
+  margin: 10px 0;
+}
+
+.pet-bubble-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid rgba(31, 28, 23, 0.12);
+  user-select: none;
+}
+
+.pet-bubble-actions.is-hidden {
+  display: none;
+}
+
+.pet-bubble-action.is-hidden {
+  display: none;
+}
+
+.pet-bubble-action {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(31, 28, 23, 0.28);
+  background: rgba(255, 255, 255, 0.45);
+  color: var(--color_ink);
+  cursor: pointer;
+}
+
+.pet-bubble-action:hover {
+  border-color: var(--color_accent);
+}
+
+.pet-bubble.is-hidden {
+  display: none;
+}
+
+.pet-bubble-content::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.pet-bubble-content::-webkit-scrollbar-thumb {
+  background: rgba(31, 28, 23, 0.25);
+  border-radius: 999px;
+}
+
+.pet-bubble-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pet-chat {
+  grid-column: var(--pet-chat-grid-column);
+  grid-row: 2;
+  display: flex;
+  align-items: center;
+  gap: var(--pet-chat-gap);
+  /* 输入框：对称贴近桌宠区域（不覆盖左侧规划栏），且不再需要外层“框” */
+  justify-self: center;
+  width: min(var(--pet-chat-width), 100%);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  z-index: 2;
+  transform: translateX(var(--pet-chat-offset-x));
+}
+
+.pet-chat.is-hidden {
+  display: none;
+}
+
+.pet-chat-input {
+  flex: 1;
+  height: var(--pet-chat-input-height);
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(31, 28, 23, 0.38);
+  background: rgba(255, 255, 255, 0.65);
+  color: var(--color_ink);
+  outline: none;
+  font-size: var(--pet-chat-font-size);
+}
+
+.pet-chat-input:focus {
+  border-color: var(--color_accent);
+  box-shadow: 0 0 0 2px var(--color_accent_soft);
+}
+
+.pet-chat-send {
+  height: var(--pet-chat-input-height);
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(31, 28, 23, 0.38);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--color_ink);
+  cursor: pointer;
+  user-select: none;
+}
+
+.pet-chat-send:hover {
+  border-color: var(--color_accent);
+}

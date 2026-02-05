@@ -1,0 +1,107 @@
+<h2 data-i18n="TAB_SKILLS"></h2>
+
+<div class="panel-block" style="background: transparent; border: none; padding: 0; box-shadow: none;">
+  <!-- Toolbar -->
+  <div class="panel-card-header">
+    <div class="panel-inline">
+        <strong data-i18n="SKILLS_LIST_LABEL"></strong>
+        <span id="skills-count" class="panel-tag" data-i18n="DASH"></span>
+    </div>
+    <div class="panel-inline">
+        <button id="skills-create-btn" class="panel-button panel-button--primary panel-button--small" data-i18n="SKILLS_CREATE_BTN"></button>
+        <button id="skills-refresh" class="panel-button panel-button--small" data-i18n="BUTTON_REFRESH"></button>
+    </div>
+  </div>
+
+  <!-- Search -->
+  <form id="skills-search-form" class="panel-form" style="margin-bottom: var(--spacing-lg);">
+    <input id="skills-search" type="text" data-placeholder="SKILLS_SEARCH_PLACEHOLDER" style="max-width: 400px;" />
+    <button class="panel-button" type="submit" data-i18n="BUTTON_SEARCH"></button>
+  </form>
+
+  <!-- Skills (按类目分组展示，内部仍是网格卡片) -->
+  <div id="skills-list" class="skills-groups"></div>
+</div>
+
+<!-- Skill Detail Drawer -->
+<div id="skill-drawer" class="drawer-overlay">
+  <div class="drawer-panel" style="width: 600px;"> <!-- Wider drawer for skills -->
+    <div class="drawer-header">
+      <h3 id="drawer-skill-title" class="drawer-title" data-i18n="SKILLS_DRAWER_TITLE_PLACEHOLDER"></h3>
+      <button id="drawer-skill-close" class="panel-button panel-button--small" data-i18n="BUTTON_CLOSE"></button>
+    </div>
+    <div class="drawer-content">
+        <div class="detail-section">
+            <p id="drawer-skill-desc" style="font-size: 14px; color: var(--color_muted); font-style: italic;" data-i18n="SKILLS_NO_DESC"></p>
+            <div id="drawer-skill-meta" class="panel-inline" style="margin-top: 12px;"></div>
+        </div>
+
+        <div class="detail-section">
+            <h3 data-i18n="SKILLS_IO_SPEC_LABEL"></h3>
+            <div class="panel-detail-grid">
+                <div class="panel-detail-item">
+                    <div class="panel-detail-label" data-i18n="SKILLS_INPUTS_LABEL"></div>
+                    <div id="drawer-skill-inputs" class="panel-detail-value" data-i18n="DASH"></div>
+                </div>
+                <div class="panel-detail-item">
+                    <div class="panel-detail-label" data-i18n="SKILLS_OUTPUTS_LABEL"></div>
+                    <div id="drawer-skill-outputs" class="panel-detail-value" data-i18n="DASH"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="detail-section">
+            <h3 data-i18n="SKILLS_STEPS_LABEL"></h3>
+            <div id="drawer-skill-steps" class="panel-list" style="background: transparent; border: none; padding: 0;"></div>
+        </div>
+        
+        <div class="detail-section">
+            <button id="action-delete-skill" class="panel-button" style="color: var(--color_alert); border-color: var(--color_alert);" data-i18n="SKILLS_DELETE_BTN"></button>
+        </div>
+    </div>
+  </div>
+</div>
+
+<!-- Create Skill Modal/Drawer (Reusing drawer for simplicity, or a separate section) -->
+<!-- For now, we will stick to the 'Full Create' form inside a details block in the main view or toggle it -->
+<div id="skill-create-panel" class="panel-card" style="display: none; margin-bottom: 20px;">
+    <div class="panel-card-header">
+        <h3 data-i18n="SKILLS_CREATE_TITLE"></h3>
+        <button id="skill-create-cancel" class="panel-button panel-button--small" data-i18n="BUTTON_CANCEL"></button>
+    </div>
+    <form id="skills-full-form" class="panel-form-vertical">
+      <div class="panel-form-group">
+        <label data-i18n="SKILLS_FORM_NAME_LABEL"></label>
+        <input id="skills-full-name" type="text" data-placeholder="SKILLS_FULL_NAME_PLACEHOLDER" required />
+      </div>
+      <div class="panel-form-group">
+        <label data-i18n="SKILLS_FORM_DESC_LABEL"></label>
+        <input id="skills-full-description" type="text" data-placeholder="SKILLS_FULL_DESC_PLACEHOLDER" />
+      </div>
+      <div class="panel-form-row">
+        <div class="panel-form-group" style="flex: 1;">
+          <label data-i18n="SKILLS_FORM_SCOPE_LABEL"></label>
+          <input id="skills-full-scope" type="text" data-placeholder="SKILLS_FULL_SCOPE_PLACEHOLDER" />
+        </div>
+        <div class="panel-form-group" style="flex: 1;">
+          <label data-i18n="SKILLS_FORM_VERSION_LABEL"></label>
+          <input id="skills-full-version" type="text" data-attrs="SKILLS_FULL_VERSION" />
+        </div>
+      </div>
+      <div class="panel-form-row">
+        <div class="panel-form-group" style="flex: 1;">
+          <label data-i18n="SKILLS_FORM_INPUTS_LABEL"></label>
+          <input id="skills-full-inputs" type="text" data-placeholder="SKILLS_FULL_INPUTS_PLACEHOLDER" />
+        </div>
+        <div class="panel-form-group" style="flex: 1;">
+          <label data-i18n="SKILLS_FORM_OUTPUTS_LABEL"></label>
+          <input id="skills-full-outputs" type="text" data-placeholder="SKILLS_FULL_OUTPUTS_PLACEHOLDER" />
+        </div>
+      </div>
+      <div class="panel-form-group">
+        <label data-i18n="SKILLS_FORM_STEPS_LABEL"></label>
+        <textarea id="skills-full-steps" data-placeholder="SKILLS_FULL_STEPS_PLACEHOLDER" rows="4"></textarea>
+      </div>
+      <button class="panel-button panel-button--primary" type="submit" data-i18n="SKILLS_CREATE_SUBMIT"></button>
+    </form>
+</div>
