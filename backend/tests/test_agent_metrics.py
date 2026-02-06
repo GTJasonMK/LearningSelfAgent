@@ -126,14 +126,66 @@ class TestAgentMetrics(unittest.TestCase):
                     (tool_id, 2, 1, 11, 0, None, None, "in3", "out3", created_at),
                 )
 
-                # agent_review_records：pass + distill allow；fail
+                # agent_review_records：pass（allow/manual/deny）+ fail（deny）
                 conn.execute(
-                    "INSERT INTO agent_review_records (task_id, run_id, status, distill_status, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (1, 10, "pass", "allow", created_at),
+                    "INSERT INTO agent_review_records (task_id, run_id, status, distill_status, distill_notes, distill_evidence_refs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        10,
+                        "pass",
+                        "allow",
+                        "ok",
+                        json.dumps([{"kind": "output", "output_id": 1}], ensure_ascii=False),
+                        created_at,
+                    ),
                 )
                 conn.execute(
-                    "INSERT INTO agent_review_records (task_id, run_id, status, distill_status, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (2, 11, "fail", "deny", created_at),
+                    "INSERT INTO agent_review_records (task_id, run_id, status, distill_status, distill_notes, distill_evidence_refs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        10,
+                        "pass",
+                        "manual",
+                        "distill_score 未达门槛：默认不自动沉淀",
+                        "[]",
+                        created_at,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO agent_review_records (task_id, run_id, status, distill_status, distill_notes, distill_evidence_refs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        10,
+                        "pass",
+                        "manual",
+                        "distill 缺少可定位 evidence_refs：默认不自动沉淀",
+                        "[]",
+                        created_at,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO agent_review_records (task_id, run_id, status, distill_status, distill_notes, distill_evidence_refs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        10,
+                        "pass",
+                        "deny",
+                        "一次性任务，不沉淀",
+                        "[]",
+                        created_at,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO agent_review_records (task_id, run_id, status, distill_status, distill_notes, distill_evidence_refs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        2,
+                        11,
+                        "fail",
+                        "deny",
+                        "bad",
+                        "[]",
+                        created_at,
+                    ),
                 )
 
             metrics = compute_agent_metrics(since_days=30)
@@ -155,10 +207,17 @@ class TestAgentMetrics(unittest.TestCase):
         self.assertEqual(metrics["tool_calls"]["reuse_fail_calls"], 1)
         self.assertAlmostEqual(metrics["tool_calls"]["reuse_pass_rate"], 0.5, places=4)
 
-        self.assertEqual(metrics["reviews"]["total"], 2)
-        self.assertEqual(metrics["reviews"]["pass"], 1)
+        self.assertEqual(metrics["reviews"]["total"], 5)
+        self.assertEqual(metrics["reviews"]["pass"], 4)
         self.assertEqual(metrics["reviews"]["distill_allow"], 1)
-        self.assertAlmostEqual(metrics["reviews"]["distill_rate_among_pass"], 1.0, places=4)
+        self.assertEqual(metrics["reviews"]["distill_allow_with_evidence"], 1)
+        self.assertAlmostEqual(metrics["reviews"]["distill_evidence_coverage_among_allow"], 1.0, places=4)
+        self.assertEqual(metrics["reviews"]["distill_manual"], 2)
+        self.assertEqual(metrics["reviews"]["distill_deny"], 1)
+        self.assertAlmostEqual(metrics["reviews"]["distill_rate_among_pass"], 0.25, places=4)
+        self.assertEqual(metrics["reviews"]["distill_block_reasons_among_pass"].get("score_below_threshold"), 1)
+        self.assertEqual(metrics["reviews"]["distill_block_reasons_among_pass"].get("missing_evidence_refs"), 1)
+        self.assertEqual(metrics["reviews"]["distill_block_reasons_among_pass"].get("evaluator_denied"), 1)
 
     def test_metrics_agent_route(self):
         from backend.src.api.system.routes_metrics import metrics_agent

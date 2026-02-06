@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
@@ -26,6 +27,11 @@ from backend.src.repositories.task_runs_repo import get_task_run
 from backend.src.repositories.task_steps_repo import list_task_steps_for_run
 from backend.src.repositories.tasks_repo import get_task
 from backend.src.repositories.tool_call_records_repo import list_tool_calls_with_tool_name_by_run
+from backend.src.services.agent_review.review_normalize import (
+    apply_distill_gate,
+    filter_evidence_refs,
+    normalize_issues,
+)
 from backend.src.services.llm.llm_client import call_openai, resolve_default_model, sse_json
 from backend.src.services.skills.skills_publish import publish_skill_file
 from backend.src.services.skills.skills_upsert import upsert_skill_from_agent_payload
@@ -161,6 +167,35 @@ async def agent_evaluate_stream(payload: AgentEvaluateStreamRequest):
                 "allows": plan_obj.get("allows"),
                 "artifacts": plan_obj.get("artifacts"),
             }
+            plan_artifacts = plan_obj.get("artifacts") if isinstance(plan_obj.get("artifacts"), list) else []
+
+            # artifacts 检查（与后处理评估对齐）：为 evaluator 提供“落盘证据”
+            artifacts_check_workdir = ""
+            artifacts_check_items: List[dict] = []
+            missing_artifacts: List[str] = []
+
+            workdir = str(state_obj.get("workdir") or "").strip() if isinstance(state_obj, dict) else ""
+            if not workdir:
+                workdir = os.getcwd()
+            artifacts_check_workdir = workdir
+
+            for it in plan_artifacts:
+                rel = str(it or "").strip()
+                if not rel:
+                    continue
+                target = rel
+                if not os.path.isabs(target):
+                    target = os.path.abspath(os.path.join(workdir, target))
+                exists = bool(os.path.exists(target))
+                artifacts_check_items.append({"path": rel, "exists": exists})
+                if not exists:
+                    missing_artifacts.append(rel)
+
+            run_meta["artifacts_check"] = {
+                "workdir": artifacts_check_workdir,
+                "items": artifacts_check_items,
+                "missing": missing_artifacts,
+            }
 
             steps_compact: List[dict] = []
             for row in step_rows:
@@ -277,6 +312,8 @@ async def agent_evaluate_stream(payload: AgentEvaluateStreamRequest):
             distill_score: Optional[float] = None
             distill_status = ""
             distill_notes = ""
+            distill_evidence_refs: List[dict] = []
+            raw_distill_evidence_refs: object = None
 
             if not llm_ok:
                 status = "fail"
@@ -324,6 +361,7 @@ async def agent_evaluate_stream(payload: AgentEvaluateStreamRequest):
                     distill_notes = str(
                         distill_payload.get("reason") or distill_payload.get("notes") or ""
                     ).strip()
+                    raw_distill_evidence_refs = distill_payload.get("evidence_refs")
 
                 if not distill_status:
                     distill_status = _normalize_distill_status(obj.get("distill_status"))
@@ -346,27 +384,68 @@ async def agent_evaluate_stream(payload: AgentEvaluateStreamRequest):
                     if not summary:
                         summary = "评分未达标：需补齐验证与修复后再交付。"
 
-                # 知识沉淀前置条件：未通过任务评估(pass)则不允许沉淀（与 docs/agent 对齐）
-                if status != "pass":
-                    distill_status = AGENT_REVIEW_DISTILL_STATUS_DENY
-                    distill_score = 0.0
+                # 证据引用清洗：防止 LLM 胡编不存在的 id
+                valid_step_ids = set()
+                valid_output_ids = set()
+                valid_tool_call_ids = set()
+                try:
+                    valid_step_ids = {int(r["id"]) for r in (step_rows or []) if r and r["id"] is not None}
+                except Exception:
+                    valid_step_ids = set()
+                try:
+                    valid_output_ids = {int(r["id"]) for r in (output_rows or []) if r and r["id"] is not None}
+                except Exception:
+                    valid_output_ids = set()
+                try:
+                    valid_tool_call_ids = {int(r["id"]) for r in (tool_rows or []) if r and r["id"] is not None}
+                except Exception:
+                    valid_tool_call_ids = set()
+                artifact_paths = set()
+                try:
+                    artifact_paths = {str(x).strip() for x in (plan_artifacts or []) if str(x).strip()}
+                except Exception:
+                    artifact_paths = set()
 
-                # backward compatible：旧评估没有 distill 字段时，默认按历史语义（pass=允许沉淀）
-                if not distill_status:
-                    distill_status = (
-                        AGENT_REVIEW_DISTILL_STATUS_ALLOW if status == "pass" else AGENT_REVIEW_DISTILL_STATUS_DENY
-                    )
-                if distill_score is None:
-                    distill_score = float(pass_score or 0.0) if status == "pass" else 0.0
+                artifact_exists_by_path: dict[str, bool] = {}
+                for it in artifacts_check_items or []:
+                    if not isinstance(it, dict):
+                        continue
+                    p = str(it.get("path") or "").strip()
+                    if not p:
+                        continue
+                    exists_value = it.get("exists")
+                    if isinstance(exists_value, bool):
+                        artifact_exists_by_path[p] = bool(exists_value)
 
-                if (
-                    distill_status == AGENT_REVIEW_DISTILL_STATUS_ALLOW
-                    and distill_score is not None
-                    and distill_score < distill_threshold
-                ):
-                    distill_status = AGENT_REVIEW_DISTILL_STATUS_MANUAL
-                    if not distill_notes:
-                        distill_notes = "distill_score 未达门槛：默认不自动沉淀"
+                distill_evidence_refs = filter_evidence_refs(
+                    raw_distill_evidence_refs,
+                    valid_step_ids=valid_step_ids,
+                    valid_output_ids=valid_output_ids,
+                    valid_tool_call_record_ids=valid_tool_call_ids,
+                    valid_artifact_paths=artifact_paths,
+                    artifact_exists_by_path=artifact_exists_by_path,
+                    max_items=8,
+                )
+
+                issues = normalize_issues(
+                    issues,
+                    valid_step_ids=valid_step_ids,
+                    valid_output_ids=valid_output_ids,
+                    valid_tool_call_record_ids=valid_tool_call_ids,
+                    valid_artifact_paths=artifact_paths,
+                    artifact_exists_by_path=artifact_exists_by_path,
+                    max_items=50,
+                )
+
+                distill_status, distill_score, distill_notes = apply_distill_gate(
+                    review_status=status,
+                    pass_score=pass_score,
+                    distill_status=distill_status,
+                    distill_score=distill_score,
+                    distill_threshold=distill_threshold,
+                    distill_notes=distill_notes,
+                    distill_evidence_refs=distill_evidence_refs,
+                )
 
             # Step 2 done/failed -> Step 3 running
             for it in plan_items:
@@ -430,6 +509,7 @@ async def agent_evaluate_stream(payload: AgentEvaluateStreamRequest):
                 distill_score=distill_score,
                 distill_threshold=distill_threshold,
                 distill_notes=distill_notes,
+                distill_evidence_refs=distill_evidence_refs,
                 summary=str(summary or ""),
                 issues=issues,
                 next_actions=next_actions,
@@ -457,6 +537,7 @@ async def agent_evaluate_stream(payload: AgentEvaluateStreamRequest):
                     "distill_score": distill_score,
                     "distill_threshold": distill_threshold,
                     "distill_notes": distill_notes,
+                    "distill_evidence_refs": distill_evidence_refs,
                     "summary": summary,
                     "issues": issues,
                     "next_actions": next_actions,

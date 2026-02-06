@@ -115,6 +115,7 @@ def get_schema_sql() -> str:
         distill_score REAL,
         distill_threshold REAL,
         distill_notes TEXT,
+        distill_evidence_refs TEXT,
         summary TEXT,
         issues TEXT,
         next_actions TEXT,

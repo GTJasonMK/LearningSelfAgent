@@ -167,11 +167,286 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
                 (run_id,),
             ).fetchone()
             self.assertIsNotNone(review)
+            refs = json.loads(review["distill_evidence_refs"] or "[]")
+            self.assertEqual(refs, [{"kind": "output", "output_id": 1}])
             skill = conn.execute(
                 "SELECT * FROM skills_items WHERE name = ? ORDER BY id DESC LIMIT 1",
                 ("测试技能",),
             ).fetchone()
             self.assertIsNotNone(skill)
+
+    async def test_agent_evaluate_stream_distill_allow_but_missing_evidence_refs_should_skip_upsert(self):
+        from backend.src.storage import get_connection
+        from backend.src.main import create_app
+        from backend.src.api.utils import now_iso
+
+        created_at = now_iso()
+        with get_connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO tasks (title, status, created_at, expectation_id, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("测试任务", "done", created_at, None, created_at, created_at),
+            )
+            task_id = int(cursor.lastrowid)
+            cursor = conn.execute(
+                "INSERT INTO task_runs (task_id, status, summary, started_at, finished_at, created_at, updated_at, agent_plan, agent_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    "done",
+                    "test_run_skip_distill",
+                    created_at,
+                    created_at,
+                    created_at,
+                    created_at,
+                    json.dumps({"titles": ["一步"], "allows": [["task_output"]], "artifacts": []}, ensure_ascii=False),
+                    json.dumps({"message": "测试", "step_order": 1}, ensure_ascii=False),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO task_steps (task_id, run_id, title, status, detail, result, error, attempts, started_at, finished_at, step_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    run_id,
+                    "输出结果",
+                    "done",
+                    json.dumps({"type": "task_output", "payload": {"output_type": "text", "content": "hi"}}, ensure_ascii=False),
+                    json.dumps({"content": "hi"}, ensure_ascii=False),
+                    None,
+                    1,
+                    created_at,
+                    created_at,
+                    1,
+                    created_at,
+                    created_at,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_outputs (task_id, run_id, output_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, run_id, "text", "hi", created_at),
+            )
+
+        fake_eval_json = json.dumps(
+            {
+                "status": "pass",
+                "pass_score": 92,
+                "pass_threshold": 80,
+                "distill": {
+                    "status": "allow",
+                    "score": 95,
+                    "threshold": 90,
+                    "reason": "缺少证据引用，不应自动沉淀",
+                    "evidence_refs": [],
+                },
+                "summary": "任务完成，但 distill 缺证据。",
+                "issues": [],
+                "next_actions": [],
+                "skills": [
+                    {
+                        "mode": "create",
+                        "name": "不应沉淀的技能",
+                        "description": "用于测试 distill evidence_refs 门槛",
+                        "category": "misc",
+                        "tags": ["test"],
+                        "triggers": ["测试"],
+                        "steps": ["step1"],
+                        "validation": ["ok"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        app = create_app()
+        transport = httpx.ASGITransport(app=app)
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "backend.src.api.agent.routes_agent_evaluate.call_openai",
+            return_value=(fake_eval_json, None, None),
+        ), patch(
+            "backend.src.api.agent.routes_agent_evaluate.upsert_skill_from_agent_payload",
+        ) as mock_upsert, patch(
+            "backend.src.api.agent.routes_agent_evaluate.publish_skill_file",
+        ) as mock_publish, patch(
+            "backend.src.api.agent.routes_agent_evaluate.asyncio.to_thread",
+            fake_to_thread,
+        ):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                async with client.stream(
+                    "POST",
+                    "/api/agent/evaluate/stream",
+                    json={"run_id": run_id, "message": "验收点：distill 缺证据应降级"},
+                ) as resp:
+                    self.assertEqual(resp.status_code, 200)
+                    got_review = False
+                    got_distill_status = None
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            payload = json.loads(line[len("data: ") :])
+                            if payload.get("type") == "review":
+                                got_review = True
+                                got_distill_status = payload.get("distill_status")
+                    self.assertTrue(got_review)
+                    self.assertEqual(got_distill_status, "manual")
+
+        self.assertFalse(mock_upsert.called)
+        self.assertFalse(mock_publish.called)
+
+        with get_connection() as conn:
+            skill = conn.execute(
+                "SELECT * FROM skills_items WHERE name = ? ORDER BY id DESC LIMIT 1",
+                ("不应沉淀的技能",),
+            ).fetchone()
+            self.assertIsNone(skill)
+            review = conn.execute(
+                "SELECT * FROM agent_review_records WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            self.assertIsNotNone(review)
+            self.assertEqual(str(review["distill_status"] or ""), "manual")
+
+    async def test_agent_evaluate_stream_distill_allow_but_invalid_evidence_refs_should_skip_upsert(self):
+        from backend.src.storage import get_connection
+        from backend.src.main import create_app
+        from backend.src.api.utils import now_iso
+
+        created_at = now_iso()
+        with get_connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO tasks (title, status, created_at, expectation_id, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("测试任务", "done", created_at, None, created_at, created_at),
+            )
+            task_id = int(cursor.lastrowid)
+            cursor = conn.execute(
+                "INSERT INTO task_runs (task_id, status, summary, started_at, finished_at, created_at, updated_at, agent_plan, agent_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    "done",
+                    "test_run_invalid_refs",
+                    created_at,
+                    created_at,
+                    created_at,
+                    created_at,
+                    json.dumps({"titles": ["一步"], "allows": [["task_output"]], "artifacts": []}, ensure_ascii=False),
+                    json.dumps({"message": "测试", "step_order": 1}, ensure_ascii=False),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO task_steps (task_id, run_id, title, status, detail, result, error, attempts, started_at, finished_at, step_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    run_id,
+                    "输出结果",
+                    "done",
+                    json.dumps({"type": "task_output", "payload": {"output_type": "text", "content": "hi"}}, ensure_ascii=False),
+                    json.dumps({"content": "hi"}, ensure_ascii=False),
+                    None,
+                    1,
+                    created_at,
+                    created_at,
+                    1,
+                    created_at,
+                    created_at,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_outputs (task_id, run_id, output_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, run_id, "text", "hi", created_at),
+            )
+
+        fake_eval_json = json.dumps(
+            {
+                "status": "pass",
+                "pass_score": 92,
+                "pass_threshold": 80,
+                "distill": {
+                    "status": "allow",
+                    "score": 95,
+                    "threshold": 90,
+                    "reason": "引用了不存在的证据 id，不应自动沉淀",
+                    "evidence_refs": [{"kind": "output", "output_id": 999999}],
+                },
+                "summary": "任务完成，但 distill 证据引用无效。",
+                "issues": [],
+                "next_actions": [],
+                "skills": [
+                    {
+                        "mode": "create",
+                        "name": "不应沉淀的技能（invalid refs）",
+                        "description": "用于测试 distill invalid evidence_refs 门槛",
+                        "category": "misc",
+                        "tags": ["test"],
+                        "triggers": ["测试"],
+                        "steps": ["step1"],
+                        "validation": ["ok"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        app = create_app()
+        transport = httpx.ASGITransport(app=app)
+
+        async def fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch(
+            "backend.src.api.agent.routes_agent_evaluate.call_openai",
+            return_value=(fake_eval_json, None, None),
+        ), patch(
+            "backend.src.api.agent.routes_agent_evaluate.upsert_skill_from_agent_payload",
+        ) as mock_upsert, patch(
+            "backend.src.api.agent.routes_agent_evaluate.publish_skill_file",
+        ) as mock_publish, patch(
+            "backend.src.api.agent.routes_agent_evaluate.asyncio.to_thread",
+            fake_to_thread,
+        ):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                async with client.stream(
+                    "POST",
+                    "/api/agent/evaluate/stream",
+                    json={"run_id": run_id, "message": "验收点：distill invalid refs 应降级"},
+                ) as resp:
+                    self.assertEqual(resp.status_code, 200)
+                    got_review = False
+                    got_distill_status = None
+                    got_distill_refs = None
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            payload = json.loads(line[len("data: ") :])
+                            if payload.get("type") == "review":
+                                got_review = True
+                                got_distill_status = payload.get("distill_status")
+                                got_distill_refs = payload.get("distill_evidence_refs")
+                    self.assertTrue(got_review)
+                    self.assertEqual(got_distill_status, "manual")
+                    self.assertEqual(got_distill_refs, [])
+
+        self.assertFalse(mock_upsert.called)
+        self.assertFalse(mock_publish.called)
+
+        with get_connection() as conn:
+            skill = conn.execute(
+                "SELECT * FROM skills_items WHERE name = ? ORDER BY id DESC LIMIT 1",
+                ("不应沉淀的技能（invalid refs）",),
+            ).fetchone()
+            self.assertIsNone(skill)
+            review = conn.execute(
+                "SELECT * FROM agent_review_records WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            self.assertIsNotNone(review)
+            self.assertEqual(str(review["distill_status"] or ""), "manual")
+            refs = json.loads(review["distill_evidence_refs"] or "[]")
+            self.assertEqual(refs, [])
 
     async def test_agent_evaluate_stream_think_mode_uses_evaluator_model_from_config(self):
         from backend.src.storage import get_connection
@@ -277,6 +552,7 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model_used, "eval-model")
         self.assertIn('"mode": "think"', str(prompt_text))
         self.assertIn("vote_records", str(prompt_text))
+        self.assertIn("artifacts_check", str(prompt_text))
 
     async def test_agent_evaluate_stream_think_mode_defaults_to_base_model_when_evaluator_missing(self):
         """

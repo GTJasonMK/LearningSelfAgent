@@ -388,7 +388,7 @@ def _select_relevant_memories(
         max_items=AGENT_MEMORY_PICK_MAX_ITEMS,
     )
     pick_text, _, pick_err = _cached_call_openai(
-        cache_namespace="graph_pick",
+        cache_namespace="memory_pick",
         prompt=pick_prompt,
         model=model,
         params={"temperature": 0, "max_tokens": 160},

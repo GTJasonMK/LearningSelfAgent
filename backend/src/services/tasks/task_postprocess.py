@@ -47,6 +47,11 @@ from backend.src.storage import get_connection
 from backend.src.services.debug.debug_output import write_task_debug_output
 from backend.src.services.graph.graph_extract import extract_graph_updates
 from backend.src.services.llm.llm_client import call_openai, resolve_default_model
+from backend.src.services.agent_review.review_normalize import (
+    apply_distill_gate,
+    filter_evidence_refs,
+    normalize_issues,
+)
 from backend.src.services.memory.memory_items import create_memory_item as create_memory_item_service
 
 logger = logging.getLogger(__name__)
@@ -490,6 +495,8 @@ def ensure_agent_review_record(
         distill_score: Optional[float] = None
         distill_status = ""
         distill_notes = ""
+        distill_evidence_refs: List[dict] = []
+        raw_distill_evidence_refs: object = None
 
         if not isinstance(obj, dict):
             status = "fail"
@@ -535,6 +542,7 @@ def ensure_agent_review_record(
                 distill_notes = str(
                     distill_payload.get("reason") or distill_payload.get("notes") or ""
                 ).strip()
+                raw_distill_evidence_refs = distill_payload.get("evidence_refs")
 
             if not distill_status:
                 distill_status = _normalize_distill_status(obj.get("distill_status"))
@@ -556,29 +564,6 @@ def ensure_agent_review_record(
                 status = "needs_changes"
                 if not summary:
                     summary = "评分未达标：需补齐验证与修复后再交付。"
-
-            # 知识沉淀前置条件：未通过任务评估(pass)则不允许沉淀（与 docs/agent 对齐）
-            if status != "pass":
-                distill_status = AGENT_REVIEW_DISTILL_STATUS_DENY
-                distill_score = 0.0
-
-            # backward compatible：旧评估没有 distill 字段时，默认按历史语义（pass=允许沉淀）
-            if not distill_status:
-                distill_status = (
-                    AGENT_REVIEW_DISTILL_STATUS_ALLOW if status == "pass" else AGENT_REVIEW_DISTILL_STATUS_DENY
-                )
-            if distill_score is None:
-                distill_score = float(pass_score or 0.0) if status == "pass" else 0.0
-
-            # distill 门槛：allow 但未达阈值时，默认不自动沉淀（manual）
-            if (
-                distill_status == AGENT_REVIEW_DISTILL_STATUS_ALLOW
-                and distill_score is not None
-                and distill_score < distill_threshold
-            ):
-                distill_status = AGENT_REVIEW_DISTILL_STATUS_MANUAL
-                if not distill_notes:
-                    distill_notes = "distill_score 未达门槛：默认不自动沉淀"
 
             # 证据引用清洗：防止 LLM 胡编不存在的 id
             valid_step_ids = set()
@@ -602,72 +587,45 @@ def ensure_agent_review_record(
             except Exception:
                 artifact_paths = set()
 
-            def _filter_evidence_refs(raw: object) -> List[dict]:
-                if not isinstance(raw, list):
-                    return []
-                out: List[dict] = []
-                for it in raw:
-                    if not isinstance(it, dict):
-                        continue
-                    kind = str(it.get("kind") or "").strip().lower()
-                    if kind == "step":
-                        try:
-                            sid = int(it.get("step_id"))
-                        except Exception:
-                            continue
-                        if valid_step_ids and sid not in valid_step_ids:
-                            continue
-                        ref = {"kind": "step", "step_id": sid}
-                        if it.get("step_order") is not None:
-                            try:
-                                ref["step_order"] = int(it.get("step_order"))
-                            except Exception:
-                                pass
-                        out.append(ref)
-                    elif kind == "output":
-                        try:
-                            oid = int(it.get("output_id"))
-                        except Exception:
-                            continue
-                        if valid_output_ids and oid not in valid_output_ids:
-                            continue
-                        out.append({"kind": "output", "output_id": oid})
-                    elif kind == "tool_call":
-                        try:
-                            cid = int(it.get("tool_call_record_id"))
-                        except Exception:
-                            continue
-                        if valid_tool_call_ids and cid not in valid_tool_call_ids:
-                            continue
-                        out.append({"kind": "tool_call", "tool_call_record_id": cid})
-                    elif kind == "artifact":
-                        path = str(it.get("path") or "").strip()
-                        if not path:
-                            continue
-                        if artifact_paths and path not in artifact_paths:
-                            continue
-                        ref = {"kind": "artifact", "path": path}
-                        exists_value = it.get("exists")
-                        if isinstance(exists_value, bool):
-                            ref["exists"] = bool(exists_value)
-                        out.append(ref)
-                    if len(out) >= 8:
-                        break
-                return out
-
-            normalized_issues: List[dict] = []
-            for issue in issues or []:
-                if not isinstance(issue, dict):
+            artifact_exists_by_path: dict[str, bool] = {}
+            for it in artifacts_check_items or []:
+                if not isinstance(it, dict):
                     continue
-                refs = _filter_evidence_refs(issue.get("evidence_refs"))
-                issue["evidence_refs"] = refs
-                quote = str(issue.get("evidence_quote") or issue.get("evidence") or "").strip()
-                if quote:
-                    issue["evidence_quote"] = truncate_text(quote, 120)
-                normalized_issues.append(issue)
-                if len(normalized_issues) >= 50:
-                    break
-            issues = normalized_issues
+                p = str(it.get("path") or "").strip()
+                if not p:
+                    continue
+                exists_value = it.get("exists")
+                if isinstance(exists_value, bool):
+                    artifact_exists_by_path[p] = bool(exists_value)
+
+            distill_evidence_refs = filter_evidence_refs(
+                raw_distill_evidence_refs,
+                valid_step_ids=valid_step_ids,
+                valid_output_ids=valid_output_ids,
+                valid_tool_call_record_ids=valid_tool_call_ids,
+                valid_artifact_paths=artifact_paths,
+                artifact_exists_by_path=artifact_exists_by_path,
+                max_items=8,
+            )
+            distill_status, distill_score, distill_notes = apply_distill_gate(
+                review_status=status,
+                pass_score=pass_score,
+                distill_status=distill_status,
+                distill_score=distill_score,
+                distill_threshold=distill_threshold,
+                distill_notes=distill_notes,
+                distill_evidence_refs=distill_evidence_refs,
+            )
+
+            issues = normalize_issues(
+                issues,
+                valid_step_ids=valid_step_ids,
+                valid_output_ids=valid_output_ids,
+                valid_tool_call_record_ids=valid_tool_call_ids,
+                valid_artifact_paths=artifact_paths,
+                artifact_exists_by_path=artifact_exists_by_path,
+                max_items=50,
+            )
 
         update_agent_review_record(
             review_id=int(review_id),
@@ -678,6 +636,7 @@ def ensure_agent_review_record(
             distill_score=distill_score,
             distill_threshold=distill_threshold,
             distill_notes=distill_notes,
+            distill_evidence_refs=distill_evidence_refs,
             summary=summary,
             issues=issues,
             next_actions=next_actions,

@@ -32,6 +32,31 @@ def _resolve_since_iso(*, since_days: int) -> Tuple[int, Optional[str]]:
     return days, since
 
 
+def _classify_distill_block_reason(*, distill_status: str, distill_notes: str) -> str:
+    """
+    将“未自动沉淀”的原因做粗粒度归类（用于趋势观测）。
+
+    说明：
+    - 当前仅基于 distill_notes 的关键词做启发式分类；
+    - 目标是“可观测性”，而不是严格审计（审计请以 review 记录原文为准）。
+    """
+    ds = str(distill_status or "").strip().lower()
+    notes = str(distill_notes or "")
+
+    if "缺少可定位 evidence_refs" in notes:
+        return "missing_evidence_refs"
+    if "distill_score 未达门槛" in notes:
+        return "score_below_threshold"
+    if "缺少 distill.status" in notes:
+        return "missing_distill_status"
+
+    # deny 在 pass 场景下通常意味着 evaluator 主观拒绝沉淀（一次性/不稳定）
+    if ds == "deny":
+        return "evaluator_denied"
+
+    return "other"
+
+
 def compute_agent_metrics(*, since_days: int = 30) -> dict:
     """
     聚合 Agent 运行指标（P3：可观测性）。
@@ -159,7 +184,10 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
                 SELECT
                     COUNT(*) AS total,
                     COALESCE(SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_count,
-                    COALESCE(SUM(CASE WHEN distill_status = 'allow' THEN 1 ELSE 0 END), 0) AS distill_allow_count
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'allow' THEN 1 ELSE 0 END), 0) AS distill_allow_count,
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'manual' THEN 1 ELSE 0 END), 0) AS distill_manual_count,
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'deny' THEN 1 ELSE 0 END), 0) AS distill_deny_count,
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'allow' AND distill_evidence_refs IS NOT NULL AND TRIM(distill_evidence_refs) NOT IN ('', '[]', 'null') THEN 1 ELSE 0 END), 0) AS distill_allow_with_evidence_count
                 FROM agent_review_records
                 WHERE created_at >= ?
                 """,
@@ -171,7 +199,10 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
                 SELECT
                     COUNT(*) AS total,
                     COALESCE(SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_count,
-                    COALESCE(SUM(CASE WHEN distill_status = 'allow' THEN 1 ELSE 0 END), 0) AS distill_allow_count
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'allow' THEN 1 ELSE 0 END), 0) AS distill_allow_count,
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'manual' THEN 1 ELSE 0 END), 0) AS distill_manual_count,
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'deny' THEN 1 ELSE 0 END), 0) AS distill_deny_count,
+                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'allow' AND distill_evidence_refs IS NOT NULL AND TRIM(distill_evidence_refs) NOT IN ('', '[]', 'null') THEN 1 ELSE 0 END), 0) AS distill_allow_with_evidence_count
                 FROM agent_review_records
                 """,
             ).fetchone()
@@ -179,7 +210,40 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
         review_total = int(review_row["total"] or 0) if review_row else 0
         review_pass = int(review_row["pass_count"] or 0) if review_row else 0
         distill_allow = int(review_row["distill_allow_count"] or 0) if review_row else 0
+        distill_manual = int(review_row["distill_manual_count"] or 0) if review_row else 0
+        distill_deny = int(review_row["distill_deny_count"] or 0) if review_row else 0
+        distill_allow_with_evidence = (
+            int(review_row["distill_allow_with_evidence_count"] or 0) if review_row else 0
+        )
         distill_rate = (float(distill_allow) / float(review_pass)) if review_pass else 0.0
+        evidence_coverage = (float(distill_allow_with_evidence) / float(distill_allow)) if distill_allow else 0.0
+
+        # distill block reasons（仅在 pass 场景观察：任务完成但不沉淀）
+        if since:
+            rows = conn.execute(
+                """
+                SELECT distill_status, distill_notes
+                FROM agent_review_records
+                WHERE status = 'pass' AND created_at >= ? AND distill_status IN ('manual', 'deny')
+                """,
+                (str(since),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT distill_status, distill_notes
+                FROM agent_review_records
+                WHERE status = 'pass' AND distill_status IN ('manual', 'deny')
+                """,
+            ).fetchall()
+
+        distill_block_reasons: Dict[str, int] = {}
+        for r in rows or []:
+            reason = _classify_distill_block_reason(
+                distill_status=str(r["distill_status"] or ""),
+                distill_notes=str(r["distill_notes"] or ""),
+            )
+            distill_block_reasons[reason] = int(distill_block_reasons.get(reason, 0)) + 1
 
     # runs 聚合
     by_status: Dict[str, int] = {}
@@ -255,6 +319,10 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
             "pass": int(review_pass),
             "distill_allow": int(distill_allow),
             "distill_rate_among_pass": round(distill_rate, 4),
+            "distill_allow_with_evidence": int(distill_allow_with_evidence),
+            "distill_evidence_coverage_among_allow": round(evidence_coverage, 4),
+            "distill_manual": int(distill_manual),
+            "distill_deny": int(distill_deny),
+            "distill_block_reasons_among_pass": distill_block_reasons,
         },
     }
-

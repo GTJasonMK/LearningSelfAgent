@@ -19,6 +19,7 @@ def create_agent_review_record(
     distill_score: Optional[float] = None,
     distill_threshold: Optional[float] = None,
     distill_notes: Optional[str] = None,
+    distill_evidence_refs: Optional[Sequence[Any]] = None,
     summary: str,
     issues: Sequence[Any],
     next_actions: Sequence[Any],
@@ -29,8 +30,8 @@ def create_agent_review_record(
     created = created_at or now_iso()
     sql = (
         "INSERT INTO agent_review_records "
-        "(task_id, run_id, status, pass_score, pass_threshold, distill_status, distill_score, distill_threshold, distill_notes, summary, issues, next_actions, skills, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "(task_id, run_id, status, pass_score, pass_threshold, distill_status, distill_score, distill_threshold, distill_notes, distill_evidence_refs, summary, issues, next_actions, skills, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     params = (
         int(task_id),
@@ -42,6 +43,7 @@ def create_agent_review_record(
         float(distill_score) if distill_score is not None else None,
         float(distill_threshold) if distill_threshold is not None else None,
         str(distill_notes) if distill_notes is not None else None,
+        json.dumps(list(distill_evidence_refs or []), ensure_ascii=False),
         summary,
         json.dumps(list(issues or []), ensure_ascii=False),
         json.dumps(list(next_actions or []), ensure_ascii=False),
@@ -54,7 +56,11 @@ def create_agent_review_record(
         except sqlite3.OperationalError as exc:
             # 兼容旧库：pass_score/distill_status 等列可能尚未迁移完成
             msg = str(exc or "")
-            if "no column named pass_score" in msg or "no column named distill_status" in msg:
+            if (
+                "no column named pass_score" in msg
+                or "no column named distill_status" in msg
+                or "no column named distill_evidence_refs" in msg
+            ):
                 legacy_sql = (
                     "INSERT INTO agent_review_records "
                     "(task_id, run_id, status, summary, issues, next_actions, skills, created_at) "
@@ -86,6 +92,7 @@ def update_agent_review_record(
     distill_score: Optional[float] = None,
     distill_threshold: Optional[float] = None,
     distill_notes: Optional[str] = None,
+    distill_evidence_refs: Optional[Sequence[Any]] = None,
     summary: Optional[str] = None,
     issues: Optional[Sequence[Any]] = None,
     next_actions: Optional[Sequence[Any]] = None,
@@ -123,6 +130,9 @@ def update_agent_review_record(
     if distill_notes is not None:
         fields.append("distill_notes = ?")
         params.append(str(distill_notes))
+    if distill_evidence_refs is not None:
+        fields.append("distill_evidence_refs = ?")
+        params.append(json.dumps(list(distill_evidence_refs or []), ensure_ascii=False))
     if summary is not None:
         fields.append("summary = ?")
         params.append(str(summary))
@@ -152,7 +162,17 @@ def update_agent_review_record(
                     filtered_params: list[Any] = []
                     for f, p in zip(fields, params[:-1]):
                         # 仅保留旧字段（status/summary/issues/next_actions/skills）
-                        if f.startswith(("pass_score", "pass_threshold", "distill_status", "distill_score", "distill_threshold", "distill_notes")):
+                        if f.startswith(
+                            (
+                                "pass_score",
+                                "pass_threshold",
+                                "distill_status",
+                                "distill_score",
+                                "distill_threshold",
+                                "distill_notes",
+                                "distill_evidence_refs",
+                            )
+                        ):
                             continue
                         filtered_fields.append(f)
                         filtered_params.append(p)

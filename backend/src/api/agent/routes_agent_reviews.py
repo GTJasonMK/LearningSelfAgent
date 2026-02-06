@@ -60,6 +60,7 @@ def get_agent_review(review_id: int):
     if not row:
         return error_response(ERROR_CODE_INVALID_REQUEST, "review 不存在", HTTP_STATUS_BAD_REQUEST)
 
+    distill_evidence_refs = parse_json_value(row["distill_evidence_refs"]) or []
     issues = parse_json_value(row["issues"]) or []
     next_actions = parse_json_value(row["next_actions"]) or []
     skills = parse_json_value(row["skills"]) or []
@@ -75,6 +76,7 @@ def get_agent_review(review_id: int):
             "distill_score": row["distill_score"],
             "distill_threshold": row["distill_threshold"],
             "distill_notes": row["distill_notes"],
+            "distill_evidence_refs": distill_evidence_refs if isinstance(distill_evidence_refs, list) else [],
             "summary": row["summary"],
             "issues": issues if isinstance(issues, list) else [],
             "next_actions": next_actions if isinstance(next_actions, list) else [],

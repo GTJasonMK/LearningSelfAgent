@@ -142,6 +142,7 @@ COLUMN_MIGRATIONS: Dict[str, List[str]] = {
         "distill_score REAL",
         "distill_threshold REAL",
         "distill_notes TEXT",
+        "distill_evidence_refs TEXT",
     ],
     "prompt_templates": [
         "description TEXT",

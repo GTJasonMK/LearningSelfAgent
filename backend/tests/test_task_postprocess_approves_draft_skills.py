@@ -56,6 +56,11 @@ class TestTaskPostprocessApprovesDraftSkills(unittest.TestCase):
                 ),
             )
             run_id = int(cursor.lastrowid)
+            cursor = conn.execute(
+                "INSERT INTO task_outputs (task_id, run_id, output_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, run_id, "text", "最终结果：ok", created_at),
+            )
+            output_id = int(cursor.lastrowid)
             task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (int(task_id),)).fetchone()
 
         draft_skill_id = create_skill(
@@ -74,7 +79,20 @@ class TestTaskPostprocessApprovesDraftSkills(unittest.TestCase):
         )
 
         fake_eval_json = json.dumps(
-            {"status": "pass", "summary": "ok", "issues": [], "next_actions": [], "skills": []},
+            {
+                "status": "pass",
+                "summary": "ok",
+                "distill": {
+                    "status": "allow",
+                    "score": 95,
+                    "threshold": 90,
+                    "reason": "可沉淀",
+                    "evidence_refs": [{"kind": "output", "output_id": int(output_id)}],
+                },
+                "issues": [],
+                "next_actions": [],
+                "skills": [],
+            },
             ensure_ascii=False,
         )
 
@@ -109,4 +127,3 @@ class TestTaskPostprocessApprovesDraftSkills(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
