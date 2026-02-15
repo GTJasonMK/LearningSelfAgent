@@ -34,6 +34,29 @@ class TestSystemPromptFormatting(unittest.TestCase):
         )
         self.assertTrue(text)
 
+    def test_agent_react_step_prompt_template_can_format_without_keyerror(self):
+        from backend.src.constants import AGENT_REACT_STEP_PROMPT_TEMPLATE
+
+        text = AGENT_REACT_STEP_PROMPT_TEMPLATE.format(
+            now="2026-02-14T00:00:00Z",
+            workdir=".",
+            agent_workspace="backend/.agent/workspace",
+            message="test",
+            plan="[\"step1\"]",
+            step_index=1,
+            step_title="step1",
+            allowed_actions="tool_call",
+            observations="- none",
+            graph="(无)",
+            tools="(无)",
+            skills="(无)",
+            memories="(无)",
+            output_style="简洁输出",
+            action_types_line="tool_call,task_output",
+        )
+        self.assertIn("user_prompt", text)
+        self.assertIn("{label,value}", text)
+
 
 if __name__ == "__main__":
     unittest.main()

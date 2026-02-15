@@ -54,13 +54,14 @@ class TestReactLoopPlanSafety(unittest.TestCase):
 
     def test_pads_missing_plan_items(self):
         """plan_items 为空/缺失时，不应触发 IndexError，应自动补齐并完成执行。"""
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
 
         task_id, run_id = self._create_task_and_run()
 
         plan_titles = ["输出结果"]
-        plan_items = []  # 故意传空：验证安全垫片逻辑
+        plan_items = []  # 故意传空：验证 PlanStructure.from_legacy 安全垫片逻辑
         plan_allows = [["task_output"]]
 
         fake_action = {
@@ -69,6 +70,13 @@ class TestReactLoopPlanSafety(unittest.TestCase):
                 "payload": {"output_type": "text", "content": "ok"},
             }
         }
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         with patch(
             "backend.src.agent.runner.react_loop.create_llm_call",
@@ -81,10 +89,7 @@ class TestReactLoopPlanSafety(unittest.TestCase):
                 workdir=os.getcwd(),
                 model="gpt-4o-mini",
                 parameters={"temperature": 0},
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",
@@ -102,16 +107,21 @@ class TestReactLoopPlanSafety(unittest.TestCase):
                 result = exc.value
 
         self.assertEqual(result.run_status, RUN_STATUS_DONE)
-        self.assertEqual(len(plan_items), 1)
-        self.assertEqual(plan_items[0].get("id"), 1)
-        self.assertTrue(str(plan_items[0].get("brief") or "").strip())
 
     def test_empty_plan_fails_gracefully(self):
         """空计划应直接失败并返回明确结果（不应越界崩溃）。"""
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_FAILED
 
         task_id, run_id = self._create_task_and_run()
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=[],
+            plan_items=[],
+            plan_allows=[],
+            plan_artifacts=[],
+        )
 
         # 若错误地调用了 LLM，这里会直接让测试失败
         with patch("backend.src.agent.runner.react_loop.create_llm_call", side_effect=AssertionError("should not call llm")):
@@ -122,10 +132,7 @@ class TestReactLoopPlanSafety(unittest.TestCase):
                 workdir=os.getcwd(),
                 model="gpt-4o-mini",
                 parameters={"temperature": 0},
-                plan_titles=[],
-                plan_items=[],
-                plan_allows=[],
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",

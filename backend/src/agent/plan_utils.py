@@ -1,3 +1,4 @@
+import os
 import re
 from typing import List, Optional
 
@@ -350,6 +351,62 @@ def repair_plan_artifacts_with_file_write_steps(
     return titles, briefs, allows, artifact_list, None, patched_count
 
 
+def reorder_script_file_writes_before_exec_steps(
+    *,
+    titles: List[str],
+    briefs: List[str],
+    allows: List[List[str]],
+) -> tuple[List[str], List[str], List[List[str]], int]:
+    """
+    计划修复：将“脚本类文件”的 file_write 步骤尽量前置到首个可执行步骤（tool_call/shell_command）之前。
+
+    背景：
+    - 模型经常把 tool_call/shell_command 放在写脚本之前，导致执行时报：
+      python: can't open file '.../xxx.py'（脚本尚未落盘）
+    - 虽然后续可能通过 replan 自愈，但会产生一次失败记录并影响观感与评估证据。
+
+    策略：
+    - 找到计划中第一个“可执行步骤”（allow 含 tool_call 或 shell_command）
+    - 将其后的“脚本类 file_write”（.py/.sh/.ps1/.js/.ts 等）移动到该步骤之前
+    - 仅重排顺序，不增减步骤数
+    """
+    if not titles or not allows:
+        return titles, briefs, allows, 0
+
+    first_exec_idx = None
+    for idx, allow in enumerate(allows):
+        allow_set = set(allow or [])
+        if ACTION_TYPE_TOOL_CALL in allow_set or ACTION_TYPE_SHELL_COMMAND in allow_set:
+            first_exec_idx = idx
+            break
+    if first_exec_idx is None:
+        return titles, briefs, allows, 0
+
+    script_exts = {".py", ".sh", ".ps1", ".js", ".ts", ".cmd", ".bat"}
+    movable: List[int] = []
+    for idx in range(int(first_exec_idx) + 1, len(titles)):
+        allow_set = set(allows[idx] or []) if idx < len(allows) else set()
+        if ACTION_TYPE_FILE_WRITE not in allow_set:
+            continue
+        path = extract_file_write_target_path(titles[idx])
+        ext = os.path.splitext(str(path or ""))[1].lower()
+        if ext and ext in script_exts:
+            movable.append(idx)
+
+    if not movable:
+        return titles, briefs, allows, 0
+
+    prefix = list(range(0, int(first_exec_idx)))
+    moved = list(movable)
+    rest = [idx for idx in range(int(first_exec_idx), len(titles)) if idx not in set(movable)]
+    new_order = prefix + moved + rest
+
+    new_titles = [titles[i] for i in new_order]
+    new_briefs = [briefs[i] for i in new_order] if len(briefs) == len(titles) else briefs
+    new_allows = [allows[i] for i in new_order]
+    return new_titles, new_briefs, new_allows, len(movable)
+
+
 def drop_non_artifact_file_write_steps(
     *,
     titles: List[str],
@@ -529,20 +586,68 @@ def apply_next_step_patch(
                 result.append(normalized)
         return result
 
+    def _normalize_artifact_token(value: object) -> str:
+        raw_value = str(value or "").strip().strip('"').strip("'").strip()
+        if not raw_value:
+            return ""
+        return raw_value.replace("\\", "/")
+
     def _append_artifacts(raw) -> None:
         if raw is None:
             return
+
         values: List[str] = []
         if isinstance(raw, str):
             values = [raw]
         elif isinstance(raw, list):
             values = [str(v) for v in raw]
+
+        existing_tokens = {
+            _normalize_artifact_token(v)
+            for v in (artifacts or [])
+            if _normalize_artifact_token(v)
+        }
+        existing_basenames = {
+            os.path.basename(token).lower()
+            for token in existing_tokens
+            if token
+        }
+
+        file_targets: List[str] = []
+        for title_text in (titles or []):
+            target = _normalize_artifact_token(extract_file_write_target_path(title_text))
+            if target:
+                file_targets.append(target)
+
         for v in values:
-            rel = str(v or "").strip()
-            if not rel:
+            token = _normalize_artifact_token(v)
+            if not token:
                 continue
-            if rel not in artifacts:
-                artifacts.append(rel)
+
+            is_abs = bool(re.match(r"^[A-Za-z]:/", token)) or token.startswith("/")
+            if is_abs:
+                basename = os.path.basename(token).lower()
+                if basename and basename in existing_basenames:
+                    continue
+
+                mapped = ""
+                if basename:
+                    for target in file_targets:
+                        if os.path.basename(target).lower() == basename:
+                            mapped = target
+                            break
+                if not mapped:
+                    continue
+                token = mapped
+
+            if token in existing_tokens:
+                continue
+
+            artifacts.append(token)
+            existing_tokens.add(token)
+            basename = os.path.basename(token).lower()
+            if basename:
+                existing_basenames.add(basename)
 
     # --- 插入新步骤（会把原 next_index 以及后续整体后移） ---
     if insert_steps_raw is not None:
@@ -551,8 +656,8 @@ def apply_next_step_patch(
         if limit is not None and len(titles) + len(insert_steps_raw) > limit:
             return f"plan_patch.insert_steps 超出 max_steps={limit}"
 
+        normalized_insert_steps: List[dict] = []
         insert_at = max(0, min(len(titles), next_index - 1))
-        offset = 0
         for i, raw in enumerate(insert_steps_raw, start=1):
             if not isinstance(raw, dict):
                 return f"plan_patch.insert_steps[{i}] 不是对象"
@@ -566,6 +671,60 @@ def apply_next_step_patch(
             step_brief = _sanitize_brief(step_brief)
             if not step_brief:
                 step_brief = _sanitize_brief(_fallback_brief_from_title(step_title))
+
+            normalized_insert_steps.append(
+                {
+                    "title": step_title,
+                    "allow": list(step_allow),
+                    "brief": step_brief,
+                }
+            )
+
+        # 约束：插入步骤里若存在“脚本 file_write”，必须排在首个 shell/tool 执行步骤之前。
+        # 背景：模型经常把 shell_command 放在写脚本之前，导致运行时报脚本不存在。
+        script_exts = {".py", ".sh", ".ps1", ".js", ".ts", ".cmd", ".bat"}
+
+        def _is_exec_step(allow_list: List[str]) -> bool:
+            allow_set = set(allow_list or [])
+            return ACTION_TYPE_SHELL_COMMAND in allow_set or ACTION_TYPE_TOOL_CALL in allow_set
+
+        def _is_script_file_write_step(step_obj: dict) -> bool:
+            allow_set = set(step_obj.get("allow") or [])
+            if ACTION_TYPE_FILE_WRITE not in allow_set:
+                return False
+            target = extract_file_write_target_path(str(step_obj.get("title") or ""))
+            ext = os.path.splitext(str(target or ""))[1].lower()
+            return bool(ext and ext in script_exts)
+
+        first_exec_idx = None
+        for idx, step_obj in enumerate(normalized_insert_steps):
+            if _is_exec_step(step_obj.get("allow") or []):
+                first_exec_idx = idx
+                break
+        if first_exec_idx is not None:
+            movable = [
+                idx
+                for idx in range(int(first_exec_idx) + 1, len(normalized_insert_steps))
+                if _is_script_file_write_step(normalized_insert_steps[idx])
+            ]
+            if movable:
+                prefix = list(range(0, int(first_exec_idx)))
+                moved = list(movable)
+                rest = [
+                    idx
+                    for idx in range(int(first_exec_idx), len(normalized_insert_steps))
+                    if idx not in set(movable)
+                ]
+                new_order = prefix + moved + rest
+                normalized_insert_steps = [normalized_insert_steps[i] for i in new_order]
+
+        offset = 0
+        for step_obj in normalized_insert_steps:
+            step_title = str(step_obj.get("title") or "").strip()
+            step_allow = list(step_obj.get("allow") or [])
+            step_brief = str(step_obj.get("brief") or "").strip() or _sanitize_brief(
+                _fallback_brief_from_title(step_title)
+            )
 
             titles.insert(insert_at + offset, step_title)
             allows.insert(insert_at + offset, step_allow)
@@ -676,6 +835,7 @@ def apply_next_step_patch(
         if not titles_in:
             return titles_in, briefs_in, allows_in, items_in
         artifact_set = {str(a or "").strip() for a in (artifacts_in or []) if str(a or "").strip()}
+        experiment_rel = str(AGENT_EXPERIMENT_DIR_REL or "").strip().replace("\\", "/")
 
         new_titles: List[str] = []
         new_briefs: List[str] = []
@@ -702,8 +862,18 @@ def apply_next_step_patch(
                 and status == "pending"
             ):
                 target = extract_file_write_target_path(title_value)
+                target_norm = str(target or "").strip().replace("\\", "/")
+                in_experiment_dir = bool(
+                    target_norm
+                    and experiment_rel
+                    and (
+                        target_norm == experiment_rel
+                        or target_norm.startswith(experiment_rel + "/")
+                    )
+                )
                 if not target or target not in artifact_set:
-                    if file_write_bound >= len(artifact_set):
+                    # 实验目录脚本是执行依赖，不应因为 artifacts 已覆盖就被压缩掉。
+                    if (not in_experiment_dir) and file_write_bound >= len(artifact_set):
                         continue
 
             if status == "pending" and prev_title == title_value and set(prev_allow or []) == set(allow_value or []):

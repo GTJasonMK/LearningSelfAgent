@@ -26,6 +26,7 @@ from backend.src.actions.registry import action_types_line
 from backend.src.agent.observation import _truncate_observation
 from backend.src.agent.plan_utils import extract_file_write_target_path
 from backend.src.agent.runner.feedback import is_task_feedback_step_title
+from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_loop_impl import _enforce_allow_constraints
 from backend.src.agent.runner.react_step_executor import (
     build_observation_line,
@@ -43,6 +44,7 @@ from backend.src.constants import (
     ACTION_TYPE_FILE_APPEND,
     ACTION_TYPE_FILE_DELETE,
     ACTION_TYPE_FILE_READ,
+    ACTION_TYPE_HTTP_REQUEST,
     ACTION_TYPE_LLM_CALL,
     ACTION_TYPE_SHELL_COMMAND,
     ACTION_TYPE_TASK_OUTPUT,
@@ -79,39 +81,54 @@ class ThinkParallelLoopResult:
     last_step_order: int
 
 
-def _has_success_validation_step(
-    *,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-) -> bool:
+def _has_success_validation_step(plan_struct: PlanStructure) -> bool:
     """
-    判断是否存在“成功的验证步骤”（用于 artifacts 任务的最终输出门闩）。
+    判断是否存在"成功的验证步骤"（用于 artifacts 任务的最终输出门闩）。
     - 允许类型：shell_command / tool_call
-    - 标题包含“验证/校验/检查/自测”等关键词
+    - 标题包含"验证/校验/检查/自测"等关键词
     - 状态必须是 done
     """
     keywords = ("验证", "校验", "检查", "自测", "verify", "validate", "check", "test")
-    for idx, title in enumerate(plan_titles or []):
-        allow = plan_allows[idx] if idx < len(plan_allows) else []
-        allow_set = set(allow or [])
+    for step in plan_struct.steps:
+        allow_set = set(step.allow or [])
         if ACTION_TYPE_SHELL_COMMAND not in allow_set and ACTION_TYPE_TOOL_CALL not in allow_set:
             continue
-        item = plan_items[idx] if idx < len(plan_items) else {}
-        status = str(item.get("status") or "pending") if isinstance(item, dict) else "pending"
-        if status != "done":
+        if step.status != "done":
             continue
-        title_text = str(title or "")
-        if any(key in title_text for key in keywords):
+        if any(key in str(step.title or "") for key in keywords):
             return True
     return False
 
 
+def _has_prior_http_success_step(
+    *,
+    current_idx: int,
+    plan_struct: PlanStructure,
+) -> tuple[bool, bool]:
+    """
+    判断 task_output 之前是否存在 http_request 依赖，且依赖里至少一次成功。
+    """
+    has_http_requirement = False
+    has_http_success = False
+    upper = max(0, int(current_idx))
+    for idx in range(upper):
+        step = plan_struct.get_step(idx)
+        if step is None:
+            continue
+        allow_set = set(step.allow or [])
+        is_http_step = ACTION_TYPE_HTTP_REQUEST in allow_set or str(step.title or "").startswith("http_request:")
+        if not is_http_step:
+            continue
+        has_http_requirement = True
+        if step.status == "done":
+            has_http_success = True
+            break
+    return has_http_requirement, has_http_success
+
+
 def _build_dependency_map(
     *,
-    plan_titles: List[str],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     dependencies: Optional[List[dict]],
 ) -> List[List[int]]:
     """
@@ -121,6 +138,9 @@ def _build_dependency_map(
     - elaborate 输出：{"from_step":0,"to_step":1}
     - executor_assign 输出：{"step_index":2,"depends_on":[0,1]}
     """
+    plan_titles = [s.title for s in plan_struct.steps]
+    plan_allows = [list(s.allow) for s in plan_struct.steps]
+    plan_artifacts = list(plan_struct.artifacts)
     total = len(plan_titles or [])
     dep_sets: List[Set[int]] = [set() for _ in range(total)]
 
@@ -131,7 +151,7 @@ def _build_dependency_map(
         def _to_int(value: object) -> Optional[int]:
             try:
                 return int(value)  # type: ignore[arg-type]
-            except Exception:
+            except (TypeError, ValueError):
                 return None
 
         def _count_valid_edges(base: int) -> int:
@@ -235,7 +255,7 @@ def _build_dependency_map(
             try:
                 from_step = int(dep.get("from_step")) - int(dep_index_base)
                 to_step = int(dep.get("to_step")) - int(dep_index_base)
-            except Exception:
+            except (TypeError, ValueError):
                 continue
             if 0 <= from_step < total and 0 <= to_step < total and from_step != to_step:
                 dep_sets[to_step].add(from_step)
@@ -244,7 +264,7 @@ def _build_dependency_map(
         if "step_index" in dep and "depends_on" in dep:
             try:
                 step_index = int(dep.get("step_index")) - int(dep_index_base)
-            except Exception:
+            except (TypeError, ValueError):
                 continue
             if not (0 <= step_index < total):
                 continue
@@ -254,7 +274,7 @@ def _build_dependency_map(
             for item in raw_deps:
                 try:
                     d = int(item) - int(dep_index_base)
-                except Exception:
+                except (TypeError, ValueError):
                     continue
                 if 0 <= d < total and d != step_index:
                     dep_sets[step_index].add(d)
@@ -371,10 +391,7 @@ def run_think_parallel_loop(
     workdir: str,
     model: str,
     parameters: dict,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     tools_hint: str,
     skills_hint: str,
     memories_hint: str,
@@ -401,29 +418,15 @@ def run_think_parallel_loop(
     - ThinkParallelLoopResult(run_status, last_step_order)
     """
     # 保险丝：计划为空直接失败，避免 0/None 越界
-    if not plan_titles:
+    if not plan_struct.steps:
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} 计划为空，无法执行\n"})
         return ThinkParallelLoopResult(run_status=RUN_STATUS_FAILED, last_step_order=0)
 
-    # 兼容：plan_items 长度/结构对齐
-    if not isinstance(plan_items, list):
-        plan_items = []
-    if len(plan_items) > len(plan_titles):
-        del plan_items[len(plan_titles) :]
-    while len(plan_items) < len(plan_titles):
-        plan_items.append({})
-    for i, title in enumerate(plan_titles):
-        if not isinstance(plan_items[i], dict):
-            plan_items[i] = {}
-        plan_items[i].setdefault("id", i + 1)
-        plan_items[i].setdefault("brief", str(title or "").strip()[:10] or "步骤")
-        plan_items[i].setdefault("status", "pending")
+    total = plan_struct.step_count
 
     # 依赖图
     dep_map = _build_dependency_map(
-        plan_titles=plan_titles,
-        plan_allows=plan_allows,
-        plan_artifacts=plan_artifacts,
+        plan_struct=plan_struct,
         dependencies=dependencies,
     )
     if _has_cycle(dep_map):
@@ -431,36 +434,36 @@ def run_think_parallel_loop(
             task_id=int(task_id),
             run_id=int(run_id),
             message="agent.think.parallel.dep_cycle",
-            data={"dependencies": dependencies, "plan_len": len(plan_titles)},
+            data={"dependencies": dependencies, "plan_len": total},
             level="warning",
         )
         # 降级：当依赖有环时，直接串行（依赖全部前置）
-        dep_map = [list(range(0, i)) for i in range(len(plan_titles))]
+        dep_map = [list(range(0, i)) for i in range(total)]
 
     # Step 范围：start_step_order 为 1-based
     try:
         start_order = int(start_step_order)
-    except Exception:
+    except (TypeError, ValueError):
         start_order = 1
     if start_order < 1:
         start_order = 1
-    if start_order > len(plan_titles):
-        start_order = len(plan_titles)
+    if start_order > total:
+        start_order = total
     start_idx = start_order - 1
 
     # 可选：限制本次并行 loop 只调度到某个 step（用于把尾部反馈闭环交回顺序执行器处理）
-    end_idx = len(plan_titles) - 1
+    end_idx = total - 1
     if end_step_order_inclusive is not None:
         try:
             end_order = int(end_step_order_inclusive)
-        except Exception:
-            end_order = len(plan_titles)
+        except (TypeError, ValueError):
+            end_order = total
         if end_order < 1:
-            # 允许“执行空区间”（用于仅剩尾部反馈闭环的场景）
+            # 允许"执行空区间"（用于仅剩尾部反馈闭环的场景）
             end_idx = -1
         else:
-            if end_order > len(plan_titles):
-                end_order = len(plan_titles)
+            if end_order > total:
+                end_order = total
             end_idx = end_order - 1
 
     # executor 线程池：默认按 docs 的 3 角色；但若 plan 实际出现其他 role，则动态补齐
@@ -471,9 +474,8 @@ def run_think_parallel_loop(
         roles = ["executor_doc", "executor_code", "executor_test"]
 
     executor_for_step: Dict[int, str] = {}
-    for i, title in enumerate(plan_titles):
-        allow = plan_allows[i] if 0 <= i < len(plan_allows) else []
-        role = _infer_executor_from_allow(allow or [], str(title or ""))
+    for i, step in enumerate(plan_struct.steps):
+        role = _infer_executor_from_allow(list(step.allow or []), str(step.title or ""))
         role = str(role or "").strip() or "executor_code"
         executor_for_step[i] = role
         if role not in roles:
@@ -487,7 +489,7 @@ def run_think_parallel_loop(
             "step_index": int(i),
             "depends_on": [int(d) for d in (dep_map[i] if 0 <= i < len(dep_map) else [])],
         }
-        for i in range(0, len(plan_titles))
+        for i in range(0, total)
     ]
     try:
         if isinstance(agent_state, dict):
@@ -495,9 +497,9 @@ def run_think_parallel_loop(
             agent_state["think_parallel_roles"] = list(roles)
             agent_state["think_parallel_executors"] = [
                 {"step_order": int(i) + 1, "executor": str(executor_for_step.get(i) or "")}
-                for i in range(0, len(plan_titles))
+                for i in range(0, total)
             ]
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         pass
     safe_write_debug(
         task_id=int(task_id),
@@ -522,25 +524,20 @@ def run_think_parallel_loop(
     last_llm_by_idx: Dict[int, str] = {}
     max_llm_idx_holder = {"idx": -1}
 
-    # 基于 plan_items.status 初始化 completed（支持 resume/反思继续）。
-    # 注意：并行调度下不再假设 “start_step_order 之前都已完成”，以免跳过未完成步骤。
-    for idx, item in enumerate(plan_items):
-        if not isinstance(item, dict):
-            continue
-        # docs/agent：skipped 也应视为“已结算”，否则会阻塞依赖与最终输出门闩。
-        if str(item.get("status") or "").strip() in {"done", "skipped"}:
+    # 基于步骤 status 初始化 completed（支持 resume/反思继续）。
+    # 注意：并行调度下不再假设 "start_step_order 之前都已完成"，以免跳过未完成步骤。
+    for idx, step in enumerate(plan_struct.steps):
+        # docs/agent：skipped 也应视为"已结算"，否则会阻塞依赖与最终输出门闩。
+        if step.status in {"done", "skipped"}:
             completed.add(idx)
 
-    # 保险丝：若 start_step_order 指向的不是“最早未完成步骤”，则回退到最早未完成 step，
+    # 保险丝：若 start_step_order 指向的不是"最早未完成步骤"，则回退到最早未完成 step，
     # 避免并行/反思插入导致 step_order 漂移后跳过未完成步骤。
     first_pending_idx: Optional[int] = None
-    for idx in range(0, len(plan_titles)):
+    for idx in range(0, total):
         if idx in completed:
             continue
-        if not isinstance(plan_items[idx], dict):
-            first_pending_idx = idx
-            break
-        if str(plan_items[idx].get("status") or "").strip() not in {"done", "skipped"}:
+        if plan_struct.steps[idx].status not in {"done", "skipped"}:
             first_pending_idx = idx
             break
     if first_pending_idx is not None and int(first_pending_idx) < int(start_idx):
@@ -565,7 +562,7 @@ def run_think_parallel_loop(
     # - 普通 done 允许按时间窗口合并落盘（最终收尾仍会强制落盘一次）。
     try:
         persist_min_interval_seconds = float(AGENT_THINK_PARALLEL_PERSIST_MIN_INTERVAL_SECONDS or 0)
-    except Exception:
+    except (TypeError, ValueError):
         persist_min_interval_seconds = 0.0
     if persist_min_interval_seconds < 0:
         persist_min_interval_seconds = 0.0
@@ -581,7 +578,7 @@ def run_think_parallel_loop(
     def _emit(msg: str) -> None:
         try:
             out_q.put_nowait(str(msg))
-        except Exception:
+        except queue.Full:
             return
 
     def _persist(
@@ -593,20 +590,14 @@ def run_think_parallel_loop(
     ) -> bool:
         paused_value: Optional[dict]
         if paused is _PAUSED_KEEP:
-            try:
-                paused_value = agent_state.get("paused") if isinstance(agent_state, dict) else None
-            except Exception:
-                paused_value = None
+            paused_value = agent_state.get("paused") if isinstance(agent_state, dict) else None
         else:
             paused_value = paused if isinstance(paused, dict) else None
 
         with db_lock:
             ok = persist_loop_state(
                 run_id=int(run_id),
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 step_order=int(step_order),
                 observations=observations,
@@ -629,14 +620,14 @@ def run_think_parallel_loop(
         return bool(ok)
 
     def _next_step_order_for_state() -> int:
-        # 以“最小 pending”作为 next step（便于 resume/审计），并不代表执行顺序严格单调
-        for idx in range(0, len(plan_titles)):
+        # 以"最小 pending"作为 next step（便于 resume/审计），并不代表执行顺序严格单调
+        for idx in range(0, total):
             if idx in completed:
                 continue
-            if str(plan_items[idx].get("status") or "").strip() in {"done", "skipped"}:
+            if plan_struct.steps[idx].status in {"done", "skipped"}:
                 continue
             return idx + 1
-        return len(plan_titles) + 1
+        return total + 1
 
     def _mark_persist_dirty(where: str, *, step_order: int, status: Optional[str] = None) -> None:
         """
@@ -688,7 +679,7 @@ def run_think_parallel_loop(
                     deps = dep_map[cand] if 0 <= cand < len(dep_map) else []
                     if any(d not in completed for d in deps):
                         continue
-                    allow_c = plan_allows[cand] if 0 <= cand < len(plan_allows) else []
+                    allow_c = list(plan_struct.steps[cand].allow or []) if 0 <= cand < total else []
                     if ACTION_TYPE_USER_PROMPT in set(allow_c or []):
                         waiting_barrier["idx"] = int(cand)
                         waiting_barrier["role"] = str(executor_for_step.get(int(cand)) or "").strip() or None
@@ -722,11 +713,10 @@ def run_think_parallel_loop(
                 if any(d not in completed for d in deps):
                     continue
 
-                # 标记 running + 更新 plan_items
+                # 标记 running + 更新 plan_struct
                 running.add(idx)
-                if 0 <= idx < len(plan_items):
-                    plan_items[idx]["status"] = "running"
-                _emit(sse_plan_delta(task_id=int(task_id), plan_items=plan_items, indices=[idx]))
+                plan_struct.set_step_status(idx, "running")
+                _emit(sse_plan_delta(task_id=int(task_id), run_id=int(run_id), plan_items=plan_struct.get_items_payload(), indices=[idx]))
 
                 return idx
             return None
@@ -736,9 +726,8 @@ def run_think_parallel_loop(
             running.discard(idx)
             if status in {"done", "skipped"}:
                 completed.add(idx)
-            if 0 <= idx < len(plan_items):
-                plan_items[idx]["status"] = status
-            _emit(sse_plan_delta(task_id=int(task_id), plan_items=plan_items, indices=[idx]))
+            plan_struct.set_step_status(idx, status)
+            _emit(sse_plan_delta(task_id=int(task_id), run_id=int(run_id), plan_items=plan_struct.get_items_payload(), indices=[idx]))
 
             next_step_order = _next_step_order_for_state()
             force = False
@@ -781,9 +770,10 @@ def run_think_parallel_loop(
         真正执行一个步骤（在 executor 线程中运行）。
         """
         step_order = idx + 1
-        title = str(plan_titles[idx] or "")
-        allow = plan_allows[idx] if 0 <= idx < len(plan_allows) else []
-        allow_text = " / ".join(list(allow or [])) if allow else "(未限制)"
+        step_obj = plan_struct.steps[idx]
+        title = str(step_obj.title or "")
+        allow = list(step_obj.allow or [])
+        allow_text = " / ".join(allow) if allow else "(未限制)"
 
         _emit(sse_json({"delta": f"{STREAM_TAG_STEP} [{role}] {title}\n"}))
 
@@ -811,9 +801,9 @@ def run_think_parallel_loop(
         if ACTION_TYPE_TASK_OUTPUT in allow_set:
             failed_steps: List[int] = []
             with state_lock:
-                for idx_item, item in enumerate(plan_items):
-                    if isinstance(item, dict) and str(item.get("status") or "").strip() == "failed":
-                        failed_steps.append(int(idx_item) + 1)
+                for s_idx, s in enumerate(plan_struct.steps):
+                    if s.status == "failed":
+                        failed_steps.append(int(s_idx) + 1)
 
             if failed_steps:
                 _emit(sse_json({"delta": f"{STREAM_TAG_FAIL} 存在失败步骤，无法直接输出结果\n"}))
@@ -828,8 +818,26 @@ def run_think_parallel_loop(
                 _fail_run(step_order, f"prior_failed_steps:{failed_steps}")
                 return
 
-            if plan_artifacts:
-                missing = check_missing_artifacts(artifacts=list(plan_artifacts or []), workdir=workdir)
+            with state_lock:
+                has_http_requirement, has_http_success = _has_prior_http_success_step(
+                    current_idx=int(idx),
+                    plan_struct=plan_struct,
+                )
+            if has_http_requirement and not has_http_success:
+                _emit(sse_json({"delta": f"{STREAM_TAG_FAIL} 缺少可验证的抓取证据，无法直接输出结果\n"}))
+                safe_write_debug(
+                    task_id=int(task_id),
+                    run_id=int(run_id),
+                    message="agent.think.parallel.http_evidence.missing",
+                    data={"step_order": int(step_order)},
+                    level="error",
+                )
+                _mark_step_finished(idx, "failed")
+                _fail_run(step_order, "http_evidence_missing")
+                return
+
+            if plan_struct.artifacts:
+                missing = check_missing_artifacts(artifacts=list(plan_struct.artifacts or []), workdir=workdir)
                 if missing:
                     _emit(sse_json({"delta": f"{STREAM_TAG_FAIL} 未生成文件：{', '.join(missing)}\n"}))
                     safe_write_debug(
@@ -844,11 +852,7 @@ def run_think_parallel_loop(
                     return
 
                 with state_lock:
-                    has_validation = _has_success_validation_step(
-                        plan_titles=plan_titles,
-                        plan_items=plan_items,
-                        plan_allows=plan_allows,
-                    )
+                    has_validation = _has_success_validation_step(plan_struct)
                 if not has_validation:
                     _emit(sse_json({"delta": f"{STREAM_TAG_FAIL} 缺少验证步骤，无法直接输出结果\n"}))
                     safe_write_debug(
@@ -870,7 +874,7 @@ def run_think_parallel_loop(
         if step_llm_config_resolver:
             try:
                 resolved_model, resolved_params = step_llm_config_resolver(step_order, title, list(allow or []))
-            except Exception as exc:
+            except (TypeError, ValueError, AttributeError, KeyError, RuntimeError) as exc:
                 safe_write_debug(
                     task_id=int(task_id),
                     run_id=int(run_id),
@@ -890,10 +894,11 @@ def run_think_parallel_loop(
             obs_text = "\n".join(f"- {_truncate_observation(o)}" for o in observations[-3:]) or "(无)"
 
         react_prompt = AGENT_REACT_STEP_PROMPT_TEMPLATE.format(
+            now=now_iso(),
             workdir=workdir,
             agent_workspace=AGENT_EXPERIMENT_DIR_REL,
             message=message,
-            plan=json.dumps(plan_titles, ensure_ascii=False),
+            plan=plan_struct.get_titles_json(),
             step_index=step_order,
             step_title=title,
             allowed_actions=allow_text,
@@ -990,10 +995,7 @@ def run_think_parallel_loop(
                 step_order=int(step_order),
                 title=title,
                 payload_obj=payload_obj,
-                plan_items=plan_items,
-                plan_titles=plan_titles,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 safe_write_debug=safe_write_debug,
                 db_lock=db_lock,
@@ -1045,6 +1047,11 @@ def run_think_parallel_loop(
                     error=str(step_error),
                     finished_at=finished_at,
                 )
+            with state_lock:
+                if isinstance(step_context, dict):
+                    step_context.pop("latest_parse_input_text", None)
+                if isinstance(context, dict):
+                    context.pop("latest_parse_input_text", None)
             _emit(sse_json({"delta": f"{STREAM_TAG_FAIL} {title}: {step_error}\n"}))
             _mark_step_finished(idx, "failed")
             _fail_run(step_order, str(step_error))
@@ -1055,7 +1062,7 @@ def run_think_parallel_loop(
         if result is not None:
             try:
                 result_value = json.dumps(result, ensure_ascii=False)
-            except Exception:
+            except (TypeError, ValueError):
                 result_value = json.dumps({"text": str(result)}, ensure_ascii=False)
         with db_lock:
             mark_task_step_done(step_id=int(step_id), result=result_value, finished_at=finished_at)
@@ -1079,6 +1086,9 @@ def run_think_parallel_loop(
                         max_llm_idx_holder["idx"] = int(idx)
                         # 仅用“最大 step_order 的 llm_call 输出”更新全局 context，保证确定性。
                         context["last_llm_response"] = resp
+            parse_source = str(step_context.get("latest_parse_input_text") or "").strip()
+            if parse_source and int(idx) >= int(max_llm_idx_holder["idx"]):
+                context["latest_parse_input_text"] = parse_source
 
         if visible_content:
             _emit(yield_visible_result(visible_content))
@@ -1103,7 +1113,7 @@ def run_think_parallel_loop(
                     remaining = [
                         i
                         for i in range(start_idx, end_idx + 1)
-                        if i not in completed and str(plan_items[i].get("status") or "").strip() != "done"
+                        if i not in completed and plan_struct.steps[i].status != "done"
                     ]
                     if not remaining or run_status_holder["status"] != RUN_STATUS_DONE:
                         return
@@ -1112,7 +1122,7 @@ def run_think_parallel_loop(
             try:
                 _exec_one_step(role, idx)
             except BaseException as exc:  # noqa: BLE001
-                _emit(sse_json({"delta": f"{STREAM_TAG_FAIL} {plan_titles[idx]}: exception:{exc}\n"}))
+                _emit(sse_json({"delta": f"{STREAM_TAG_FAIL} {plan_struct.steps[idx].title}: exception:{exc}\n"}))
                 _mark_step_finished(idx, "failed")
                 _fail_run(idx + 1, f"exception:{exc}")
                 return
@@ -1143,7 +1153,7 @@ def run_think_parallel_loop(
                     remaining = [
                         i
                         for i in range(start_idx, end_idx + 1)
-                        if i not in completed and str(plan_items[i].get("status") or "").strip() != "done"
+                        if i not in completed and plan_struct.steps[i].status != "done"
                     ]
                     if run_status_holder["status"] != RUN_STATUS_DONE:
                         break
@@ -1151,7 +1161,7 @@ def run_think_parallel_loop(
                         break
 
                     # 兜底：并行调度死锁检测
-                    # 场景：剩余步骤全部“依赖未满足/依赖在本次区间外”，且当前无 running。
+                    # 场景：剩余步骤全部"依赖未满足/依赖在本次区间外"，且当前无 running。
                     # 若不处理，会表现为长时间 idle + 心跳，任务永不结束。
                     if remaining and not running:
                         barrier_idx = waiting_barrier.get("idx")
@@ -1182,7 +1192,7 @@ def run_think_parallel_loop(
                                 blocked.append(
                                     {
                                         "step_order": int(cand) + 1,
-                                        "title": str(plan_titles[int(cand)] or ""),
+                                        "title": str(plan_struct.steps[int(cand)].title or ""),
                                         "missing_step_orders": [int(d) + 1 for d in missing],
                                         "missing_outside_window_step_orders": [int(d) + 1 for d in missing_outside],
                                     }
@@ -1211,13 +1221,12 @@ def run_think_parallel_loop(
 
                             # 让 UI/计划状态可见（选择最早阻塞步骤标记 failed）。
                             deadlock_idx = int(min(remaining))
-                            if 0 <= deadlock_idx < len(plan_items):
-                                plan_items[deadlock_idx]["status"] = "failed"
-                                _emit(
-                                    sse_plan_delta(
-                                        task_id=int(task_id), plan_items=plan_items, indices=[deadlock_idx]
-                                    )
+                            plan_struct.set_step_status(deadlock_idx, "failed")
+                            _emit(
+                                sse_plan_delta(
+                                    task_id=int(task_id), run_id=int(run_id), plan_items=plan_struct.get_items_payload(), indices=[deadlock_idx]
                                 )
+                            )
 
                             # 失败状态必须立即落盘（不受节流影响）。
                             _mark_persist_dirty(

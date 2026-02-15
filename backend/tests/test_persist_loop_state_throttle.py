@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+from backend.src.agent.core.plan_structure import PlanStructure
+
 
 class TestPersistLoopStateThrottle(unittest.TestCase):
     def setUp(self):
@@ -17,19 +19,19 @@ class TestPersistLoopStateThrottle(unittest.TestCase):
         def _fake_update_task_run(**kwargs):
             calls.append(dict(kwargs))
 
-        plan_titles = ["a", "b", "c"]
-        plan_items = [{"id": 1, "status": "pending"} for _ in plan_titles]
-        plan_allows = [["tool_call"] for _ in plan_titles]
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=["a", "b", "c"],
+            plan_items=[{"id": 1, "status": "pending"} for _ in range(3)],
+            plan_allows=[["tool_call"] for _ in range(3)],
+            plan_artifacts=[],
+        )
 
         with patch.object(sm, "update_task_run", side_effect=_fake_update_task_run), patch.object(
             sm, "AGENT_REACT_PERSIST_MIN_INTERVAL_SECONDS", 999
         ), patch.object(sm.time, "monotonic", return_value=1.0):
             ok1 = sm.persist_loop_state(
                 run_id=1,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 agent_state={},
                 step_order=1,
                 observations=[],
@@ -38,23 +40,17 @@ class TestPersistLoopStateThrottle(unittest.TestCase):
             )
             ok2 = sm.persist_loop_state(
                 run_id=1,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 agent_state={},
                 step_order=2,
                 observations=[],
                 context={},
                 where="t2",
             )
-            # 收尾：step_order >= len(plan_titles)+1 应强制落盘（即使仍在节流窗口内）
+            # 收尾：step_order >= step_count+1 应强制落盘（即使仍在节流窗口内）
             ok3 = sm.persist_loop_state(
                 run_id=1,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 agent_state={},
                 step_order=4,
                 observations=[],
@@ -76,19 +72,19 @@ class TestPersistLoopStateThrottle(unittest.TestCase):
         def _fake_update_task_run(**kwargs):
             calls.append(dict(kwargs))
 
-        plan_titles = ["a", "b"]
-        plan_items = [{"id": 1, "status": "pending"} for _ in plan_titles]
-        plan_allows = [["tool_call"] for _ in plan_titles]
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=["a", "b"],
+            plan_items=[{"id": 1, "status": "pending"} for _ in range(2)],
+            plan_allows=[["tool_call"] for _ in range(2)],
+            plan_artifacts=[],
+        )
 
         with patch.object(sm, "update_task_run", side_effect=_fake_update_task_run), patch.object(
             sm, "AGENT_REACT_PERSIST_MIN_INTERVAL_SECONDS", 999
         ), patch.object(sm.time, "monotonic", return_value=1.0):
             sm.persist_loop_state(
                 run_id=1,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 agent_state={},
                 step_order=1,
                 observations=[],
@@ -97,10 +93,7 @@ class TestPersistLoopStateThrottle(unittest.TestCase):
             )
             sm.persist_loop_state(
                 run_id=1,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 agent_state={},
                 step_order=2,
                 observations=[],
@@ -110,4 +103,3 @@ class TestPersistLoopStateThrottle(unittest.TestCase):
             )
 
         self.assertEqual(len(calls), 2)
-

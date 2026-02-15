@@ -46,11 +46,14 @@ _scheduler_started = False
 _scheduler_lock = threading.Lock()
 
 _CLEANUP_TABLES = {
+    "chat_messages": "created_at",
     "llm_records": "created_at",
     "tool_call_records": "created_at",
     "search_records": "created_at",
     "eval_records": "created_at",
     "eval_criteria_records": "created_at",
+    "agent_review_records": "created_at",
+    "tasks": "created_at",
     "task_steps": "created_at",
     "task_outputs": "created_at",
     "task_runs": "created_at",

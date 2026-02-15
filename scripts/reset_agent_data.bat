@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul
 echo ========================================
 echo LearningSelfAgent reset agent data
 echo ========================================
@@ -15,7 +16,7 @@ if exist "%PY_EXE%" (
 
 set "PY_EXE=%ROOT%\.venv\Scripts\python.exe"
 if exist "%PY_EXE%" (
-  rem 若该 .venv 来自 WSL（pyvenv.cfg 里 home=/usr/bin），Windows 下会报 “No Python at /usr/bin\\python.exe”。
+  rem If this .venv was created in WSL (pyvenv.cfg has home=/usr/bin), skip it on Windows.
   findstr /i "home = /usr" "%ROOT%\.venv\pyvenv.cfg" >nul 2>nul
   if not errorlevel 1 (
     echo Detected WSL venv at %ROOT%\.venv. Skipping.

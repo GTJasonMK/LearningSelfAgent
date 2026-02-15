@@ -11,11 +11,58 @@ import os
 import time
 import signal
 import threading
+import socket
 from pathlib import Path
 
 
 # 全局进程列表，用于清理
 processes = []
+
+BACKEND_HOST = "127.0.0.1"
+BACKEND_PORT_ENV = "LSA_BACKEND_PORT"
+BACKEND_START_MAX_RETRIES = 3
+
+
+def _parse_port(raw_value):
+    """解析并校验端口号（1..65535）。"""
+    try:
+        port = int(str(raw_value).strip())
+    except Exception:
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def _is_port_available(host, port):
+    """检测端口是否可用（可绑定）。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, int(port)))
+        return True
+    except Exception:
+        return False
+
+
+def _pick_ephemeral_port(host):
+    """让系统自动分配一个当前可用端口。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def resolve_backend_port(host=BACKEND_HOST):
+    """解析并选择后端端口：优先环境变量，否则自动分配可用端口。"""
+    env_port = _parse_port(os.environ.get(BACKEND_PORT_ENV))
+    if env_port is not None:
+        if _is_port_available(host, env_port):
+            return int(env_port)
+        print(f"[端口] {BACKEND_PORT_ENV}={env_port} 已占用，自动分配可用端口")
+
+    picked_port = _pick_ephemeral_port(host)
+    print(f"[端口] 自动分配端口: {picked_port}")
+    return int(picked_port)
 
 
 def get_project_root():
@@ -132,8 +179,28 @@ def get_venv_python(project_root):
     return sys.executable
 
 
+def should_use_ansi_colors() -> bool:
+    """
+    判断是否启用 ANSI 颜色输出。
+
+    说明：
+    - Windows 的 cmd 可能不支持 VT 序列，直接输出会出现“乱码/杂字符”；默认关闭颜色；
+    - Windows Terminal / VS Code 终端通常支持；或用户可通过 LSA_ENABLE_ANSI=1 强制开启。
+    """
+    if sys.platform != "win32":
+        return True
+    if str(os.environ.get("LSA_ENABLE_ANSI") or "").strip() == "1":
+        return True
+    if os.environ.get("WT_SESSION"):
+        return True
+    if str(os.environ.get("TERM_PROGRAM") or "").lower() == "vscode":
+        return True
+    return False
+
+
 def stream_output(process, prefix, color_code):
     """实时输出进程的标准输出"""
+    use_ansi = should_use_ansi_colors()
     try:
         for line in iter(process.stdout.readline, b''):
             if line:
@@ -146,13 +213,17 @@ def stream_output(process, prefix, color_code):
                         continue
                 else:
                     text = line.decode('utf-8', errors='replace').rstrip()
-                print(f"\033[{color_code}m[{prefix}]\033[0m {text}")
+                if use_ansi:
+                    print(f"\033[{color_code}m[{prefix}]\033[0m {text}")
+                else:
+                    print(f"[{prefix}] {text}")
     except Exception:
         pass
 
 
 def stream_error(process, prefix, color_code):
     """实时输出进程的错误输出"""
+    use_ansi = should_use_ansi_colors()
     try:
         for line in iter(process.stderr.readline, b''):
             if line:
@@ -165,24 +236,28 @@ def stream_error(process, prefix, color_code):
                         continue
                 else:
                     text = line.decode('utf-8', errors='replace').rstrip()
-                print(f"\033[{color_code}m[{prefix}]\033[0m {text}")
+                if use_ansi:
+                    print(f"\033[{color_code}m[{prefix}]\033[0m {text}")
+                else:
+                    print(f"[{prefix}] {text}")
     except Exception:
         pass
 
 
-def start_backend(project_root):
+def start_backend(project_root, backend_port):
     """启动后端服务"""
     print("\n[后端] 启动 FastAPI 服务...")
 
     venv_python = get_venv_python(project_root)
     print(f"[后端] Python: {venv_python}")
+    print(f"[后端] 端口: {int(backend_port)}")
 
     # 使用 uvicorn 启动
     cmd = [
         venv_python, "-m", "uvicorn",
         "backend.src.main:app",
-        "--port", "8123",
-        "--host", "127.0.0.1"
+        "--port", str(int(backend_port)),
+        "--host", BACKEND_HOST
     ]
 
     enable_reload = str(os.environ.get("LSA_BACKEND_RELOAD") or "").strip() == "1"
@@ -195,20 +270,28 @@ def start_backend(project_root):
         ])
 
     env = os.environ.copy()
+    env["LSA_BACKEND_PORT"] = str(int(backend_port))
+    if sys.platform == "win32":
+        # 确保子进程日志在 Windows 下按 UTF-8 输出，减少“看起来像乱码”的问题
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
     if enable_reload:
         # 兼容旧版 uvicorn：通过 watchfiles 环境变量忽略实验目录，避免临时脚本触发重载
         ignore_patterns = env.get("WATCHFILES_IGNORE", "")
         extra_ignore = "backend/.agent/workspace/*,backend/.agent/workspace/**,backend\\.agent\\workspace\\*,backend\\.agent\\workspace\\**"
         env["WATCHFILES_IGNORE"] = f"{ignore_patterns},{extra_ignore}".strip(",")
 
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(project_root),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1
-    )
+    popen_kwargs = {
+        "cwd": str(project_root),
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "bufsize": 1,
+    }
+    if sys.platform != "win32":
+        # POSIX：为子进程创建独立会话/进程组，便于 cleanup 时 killpg 不误伤自身进程组
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(cmd, **popen_kwargs)
 
     processes.append(process)
 
@@ -219,7 +302,7 @@ def start_backend(project_root):
     return process
 
 
-def start_frontend(project_root):
+def start_frontend(project_root, backend_port):
     """启动前端应用"""
     print("\n[前端] 启动 Electron 应用...")
 
@@ -244,19 +327,22 @@ def start_frontend(project_root):
 
     # Windows 下设置环境变量以避免编码问题
     env = os.environ.copy()
+    env["LSA_BACKEND_PORT"] = str(int(backend_port))
     if sys.platform == "win32":
         env["PYTHONIOENCODING"] = "utf-8"
     # 后端已由本脚本启动，前端（Electron）无需重复启动后端，避免端口占用错误
     env["LSA_SKIP_BACKEND"] = "1"
 
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(frontend_path),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-        env=env
-    )
+    popen_kwargs = {
+        "cwd": str(frontend_path),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "bufsize": 1,
+        "env": env,
+    }
+    if sys.platform != "win32":
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(cmd, **popen_kwargs)
 
     processes.append(process)
 
@@ -275,7 +361,10 @@ def cleanup(signum=None, frame=None):
             if sys.platform == "win32":
                 proc.terminate()
             else:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
         except Exception:
             pass
 
@@ -284,13 +373,19 @@ def cleanup(signum=None, frame=None):
         try:
             proc.wait(timeout=3)
         except Exception:
-            proc.kill()
+            try:
+                if sys.platform != "win32":
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                else:
+                    proc.kill()
+            except Exception:
+                proc.kill()
 
     print("所有服务已关闭")
     sys.exit(0)
 
 
-def wait_for_backend(timeout=30):
+def wait_for_backend(backend_port, backend_proc=None, timeout=30):
     """等待后端服务就绪"""
     import urllib.request
     import urllib.error
@@ -299,8 +394,16 @@ def wait_for_backend(timeout=30):
     start_time = time.time()
 
     while time.time() - start_time < timeout:
+        # 若后端进程提前退出，直接失败返回
         try:
-            response = urllib.request.urlopen("http://127.0.0.1:8123/api/health", timeout=2)
+            if backend_proc is not None and backend_proc.poll() is not None:
+                print("\n[错误] 后端进程已退出，无法继续启动。")
+                return False
+        except Exception:
+            pass
+
+        try:
+            response = urllib.request.urlopen(f"http://{BACKEND_HOST}:{int(backend_port)}/api/health", timeout=2)
             if response.status == 200:
                 print("[后端] 服务已就绪!")
                 return True
@@ -329,22 +432,59 @@ def main():
 
     project_root = get_project_root()
     print(f"项目根目录: {project_root}")
+    backend_port = resolve_backend_port()
+    os.environ[BACKEND_PORT_ENV] = str(int(backend_port))
+    print(f"后端端口: {int(backend_port)}")
 
     # 注册信号处理
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    # 启动后端
-    backend_proc = start_backend(project_root)
-    if not backend_proc:
-        print("后端启动失败")
-        return
+    # 启动后端（端口冲突重试）
+    backend_proc = None
+    backend_ready = False
+    attempted_ports = set()
 
-    # 等待后端就绪
-    wait_for_backend()
+    for attempt in range(1, int(BACKEND_START_MAX_RETRIES) + 1):
+        os.environ[BACKEND_PORT_ENV] = str(int(backend_port))
+        print(f"\n[后端] 启动尝试 {attempt}/{int(BACKEND_START_MAX_RETRIES)}，端口 {int(backend_port)}")
+        backend_proc = start_backend(project_root, backend_port=backend_port)
+        if not backend_proc:
+            print("后端启动失败")
+            return
+
+        backend_ready = wait_for_backend(backend_port=backend_port, backend_proc=backend_proc)
+        if backend_ready:
+            break
+
+        backend_exited = backend_proc.poll() is not None
+        port_conflicted = not _is_port_available(BACKEND_HOST, backend_port)
+        if backend_exited and port_conflicted and attempt < int(BACKEND_START_MAX_RETRIES):
+            attempted_ports.add(int(backend_port))
+            next_port = resolve_backend_port()
+            # 防止极端情况下重复命中同一端口
+            while int(next_port) in attempted_ports:
+                next_port = resolve_backend_port()
+            print(f"[端口] {int(backend_port)} 启动期间发生冲突，重试端口 {int(next_port)}")
+            backend_port = int(next_port)
+            continue
+
+        if backend_exited:
+            print("[后端] 启动失败（进程退出）")
+            cleanup()
+            return
+        break
+
+    if not backend_ready:
+        if backend_proc is not None and backend_proc.poll() is None:
+            print("[后端] 尚未就绪，继续启动前端（可稍后重试）")
+        else:
+            print("[后端] 启动失败")
+            cleanup()
+            return
 
     # 启动前端
-    frontend_proc = start_frontend(project_root)
+    frontend_proc = start_frontend(project_root, backend_port=backend_port)
     if not frontend_proc:
         print("前端启动失败")
         cleanup()
@@ -352,8 +492,8 @@ def main():
 
     print("\n" + "=" * 60)
     print("服务已启动:")
-    print("  - 后端 API: http://127.0.0.1:8123")
-    print("  - API 文档: http://127.0.0.1:8123/docs")
+    print(f"  - 后端 API: http://{BACKEND_HOST}:{int(backend_port)}")
+    print(f"  - API 文档: http://{BACKEND_HOST}:{int(backend_port)}/docs")
     print("  - 前端应用: Electron 窗口")
     print("=" * 60)
     print("\n按 Ctrl+C 停止所有服务\n")

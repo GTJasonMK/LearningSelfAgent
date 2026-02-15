@@ -11,9 +11,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from backend.src.agent.runner.react_plan_state import build_agent_plan_payload
+from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.common.utils import now_iso
 from backend.src.constants import (
+    AGENT_MAX_STEPS_UNLIMITED,
     AGENT_REACT_PERSIST_MIN_INTERVAL_SECONDS,
     AGENT_REACT_REPLAN_MAX_ATTEMPTS,
     RUN_STATUS_DONE,
@@ -86,7 +87,11 @@ def prepare_replan_context(
     if remaining_limit is not None:
         max_steps_value = int(remaining_limit)
     else:
-        max_steps_value = int(max_steps_limit or len(plan_titles))
+        # 开发阶段无上限：避免 replan 在“当前计划长度”处被误限流（例如需要插入补救步骤时被拦截）。
+        if isinstance(max_steps_limit, int) and max_steps_limit > 0:
+            max_steps_value = int(max_steps_limit)
+        else:
+            max_steps_value = int(AGENT_MAX_STEPS_UNLIMITED)
 
     return ReplanContext(
         can_replan=can_replan,
@@ -101,10 +106,7 @@ def prepare_replan_context(
 def persist_loop_state(
     *,
     run_id: int,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     agent_state: Dict,
     step_order: int,
     observations: List[str],
@@ -118,25 +120,6 @@ def persist_loop_state(
 ) -> bool:
     """
     统一的循环状态持久化。
-
-    Args:
-        run_id: 执行尝试 ID
-        plan_titles: 计划标题列表
-        plan_items: 计划项列表
-        plan_allows: 允许的动作类型列表
-        plan_artifacts: 产物列表
-        agent_state: Agent 状态字典
-        step_order: 当前步骤序号
-        observations: 观测列表
-        context: 上下文字典
-        paused: 暂停信息（可选）
-        status: 运行状态（可选，不传则不更新）
-        safe_write_debug: 调试输出函数（可选）
-        task_id: 任务 ID（用于调试输出）
-        where: 调用位置标识（用于调试）
-
-    Returns:
-        是否成功持久化
     """
     try:
         agent_state["paused"] = paused
@@ -166,7 +149,7 @@ def persist_loop_state(
 
         is_final_step = False
         try:
-            is_final_step = int(step_order) >= int(len(plan_titles or [])) + 1
+            is_final_step = int(step_order) >= int(plan_struct.step_count) + 1
         except Exception:
             is_final_step = False
 
@@ -179,12 +162,7 @@ def persist_loop_state(
 
         update_kwargs = {
             "run_id": int(run_id),
-            "agent_plan": build_agent_plan_payload(
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
-            ),
+            "agent_plan": plan_struct.to_agent_plan_payload(),
             "agent_state": agent_state,
             "updated_at": updated_at,
         }
@@ -221,10 +199,7 @@ def persist_loop_state(
 def persist_plan_only(
     *,
     run_id: int,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     safe_write_debug: Optional[Callable] = None,
     task_id: Optional[int] = None,
     step_order: int = 0,
@@ -232,31 +207,12 @@ def persist_plan_only(
 ) -> bool:
     """
     仅持久化计划（用于 plan_patch 后立即保存）。
-
-    Args:
-        run_id: 执行尝试 ID
-        plan_titles: 计划标题列表
-        plan_items: 计划项列表
-        plan_allows: 允许的动作类型列表
-        plan_artifacts: 产物列表
-        safe_write_debug: 调试输出函数（可选）
-        task_id: 任务 ID（用于调试输出）
-        step_order: 当前步骤序号（用于调试）
-        where: 调用位置标识（用于调试）
-
-    Returns:
-        是否成功持久化
     """
     try:
         updated_at = now_iso()
         update_task_run(
             run_id=int(run_id),
-            agent_plan=build_agent_plan_payload(
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
-            ),
+            agent_plan=plan_struct.to_agent_plan_payload(),
             updated_at=updated_at,
         )
         return True

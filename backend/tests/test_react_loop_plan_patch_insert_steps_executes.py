@@ -50,6 +50,7 @@ class TestReactLoopPlanPatchInsertStepsExecutes(unittest.TestCase):
         - 旧实现用 for range(len(plan_titles))，执行中插入步骤会导致“后移的原计划步骤”永远不会被执行；
         - 新实现用 while 动态读取 plan 长度，必须能把后移步骤也跑完。
         """
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
 
@@ -62,6 +63,13 @@ class TestReactLoopPlanPatchInsertStepsExecutes(unittest.TestCase):
             {"id": 2, "brief": "二", "status": "pending"},
         ]
         plan_allows = [["llm_call"], ["task_output"]]
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         llm_actions = [
             # step1：执行 llm_call，同时在下一步位置插入一个新的 llm_call 步骤（原“步骤2”后移）
@@ -111,10 +119,7 @@ class TestReactLoopPlanPatchInsertStepsExecutes(unittest.TestCase):
                 workdir=workdir,
                 model="gpt-4o-mini",
                 parameters={"temperature": 0},
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",

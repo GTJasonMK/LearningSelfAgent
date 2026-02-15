@@ -114,7 +114,12 @@ export async function fetchAgentReview(reviewId) {
 }
 
 export async function fetchRecentRecords(params = {}) {
-  const suffix = buildQueryString({ limit: params.limit, offset: params.offset });
+  const suffix = buildQueryString({
+    limit: params.limit,
+    offset: params.offset,
+    task_id: params.task_id,
+    run_id: params.run_id
+  });
   return request(`/records/recent${suffix}`);
 }
 
@@ -146,6 +151,53 @@ export async function fetchSkills() {
 
 export async function fetchGraph() {
   return request("/memory/graph");
+}
+
+export async function fetchDomainsStats() {
+  return request("/domains/stats");
+}
+
+export async function fetchDomainsTree() {
+  return request("/domains/tree");
+}
+
+export async function fetchSkillsCatalog() {
+  return request("/skills/catalog");
+}
+
+export async function searchSkillsLibrary(params = {}) {
+  const suffix = buildQueryString({
+    q: params.q,
+    category: params.category,
+    tag: params.tag,
+    skill_type: params.skill_type,
+    status: params.status,
+    limit: params.limit,
+    offset: params.offset
+  });
+  return request(`/skills/search${suffix}`);
+}
+
+export async function fetchToolReuseSummary(params = {}) {
+  const suffix = buildQueryString({
+    task_id: params.task_id,
+    run_id: params.run_id,
+    tool_id: params.tool_id,
+    reuse_status: params.reuse_status,
+    limit: params.limit
+  });
+  return request(`/records/tools/reuse${suffix}`);
+}
+
+export async function fetchSkillReuseSummary(params = {}) {
+  const suffix = buildQueryString({
+    task_id: params.task_id,
+    run_id: params.run_id,
+    tool_id: params.tool_id,
+    reuse_status: params.reuse_status,
+    limit: params.limit
+  });
+  return request(`/records/skills/reuse${suffix}`);
 }
 
 export async function fetchEvalLatest() {

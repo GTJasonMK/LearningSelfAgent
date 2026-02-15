@@ -18,12 +18,12 @@ from typing import Iterable, List
 from backend.src.services.llm.llm_client import sse_json
 
 
-def sse_plan(*, task_id: int, plan_items: List[dict]) -> str:
+def sse_plan(*, task_id: int, run_id: int, plan_items: List[dict]) -> str:
     """全量计划栏快照事件。"""
-    return sse_json({"type": "plan", "task_id": int(task_id), "items": plan_items})
+    return sse_json({"type": "plan", "task_id": int(task_id), "run_id": int(run_id), "items": plan_items})
 
 
-def sse_plan_delta(*, task_id: int, plan_items: List[dict], indices: Iterable[int]) -> str:
+def sse_plan_delta(*, task_id: int, run_id: int, plan_items: List[dict], indices: Iterable[int]) -> str:
     """
     增量计划栏事件：把 indices 指向的 plan_items 条目提取成 changes。
 
@@ -67,5 +67,4 @@ def sse_plan_delta(*, task_id: int, plan_items: List[dict], indices: Iterable[in
                 change["title"] = item.get("title")
         changes.append(change)
 
-    return sse_json({"type": "plan_delta", "task_id": int(task_id), "changes": changes})
-
+    return sse_json({"type": "plan_delta", "task_id": int(task_id), "run_id": int(run_id), "changes": changes})

@@ -21,8 +21,17 @@ def run_command(cmd, cwd=None, check=True):
     print(f"\n>>> 执行: {' '.join(cmd)}")
     print(f"    目录: {cwd or os.getcwd()}")
     print("-" * 50)
-    result = subprocess.run(cmd, cwd=cwd, check=check)
-    return result.returncode == 0
+    try:
+        result = subprocess.run(cmd, cwd=cwd, check=check)
+        return result.returncode == 0
+    except FileNotFoundError:
+        # 例如：uv/node/npm 未安装或未在 PATH
+        print(f"[错误] 未找到命令: {cmd[0]}")
+        return False
+    except subprocess.CalledProcessError as exc:
+        # check=True 且命令返回非 0
+        print(f"[错误] 命令执行失败（退出码={exc.returncode}）: {' '.join(cmd)}")
+        return False
 
 
 def run_command_with_env(cmd, cwd=None, env=None, check=True):
@@ -30,8 +39,15 @@ def run_command_with_env(cmd, cwd=None, env=None, check=True):
     print(f"\n>>> 执行: {' '.join(cmd)}")
     print(f"    目录: {cwd or os.getcwd()}")
     print("-" * 50)
-    result = subprocess.run(cmd, cwd=cwd, env=env, check=check)
-    return result.returncode == 0
+    try:
+        result = subprocess.run(cmd, cwd=cwd, env=env, check=check)
+        return result.returncode == 0
+    except FileNotFoundError:
+        print(f"[错误] 未找到命令: {cmd[0]}")
+        return False
+    except subprocess.CalledProcessError as exc:
+        print(f"[错误] 命令执行失败（退出码={exc.returncode}）: {' '.join(cmd)}")
+        return False
 
 
 def check_uv_installed():
@@ -46,10 +62,8 @@ def check_uv_installed():
 def check_node_installed():
     """检查 Node.js 是否已安装"""
     try:
-        if sys.platform == "win32":
-            subprocess.run(["node.exe", "--version"], capture_output=True, check=True, shell=True)
-        else:
-            subprocess.run(["node", "--version"], capture_output=True, check=True)
+        # Windows 下也优先用 node（依赖 PATHEXT 自动解析为 node.exe）
+        subprocess.run(["node", "--version"], capture_output=True, check=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
@@ -110,10 +124,16 @@ def setup_backend_venv(project_root):
     # 创建虚拟环境
     if not venv_path.exists():
         print("创建虚拟环境...")
-        if not run_command(["uv", "venv", str(venv_path)], cwd=str(project_root), check=False):
-            # 回退到 python -m venv
-            print("uv venv 失败，尝试使用 python -m venv...")
-            run_command([sys.executable, "-m", "venv", str(venv_path)], cwd=str(project_root))
+        created_by_uv = False
+        if check_uv_installed():
+            created_by_uv = run_command(["uv", "venv", str(venv_path)], cwd=str(project_root), check=False)
+
+        if not created_by_uv:
+            # 回退到 python -m venv（保证在 uv 缺失时也能继续）
+            print("使用 python -m venv 创建虚拟环境...")
+            if not run_command([sys.executable, "-m", "venv", str(venv_path)], cwd=str(project_root), check=True):
+                print(f"[错误] 虚拟环境创建失败: {venv_path}")
+                return False
     else:
         print(f"虚拟环境已存在: {venv_path}")
 
@@ -122,11 +142,15 @@ def setup_backend_venv(project_root):
         if is_windows_like
         else venv_path / "bin" / "python"
     )
+    if not venv_python.exists():
+        print(f"[错误] 未找到虚拟环境 Python: {venv_python}")
+        print("建议：删除虚拟环境目录后重试，或检查 Python/权限。")
+        return False
 
     # 安装后端依赖
     print("安装后端依赖...")
     if check_uv_installed():
-        run_command(
+        ok = run_command(
             ["uv", "pip", "install", "-p", str(venv_python), "-r", str(requirements_path)],
             cwd=str(project_root),
             check=False
@@ -137,8 +161,11 @@ def setup_backend_venv(project_root):
             pip_path = venv_path / "Scripts" / "pip.exe"
         else:
             pip_path = venv_path / "bin" / "pip"
-        run_command([str(pip_path), "install", "-r", str(requirements_path)], check=False)
+        ok = run_command([str(pip_path), "install", "-r", str(requirements_path)], check=False)
 
+    if not ok:
+        print("[警告] 后端依赖安装可能失败（请检查上方输出）。")
+        # venv 仍可用于后续手动修复：不强制失败
     return True
 
 
@@ -210,23 +237,32 @@ def main():
     print(f"项目根目录: {project_root}")
 
     # 1. 安装 uv
-    install_uv()
+    uv_ok = install_uv()
 
     # 2. 设置后端
-    setup_backend_venv(project_root)
+    backend_ok = setup_backend_venv(project_root)
 
     # 3. 设置前端
-    setup_frontend(project_root)
+    frontend_ok = setup_frontend(project_root)
 
     print("\n" + "=" * 60)
-    print("安装完成!")
+    if backend_ok and frontend_ok:
+        print("安装完成!")
+    else:
+        print("安装未完全成功（请检查上方输出）")
     print("=" * 60)
+    print("\n结果摘要:")
+    print(f"  - uv: {'OK' if uv_ok else 'FAIL/NO'}")
+    print(f"  - backend: {'OK' if backend_ok else 'FAIL'}")
+    print(f"  - frontend: {'OK' if frontend_ok else 'FAIL'}")
     print("\n后续步骤:")
     print("  1. 运行项目: python scripts/start.py")
     print("  2. 或手动启动:")
     print("     - 后端: uvicorn backend.src.main:app --reload --port 8123")
     print("     - 前端: cd frontend-gui && npm run start")
     print("")
+    if not (backend_ok and frontend_ok):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

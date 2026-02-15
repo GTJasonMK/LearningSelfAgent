@@ -1092,6 +1092,18 @@ def _assess_knowledge_sufficiency(
     if suggestion not in valid_suggestions:
         suggestion = "proceed"
 
+    # 冷启动兜底（docs/agent 对齐）：
+    # - 当没有任何可用知识（skills/graph/memories 全空）且 LLM 建议 ask_user，
+    #   如果缺失的是 skill/methodology/tool，优先改为 create_draft_skill（从零起草方法论），
+    #   避免因为知识库为空而“还没开始就进入 waiting”，阻断自我进化闭环。
+    cold_start = (skill_count <= 0) and (graph_count <= 0) and (memory_count <= 0)
+    if (not bool(sufficient)) and cold_start and suggestion == "ask_user" and missing_knowledge in {"skill", "methodology", "tool"}:
+        suggestion = "create_draft_skill"
+        if reason:
+            reason = f"{reason}（冷启动：改为先草拟技能）"
+        else:
+            reason = "冷启动：无可用知识，改为先草拟技能"
+
     return KnowledgeSufficiencyResult(
         sufficient=sufficient,
         reason=reason,

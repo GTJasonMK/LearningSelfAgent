@@ -25,25 +25,52 @@ def write_task_debug_output(
     - 让复杂 bug 可复盘：主链路关键节点（规划/解析/执行/修正/失败）都能留下可读痕迹
     - 控制体积：避免把超长 prompt/输出刷爆数据库与 UI
     """
-    head = str(message or "").strip()
+    """
+    约定：debug 输出使用 JSON（便于前端结构化渲染与过滤）。
 
-    suffix = ""
+    注意：
+    - task_outputs.content 是 TEXT，无法存结构化字段，因此这里统一 JSON 序列化；
+    - 为避免 truncate 破坏 JSON 结构：超长时将 data 降级为 data_preview，并标记 truncated=true。
+    """
+    level_value = str(level or "debug").strip().lower() or "debug"
+    msg_value = str(message or "").strip() or "(empty)"
+
+    payload: dict[str, Any] = {"kind": "debug", "level": level_value, "message": msg_value}
     if isinstance(data, dict) and data:
+        payload["data"] = data
+
+    def _dump(obj: dict[str, Any]) -> str:
         try:
-            suffix = json.dumps(data, ensure_ascii=False)
+            return json.dumps(obj, ensure_ascii=False)
         except Exception:
-            suffix = json.dumps({"data": str(data)}, ensure_ascii=False)
+            # 极端情况：对象不可序列化，降级为字符串
+            return json.dumps({"kind": "debug", "level": level_value, "message": msg_value, "error": "json_dump_failed"}, ensure_ascii=False)
 
-    content = head
-    if suffix:
-        content = f"{head} | {suffix}" if head else suffix
+    content = _dump(payload)
+    if len(content) > int(AGENT_DEBUG_OUTPUT_MAX_CHARS or 0):
+        preview = ""
+        if isinstance(data, dict) and data:
+            try:
+                preview = json.dumps(data, ensure_ascii=False)
+            except Exception:
+                preview = str(data)
+        payload = {
+            "kind": "debug",
+            "level": level_value,
+            "message": truncate_text(msg_value, 240, strip=False) or "(empty)",
+            "data_preview": truncate_text(preview, 720, strip=False),
+            "truncated": True,
+        }
+        content = _dump(payload)
 
-    content = content.strip() or "(empty)"
-    if level:
-        content = f"[{level}] {content}"
-
-    # debug 输出允许保留换行等格式，因此不做 strip
-    content = truncate_text(content, AGENT_DEBUG_OUTPUT_MAX_CHARS, strip=False) or "(empty)"
+    if len(content) > int(AGENT_DEBUG_OUTPUT_MAX_CHARS or 0):
+        payload = {
+            "kind": "debug",
+            "level": level_value,
+            "message": truncate_text(msg_value, 240, strip=False) or "(empty)",
+            "truncated": True,
+        }
+        content = _dump(payload)
     try:
         create_task_output(
             task_id=int(task_id),

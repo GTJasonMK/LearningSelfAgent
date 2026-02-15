@@ -85,6 +85,11 @@ body {
   display: none;
 }
 
+/* 通用：隐藏元素（JS 可通过 classList.add("is-hidden") 控制） */
+.is-hidden {
+  display: none !important;
+}
+
 .panel-topbar-right {
   display: flex;
   align-items: center;
@@ -551,6 +556,108 @@ input:focus, select:focus, textarea:focus {
   margin-bottom: 0;
 }
 
+.system-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-md);
+}
+
+.system-metric {
+  border: 1px solid var(--color_border);
+  background: var(--color_paper);
+  border-radius: var(--size-radius-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.system-metric-label {
+  font-size: 11px;
+  color: var(--color_muted);
+}
+
+.system-metric-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color_ink);
+}
+
+.system-metric-split {
+  margin: 0 6px;
+  font-size: 12px;
+  color: var(--color_muted);
+}
+
+.system-domain-tree {
+  margin-top: var(--spacing-md);
+}
+
+.system-domain-node {
+  border: 1px solid var(--color_border);
+  background: var(--color_paper);
+  border-radius: var(--size-radius-md);
+  padding: 6px 10px;
+  margin-bottom: 8px;
+}
+
+.system-domain-summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.system-domain-title {
+  font-weight: 600;
+}
+
+.system-domain-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.system-domain-desc {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--color_muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.system-domain-children {
+  margin: 8px 0 0 18px;
+  padding: 0;
+  list-style: disc;
+  color: var(--color_muted);
+  font-size: 12px;
+}
+
+.system-domain-child {
+  margin: 2px 0;
+}
+
+.system-inline-form {
+  grid-template-columns: 1fr 140px;
+}
+
+.system-filter-input {
+  margin-top: var(--spacing-sm);
+}
+
+.panel-list-subtext {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--color_muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .system-search-form {
   grid-template-columns: 1fr 180px 140px;
 }
@@ -570,8 +677,36 @@ input:focus, select:focus, textarea:focus {
   margin-top: var(--spacing-md);
 }
 
+.system-reuse-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-lg);
+  margin-top: var(--spacing-md);
+}
+
+.system-reuse-pane {
+  min-width: 0;
+}
+
 .system-pane {
   min-width: 0;
+}
+
+.system-advanced {
+  border: 1px solid var(--color_border);
+  border-radius: var(--size-radius-md);
+  background: var(--color_paper_faint);
+  padding: var(--spacing-sm) var(--spacing-md);
+}
+
+.system-advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color_muted);
+}
+
+.system-advanced-body {
+  margin-top: var(--spacing-md);
 }
 
 .system-pane-title {
@@ -775,6 +910,12 @@ input:focus, select:focus, textarea:focus {
   border-left: 3px solid var(--color_accent);
 }
 
+/* 通用：用于标记“当前步骤/当前焦点” */
+.panel-list-item.is-current {
+  background: var(--color_paper_alt);
+  border-left: 3px solid var(--color_accent);
+}
+
 @media (max-width: 980px) {
   .eval-review-grid {
     grid-template-columns: 1fr;
@@ -906,6 +1047,87 @@ input:focus, select:focus, textarea:focus {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+/* 概览页：最近动态 - 结构化渲染 */
+#dashboard-activity .dashboard-activity-item {
+  white-space: normal;
+  gap: var(--spacing-md);
+}
+
+.dashboard-activity-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.dashboard-activity-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--color_muted);
+  font-size: var(--font-size-xs);
+  margin-bottom: 4px;
+}
+
+.dashboard-activity-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-activity-context {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 520px;
+}
+
+.dashboard-activity-title {
+  font-size: var(--font-size-sm);
+  color: var(--color_ink);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.dashboard-activity-sub {
+  margin-top: 2px;
+  font-size: var(--font-size-xs);
+  color: var(--color_muted);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.dashboard-activity-tags {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-end;
+  flex-shrink: 0;
+}
+
+.dashboard-activity-detail {
+  margin-top: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  background: var(--color_paper_faint);
+  border: 1px solid var(--color_border);
+  border-radius: var(--size-radius-md);
+  padding: 6px 8px;
+}
+
+.dashboard-activity-detail.is-collapsed {
+  max-height: 84px;
+  overflow: hidden;
+}
+
+.dashboard-activity-detail.is-expanded {
+  max-height: var(--list-max-height);
+  overflow: auto;
+}
+
+.dashboard-activity-toggle {
+  margin-left: auto;
 }
 
 @media (max-width: 860px) {
@@ -1255,6 +1477,11 @@ input:focus, select:focus, textarea:focus {
   border-color: var(--color_accent);
 }
 
+.task-card--waiting {
+  border-color: #ffcc80;
+  background: linear-gradient(180deg, #fff8e1 0%, var(--color_paper) 56%);
+}
+
 .task-card.is-active {
   border-color: var(--color_accent_deep);
   background: var(--color_paper_alt);
@@ -1265,6 +1492,12 @@ input:focus, select:focus, textarea:focus {
   justify-content: space-between;
   align-items: flex-start;
   margin-bottom: var(--spacing-sm);
+}
+
+.task-card-header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .task-card-id {
@@ -1283,6 +1516,27 @@ input:focus, select:focus, textarea:focus {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.task-card-waiting-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #8d6e00;
+  background: #fff3cd;
+  border: 1px solid #ffe082;
+  white-space: nowrap;
+}
+
+.task-card-waiting-hint {
+  margin-top: 4px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #8d6e00;
 }
 
 /* Overlay Drawer */
@@ -1587,6 +1841,35 @@ input:focus, select:focus, textarea:focus {
   gap: var(--spacing-lg);
 }
 
+.world-bottom-choices {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+  align-items: center;
+}
+
+.world-bottom-choices.is-hidden {
+  display: none;
+}
+
+.world-choice-btn {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--color_border);
+  border-radius: var(--size-radius-lg);
+  background: var(--color_paper_faint);
+  color: var(--color_ink);
+  cursor: pointer;
+  font-family: var(--font_display);
+  font-size: 13px;
+}
+
+.world-choice-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px var(--color_shadow);
+}
+
 .world-bottom-upload,
 .world-bottom-send,
 .world-bottom-input {
@@ -1665,6 +1948,48 @@ input:focus, select:focus, textarea:focus {
   margin-bottom: var(--spacing-md);
   border-bottom: 1px dashed var(--color_border);
   padding-bottom: var(--spacing-xs);
+}
+
+.task-need-input-question {
+  padding: var(--spacing-sm) var(--spacing-md);
+  border: 1px dashed var(--color_border);
+  border-radius: var(--size-radius-md);
+  background: var(--color_paper_faint);
+  color: var(--color_ink);
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+.task-need-input-choices {
+  margin-top: var(--spacing-sm);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+}
+
+.task-need-input-editor {
+  margin-top: var(--spacing-sm);
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: center;
+}
+
+.task-need-input-editor > input {
+  flex: 1;
+  min-width: 120px;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--color_border);
+  border-radius: var(--size-radius-md);
+  background: var(--color_paper);
+  color: var(--color_ink);
+  font-size: var(--font-size-md);
+}
+
+.task-need-input-editor > input:focus {
+  border-color: var(--color_accent);
+  outline: none;
+  box-shadow: 0 0 0 2px var(--color_accent_soft);
 }
 
 .timeline-item {

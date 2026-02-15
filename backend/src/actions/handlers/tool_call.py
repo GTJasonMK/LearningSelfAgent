@@ -1,19 +1,27 @@
+import json
 import logging
 import os
 import shlex
-from typing import Optional, Tuple
+import time
+from typing import List, Optional, Set, Tuple
 
+from backend.src.common.path_utils import normalize_windows_abs_path_on_posix
 from backend.src.constants import (
     ACTION_TYPE_TOOL_CALL,
+    AGENT_EXPERIMENT_DIR_REL,
+    AGENT_SHELL_COMMAND_DEFAULT_TIMEOUT_MS,
     AUTO_TOOL_DESCRIPTION_TEMPLATE,
     AUTO_TOOL_PREFIX,
     DEFAULT_TOOL_VERSION,
     ERROR_MESSAGE_PROMPT_RENDER_FAILED,
+    TOOL_NAME_WEB_FETCH,
     TOOL_METADATA_SOURCE_AUTO,
+    SHELL_COMMAND_REQUIRE_FILE_WRITE_BINDING_DEFAULT,
 )
 from backend.src.services.execution.shell_command import run_shell_command
 from backend.src.services.debug.debug_output import write_task_debug_output
 from backend.src.services.tools.tool_records import create_tool_record as _create_tool_record
+from backend.src.repositories.task_steps_repo import list_task_steps_for_run
 from backend.src.repositories.tools_repo import (
     get_tool,
     get_tool_by_name,
@@ -23,6 +31,53 @@ from backend.src.repositories.tools_repo import (
 from backend.src.services.permissions.permissions_store import is_tool_enabled
 
 logger = logging.getLogger(__name__)
+
+def _truncate_inline(text: object, max_chars: int = 220) -> str:
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    raw = " ".join(raw.split()).strip()
+    if not raw:
+        return ""
+    limit = max(1, int(max_chars))
+    if len(raw) <= limit:
+        return raw
+    return f"{raw[: max(0, limit - 1)]}…"
+
+
+_WEB_FETCH_BLOCK_MARKERS: List[Tuple[str, str]] = [
+    # 英文常见反爬/限流提示
+    ("too many requests", "too_many_requests"),
+    ("access denied", "access_denied"),
+    ("request blocked", "request_blocked"),
+    ("verify you are human", "verify_human"),
+    ("enable javascript", "enable_javascript"),
+    ("cloudflare", "cloudflare"),
+    ("captcha", "captcha"),
+    ("service unavailable", "service_unavailable"),
+    # 中文常见提示
+    ("请求过于频繁", "too_many_requests"),
+    ("访问被拒绝", "access_denied"),
+    ("需要启用javascript", "enable_javascript"),
+]
+
+
+def _detect_web_fetch_block_reason(output_text: str) -> Optional[str]:
+    """
+    尝试识别 web_fetch 返回的“反爬/限流/拦截页面”。
+
+    说明：
+    - curl -f 只能识别 HTTP>=400；但部分站点会返回 200 + 拦截页面正文；
+    - 这些正文不应作为“抓取成功证据”继续进入 json_parse/task_output，否则会诱发“编数据”。
+    """
+    raw = str(output_text or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    sample = lowered[:4000]
+    for phrase, tag in _WEB_FETCH_BLOCK_MARKERS:
+        if phrase in sample:
+            return tag
+    return None
+
 
 def _normalize_exec_spec(exec_spec: dict) -> dict:
     """
@@ -133,10 +188,323 @@ def _resolve_tool_exec_spec(payload: dict) -> Optional[dict]:
             if has_any:
                 return exec_spec
     meta = _load_tool_metadata_from_db(payload.get("tool_id"), payload.get("tool_name"))
-    if not isinstance(meta, dict):
+    if isinstance(meta, dict):
+        exec_spec = meta.get("exec")
+        if isinstance(exec_spec, dict):
+            normalized = _normalize_exec_spec(exec_spec)
+            has_any = bool(
+                str(normalized.get("type") or "").strip()
+                or (isinstance(normalized.get("args"), list) and normalized.get("args"))
+                or str(normalized.get("command") or "").strip()
+            )
+            if has_any:
+                return normalized
+
+    # 再兜底：从实验目录脚本推断执行定义（防止“已写脚本但漏填 exec”中断）。
+    inferred = _infer_exec_spec_from_workspace_script(payload)
+    if isinstance(inferred, dict):
+        return _normalize_exec_spec(inferred)
+    return None
+
+
+def _infer_exec_spec_from_workspace_script(payload: dict) -> Optional[dict]:
+    """
+    兜底：当 tool_metadata.exec 缺失时，尝试从实验目录推断脚本执行命令。
+
+    适用场景：模型先写了 `backend/.agent/workspace/<tool_name>.py`，
+    但下一步 tool_call 漏填了 tool_metadata.exec。
+    """
+    tool_name = str(payload.get("tool_name") or "").strip()
+    if not tool_name:
         return None
-    exec_spec = meta.get("exec")
-    return _normalize_exec_spec(exec_spec) if isinstance(exec_spec, dict) else None
+
+    workdir = ""
+    meta = payload.get("tool_metadata")
+    if isinstance(meta, dict):
+        exec_meta = meta.get("exec")
+        if isinstance(exec_meta, dict):
+            workdir = str(exec_meta.get("workdir") or "").strip()
+    if not workdir:
+        workdir = os.getcwd()
+
+    workspace_dir = os.path.join(workdir, str(AGENT_EXPERIMENT_DIR_REL).replace("/", os.sep))
+    candidates = [
+        (os.path.join(workspace_dir, f"{tool_name}.py"), "python"),
+        (os.path.join(workspace_dir, f"{tool_name}.sh"), "sh"),
+        (os.path.join(workspace_dir, f"{tool_name}.ps1"), "powershell"),
+        (os.path.join(workspace_dir, f"{tool_name}.bat"), None),
+        (os.path.join(workspace_dir, f"{tool_name}.cmd"), None),
+    ]
+
+    for script_path, launcher in candidates:
+        if not os.path.exists(script_path):
+            continue
+        rel_script = os.path.relpath(script_path, workdir)
+        rel_script = rel_script.replace("\\", "/")
+        command = f"{launcher} {rel_script}" if launcher else rel_script
+        return {
+            "type": "shell",
+            "command": command,
+            "workdir": workdir,
+            "timeout_ms": AGENT_SHELL_COMMAND_DEFAULT_TIMEOUT_MS,
+        }
+
+    return None
+
+
+def _load_json_object(value: object) -> Optional[dict]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, str):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    return dict(parsed) if isinstance(parsed, dict) else None
+
+
+def _parse_command_tokens_for_dependency(command: object) -> List[str]:
+    if isinstance(command, list):
+        return [str(item) for item in command if str(item).strip()]
+    if isinstance(command, str):
+        raw = str(command).strip()
+        if not raw:
+            return []
+        tokens = shlex.split(raw, posix=os.name != "nt")
+        if os.name != "nt":
+            return [str(item) for item in tokens]
+        cleaned: List[str] = []
+        for item in tokens:
+            value = str(item)
+            if len(value) >= 2 and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'")):
+                value = value[1:-1]
+            cleaned.append(value)
+        return cleaned
+    return []
+
+
+def _looks_like_executable_token(token: str) -> bool:
+    head = str(token or "").strip()
+    if not head:
+        return False
+    lowered = head.lower()
+    if lowered.startswith("-"):
+        return False
+    ext = os.path.splitext(lowered)[1]
+    if ext in {".py", ".js", ".ts", ".sh", ".ps1", ".bat", ".cmd", ".txt", ".md", ".csv", ".json"}:
+        return False
+    if "/" in head or "\\" in head:
+        return True
+    if lowered.endswith(".exe"):
+        return True
+    return lowered in {
+        "python",
+        "python3",
+        "py",
+        "pip",
+        "pip3",
+        "curl",
+        "wget",
+        "node",
+        "npm",
+        "npx",
+        "git",
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "pwsh",
+        "uv",
+        "uvicorn",
+    }
+
+
+def _extract_script_candidates_from_tokens(tokens: List[str]) -> List[str]:
+    if not tokens:
+        return []
+
+    first = str(tokens[0] or "").strip()
+    if not first:
+        return []
+
+    first_name = os.path.splitext(os.path.basename(first))[0].lower()
+    if first_name in {"python", "python3", "py"}:
+        if len(tokens) >= 2 and str(tokens[1] or "").strip() in {"-c", "-m"}:
+            return []
+        for token in tokens[1:]:
+            current = str(token or "").strip()
+            if not current or current.startswith("-"):
+                continue
+            if current.lower().endswith((".py", ".sh", ".ps1", ".bat", ".cmd")):
+                return [current]
+            return []
+        return []
+
+    if first.lower().endswith((".py", ".sh", ".ps1", ".bat", ".cmd")):
+        return [first]
+    return []
+
+
+def _extract_script_candidates_from_exec_spec(exec_spec: dict, tool_input: str) -> List[str]:
+    if not isinstance(exec_spec, dict):
+        return []
+
+    args = exec_spec.get("args")
+    command = exec_spec.get("command")
+    tokens: List[str] = []
+
+    if isinstance(args, list) and args:
+        formatted_args = [str(item).replace("{input}", tool_input) for item in args]
+        if isinstance(command, str) and command.strip():
+            command_tokens = _parse_command_tokens_for_dependency(str(command).replace("{input}", tool_input))
+            if command_tokens:
+                if _looks_like_executable_token(formatted_args[0]):
+                    tokens = formatted_args
+                else:
+                    tokens = command_tokens + formatted_args
+            else:
+                tokens = formatted_args
+        else:
+            tokens = formatted_args
+    elif isinstance(command, str) and command.strip():
+        tokens = _parse_command_tokens_for_dependency(str(command).replace("{input}", tool_input))
+    elif isinstance(command, list) and command:
+        tokens = [str(item).replace("{input}", tool_input) for item in command if str(item).strip()]
+
+    return _extract_script_candidates_from_tokens(tokens)
+
+
+def _resolve_path_for_dependency(raw_path: str, workdir: str) -> str:
+    text = normalize_windows_abs_path_on_posix(str(raw_path or "").strip())
+    if not text:
+        return ""
+
+    base = normalize_windows_abs_path_on_posix(str(workdir or "").strip())
+    if not base:
+        base = os.getcwd()
+    if not os.path.isabs(base):
+        base = os.path.abspath(base)
+
+    if os.path.isabs(text):
+        return os.path.abspath(text)
+    return os.path.abspath(os.path.join(base, text))
+
+
+def _collect_written_script_paths_for_run(
+    *,
+    task_id: int,
+    run_id: int,
+    current_step_id: Optional[int],
+    workdir: str,
+) -> Set[str]:
+    paths: Set[str] = set()
+    try:
+        rows = list_task_steps_for_run(task_id=int(task_id), run_id=int(run_id))
+    except Exception:
+        return paths
+
+    for row in rows or []:
+        if not row:
+            continue
+        try:
+            row_id = int(row["id"]) if row["id"] is not None else None
+        except Exception:
+            row_id = None
+        if current_step_id is not None and row_id == int(current_step_id):
+            continue
+
+        status = str(row["status"] or "").strip().lower() if "status" in row.keys() else ""
+        if status != "done":
+            continue
+
+        detail_obj = _load_json_object(row["detail"] if "detail" in row.keys() else None)
+        action_type = str(detail_obj.get("type") or "").strip().lower() if isinstance(detail_obj, dict) else ""
+        if action_type not in {"file_write", "file_append"}:
+            continue
+
+        payload_obj = detail_obj.get("payload") if isinstance(detail_obj, dict) else None
+        result_obj = _load_json_object(row["result"] if "result" in row.keys() else None)
+
+        raw_path = ""
+        if isinstance(result_obj, dict):
+            raw_path = str(result_obj.get("path") or "").strip()
+        if not raw_path and isinstance(payload_obj, dict):
+            raw_path = str(payload_obj.get("path") or "").strip()
+
+        resolved = _resolve_path_for_dependency(raw_path, workdir)
+        if resolved:
+            paths.add(os.path.normcase(resolved))
+
+    return paths
+
+
+def _enforce_tool_exec_script_dependency(
+    *,
+    task_id: int,
+    run_id: int,
+    step_row,
+    exec_spec: dict,
+    tool_input: str,
+) -> Optional[str]:
+    """
+    强约束：tool_call.exec 若引用脚本文件，必须满足“脚本存在 + 当前 run 已有 file_write/file_append 成功步骤”。
+
+    目的：避免出现“先执行工具脚本，后补写脚本”导致的不可重复失败。
+    """
+    if not SHELL_COMMAND_REQUIRE_FILE_WRITE_BINDING_DEFAULT:
+        return None
+    if not isinstance(exec_spec, dict):
+        return None
+
+    workdir = normalize_windows_abs_path_on_posix(str(exec_spec.get("workdir") or "").strip())
+    if not workdir:
+        workdir = os.getcwd()
+
+    script_candidates = _extract_script_candidates_from_exec_spec(exec_spec, tool_input)
+    if not script_candidates:
+        return None
+
+    current_step_id = None
+    try:
+        if hasattr(step_row, "keys") and "id" in step_row.keys() and step_row["id"] is not None:
+            current_step_id = int(step_row["id"])
+    except Exception:
+        current_step_id = None
+
+    written_paths = _collect_written_script_paths_for_run(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        current_step_id=current_step_id,
+        workdir=workdir,
+    )
+
+    missing_paths: List[str] = []
+    unbound_paths: List[str] = []
+    for candidate in script_candidates:
+        absolute_path = _resolve_path_for_dependency(candidate, workdir)
+        if not absolute_path:
+            continue
+        if not os.path.exists(absolute_path):
+            missing_paths.append(absolute_path)
+            continue
+        normalized = os.path.normcase(absolute_path)
+        if normalized not in written_paths:
+            unbound_paths.append(absolute_path)
+
+    if missing_paths:
+        return (
+            f"工具执行失败: 脚本不存在: {', '.join(missing_paths)}"
+            "（请先执行 file_write/file_append 并确认落盘）"
+        )
+    if unbound_paths:
+        return (
+            f"工具执行失败: 脚本依赖未绑定: {', '.join(unbound_paths)}"
+            "（当前 run 未发现对应的 file_write/file_append 成功步骤）"
+        )
+    return None
 
 
 def _execute_tool_with_exec_spec(exec_spec: dict, tool_input: str) -> Tuple[Optional[str], Optional[str]]:
@@ -244,27 +612,84 @@ def _execute_tool_with_exec_spec(exec_spec: dict, tool_input: str) -> Tuple[Opti
     else:
         return None, "工具未配置 command/args"
 
-    result, error_message = run_shell_command(
-        {
-            "command": cmd_value,
-            "workdir": workdir,
-            "timeout_ms": timeout_ms,
-            "stdin": tool_input if not uses_input_placeholder else "",
-        }
-    )
-    if error_message:
-        return None, error_message
-    if not isinstance(result, dict):
-        return None, "工具执行返回格式异常"
+    retry_cfg = exec_spec.get("retry")
+    max_attempts = 1
+    backoff_ms = 0
+    if isinstance(retry_cfg, dict):
+        try:
+            max_attempts = int(retry_cfg.get("max_attempts") or retry_cfg.get("attempts") or 1)
+        except Exception:
+            max_attempts = 1
+        try:
+            backoff_ms = int(retry_cfg.get("backoff_ms") or retry_cfg.get("delay_ms") or 0)
+        except Exception:
+            backoff_ms = 0
 
-    stdout = str(result.get("stdout") or "")
-    stderr = str(result.get("stderr") or "")
-    ok = bool(result.get("ok"))
-    if not ok:
-        detail = stderr.strip() or stdout.strip() or str(result.get("returncode"))
-        return None, f"工具执行失败: {detail}"
-    output_text = stdout.strip() or stderr.strip()
-    return output_text or "", None
+    # 防止无限重试卡死：即使配置过大也做一个上限保护
+    if max_attempts <= 0:
+        max_attempts = 1
+    if max_attempts > 6:
+        max_attempts = 6
+    if backoff_ms < 0:
+        backoff_ms = 0
+
+    last_error = None
+    last_result = None
+
+    for attempt in range(0, max_attempts):
+        result, error_message = run_shell_command(
+            {
+                "command": cmd_value,
+                "workdir": workdir,
+                "timeout_ms": timeout_ms,
+                "stdin": tool_input if not uses_input_placeholder else "",
+            }
+        )
+        if error_message:
+            last_error = error_message
+            last_result = None
+        elif not isinstance(result, dict):
+            last_error = "工具执行返回格式异常"
+            last_result = None
+        else:
+            last_error = None
+            last_result = dict(result)
+            if bool(last_result.get("ok")):
+                stdout = str(last_result.get("stdout") or "")
+                stderr = str(last_result.get("stderr") or "")
+                output_text = stdout.strip() or stderr.strip()
+                return output_text or "", None
+
+            stdout = str(last_result.get("stdout") or "")
+            stderr = str(last_result.get("stderr") or "")
+            rc = last_result.get("returncode")
+            detail = stderr.strip() or stdout.strip() or (str(rc) if rc is not None else "")
+            last_error = f"工具执行失败: {detail}".strip()
+
+        # 最后一次失败：直接返回
+        if attempt >= max_attempts - 1:
+            break
+
+        # 有 retry 配置才进入重试分支
+        if max_attempts <= 1:
+            break
+
+        # 简单退避（可配置），避免瞬时抖动导致的连续失败
+        if backoff_ms > 0:
+            try:
+                time.sleep(float(backoff_ms) / 1000.0)
+            except Exception:
+                pass
+
+    if last_error:
+        return None, last_error
+    if isinstance(last_result, dict):
+        stdout = str(last_result.get("stdout") or "")
+        stderr = str(last_result.get("stderr") or "")
+        rc = last_result.get("returncode")
+        detail = stderr.strip() or stdout.strip() or (str(rc) if rc is not None else "")
+        return None, f"工具执行失败: {detail}".strip()
+    return None, "工具执行失败"
 
 
 def _build_tool_metadata(task_id: int, run_id: int, step_row, payload: dict) -> dict:
@@ -381,18 +806,26 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
         except Exception:
             allow_empty_output = False
 
+    dependency_error = _enforce_tool_exec_script_dependency(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        step_row=step_row,
+        exec_spec=exec_spec,
+        tool_input=str(tool_input),
+    )
+    if dependency_error:
+        raise ValueError(dependency_error)
+
     output_text, exec_error = _execute_tool_with_exec_spec(exec_spec, str(tool_input))
     if exec_error:
         raise ValueError(exec_error)
 
     output_text = str(output_text or "")
-    # 新工具必须“可观察地成功”：至少要有非空输出，避免把“没跑通/没产出”的工具注册到库里。
-    # 说明：对已存在工具允许 exec.allow_empty_output=true（某些工具用文件落盘而非 stdout），
-    # 但新工具自举阶段不允许为空，否则 Eval 很难基于证据审查工具是否可用。
+    warnings: List[str] = []
     if tool_was_missing and not output_text.strip():
-        raise ValueError("新创建工具自测失败：执行成功但输出为空（请让工具输出可解析结果/关键日志）")
+        warnings.append("新创建工具执行输出为空：建议让工具打印关键结果/关键日志，或使用文件落盘并在后续步骤验证产物。")
     if not output_text.strip() and not allow_empty_output:
-        raise ValueError("工具输出为空（请让工具打印关键结果或设置 exec.allow_empty_output=true）")
+        warnings.append("工具输出为空：若该工具以文件落盘为主，请设置 exec.allow_empty_output=true 并补充验证步骤。")
 
     payload["output"] = output_text
     # 让 metadata 里保留一次可读的样例，便于后续沉淀为技能/回放调试
@@ -406,6 +839,26 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
     record = result.get("record") if isinstance(result, dict) else None
     if not isinstance(record, dict):
         raise ValueError(ERROR_MESSAGE_PROMPT_RENDER_FAILED)
+    if warnings:
+        record["warnings"] = warnings
+
+    # web_fetch：避免把“限流/反爬拦截页正文”当成成功证据继续执行。
+    # 说明：
+    # - 该工具常用于冷启动抓取；若继续在拦截页上做解析/产物落盘，很容易诱发“编数据”或输出无效结果；
+    # - 这里选择“记录证据 + 标记本步失败”，让上层 replan 换源/退避/提示用户提供 API Key。
+    if tool_name_value == TOOL_NAME_WEB_FETCH:
+        block_reason = _detect_web_fetch_block_reason(output_text)
+        if block_reason:
+            warn_text = f"web_fetch 可能被限流/反爬拦截：{block_reason}"
+            if isinstance(record.get("warnings"), list):
+                record["warnings"].append(warn_text)
+            else:
+                record["warnings"] = [warn_text]
+
+            url_text = _truncate_inline(str(tool_input), 180)
+            preview = _truncate_inline(output_text, 260)
+            tail = f" {preview}" if preview else ""
+            return record, f"web_fetch 可能被限流/反爬（{block_reason}）：{url_text}{tail}"
 
     # 新工具：此处只负责“真实执行 + 记录调用”，不直接沉淀为 skill。
     # 说明：

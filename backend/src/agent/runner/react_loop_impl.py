@@ -18,6 +18,7 @@ from backend.src.agent.support import (
     _truncate_observation,
     apply_next_step_patch,
 )
+from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_helpers import (
     call_llm_for_text,
     validate_and_normalize_action_text,
@@ -29,7 +30,6 @@ from backend.src.agent.runner.react_feedback_flow import (
 )
 from backend.src.agent.runner.plan_events import sse_plan, sse_plan_delta
 from backend.src.agent.runner.react_artifacts_gate import apply_artifacts_gates
-from backend.src.agent.runner.react_plan_state import build_agent_plan_payload
 from backend.src.agent.runner.react_replan import run_replan_and_merge
 from backend.src.agent.runner.react_state_manager import (
     persist_loop_state,
@@ -81,6 +81,7 @@ class ReactLoopResult:
     """ReAct 循环执行结果。"""
     run_status: str
     last_step_order: int
+    plan_struct: Optional[PlanStructure] = None
 
 
 def _safe_write_debug(
@@ -176,10 +177,7 @@ def run_react_loop_impl(
     workdir: str,
     model: str,
     parameters: dict,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     tools_hint: str,
     skills_hint: str,
     memories_hint: str,
@@ -207,7 +205,7 @@ def run_react_loop_impl(
     last_step_order = max(0, int(start_step_order) - 1)
 
     # 保险丝：plan 为空时直接失败，避免 idx=-1 等越界错误（常见于旧 run/损坏数据）
-    if not plan_titles:
+    if plan_struct.step_count == 0:
         _safe_write_debug(
             task_id=int(task_id),
             run_id=int(run_id),
@@ -216,28 +214,7 @@ def run_react_loop_impl(
             level="warning",
         )
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} 计划为空，无法执行\n"})
-        return ReactLoopResult(run_status=RUN_STATUS_FAILED, last_step_order=0)
-
-    # 保险丝：保证 plan_items 与 plan_titles 长度一致，避免 resume/旧数据导致 IndexError
-    if not isinstance(plan_items, list):
-        plan_items = []
-    if len(plan_items) > len(plan_titles):
-        del plan_items[len(plan_titles):]
-    while len(plan_items) < len(plan_titles):
-        plan_items.append({})
-    for i, title in enumerate(plan_titles):
-        if not isinstance(plan_items[i], dict):
-            plan_items[i] = {}
-        item = plan_items[i]
-        brief = str(item.get("brief") or "").strip()
-        if not brief:
-            brief = str(title or "").strip()[:10]
-        status = str(item.get("status") or "").strip() or "pending"
-        if status == "planned":
-            status = "pending"
-        item["id"] = i + 1
-        item["brief"] = brief
-        item["status"] = status
+        return ReactLoopResult(run_status=RUN_STATUS_FAILED, last_step_order=0, plan_struct=plan_struct)
 
     react_params = dict(parameters or {})
     react_params.setdefault("temperature", 0.2)
@@ -245,34 +222,25 @@ def run_react_loop_impl(
     start = int(start_step_order)
     if start < 1:
         start = 1
-    if start > len(plan_titles):
-        start = len(plan_titles)
+    if start > plan_struct.step_count:
+        start = plan_struct.step_count
 
-    # max_steps 限制
+    # 开发阶段：执行链路不限制 max_steps，避免评估修复/重规划被上限提前截断。
     max_steps_limit = None
-    try:
-        value = agent_state.get("max_steps") if isinstance(agent_state, dict) else None
-        value = int(value) if value is not None else None
-        max_steps_limit = value if value and value > 0 else None
-    except Exception:
-        max_steps_limit = None
 
     idx = start - 1
 
     # 主循环
-    while idx < len(plan_titles):
+    while idx < plan_struct.step_count:
         step_order = idx + 1
         last_step_order = step_order
-        title = plan_titles[idx]
+        step = plan_struct.get_step(idx)
+        title = step.title if step else ""
 
         # 结算上一步状态
-        for item in plan_items:
-            if item.get("status") == "running":
-                item["status"] = "done"
+        plan_struct.mark_running_as_done()
 
-        allowed: List[str] = []
-        if 0 <= idx < len(plan_allows):
-            allowed = plan_allows[idx] or []
+        allowed: List[str] = step.allow if step else []
         allowed_text = " / ".join(allowed) if allowed else "(未限制)"
 
         step_model = model
@@ -308,11 +276,9 @@ def run_react_loop_impl(
                 react_params=step_react_params,
                 variables_source=variables_source,
                 llm_call=llm_call,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 max_steps_limit=max_steps_limit,
+                agent_state=agent_state,
                 safe_write_debug=_safe_write_debug,
             )
             if inserted:
@@ -335,10 +301,7 @@ def run_react_loop_impl(
                 skills_hint=skills_hint,
                 memories_hint=memories_hint,
                 graph_hint=graph_hint,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 context=context,
                 observations=observations,
@@ -346,14 +309,6 @@ def run_react_loop_impl(
                 run_replan_and_merge=run_replan_and_merge,
                 safe_write_debug=_safe_write_debug,
             )
-            if outcome.plan_titles is not None:
-                plan_titles = outcome.plan_titles
-            if outcome.plan_allows is not None:
-                plan_allows = outcome.plan_allows
-            if outcome.plan_items is not None:
-                plan_items = outcome.plan_items
-            if outcome.plan_artifacts is not None:
-                plan_artifacts = outcome.plan_artifacts
             if outcome.run_status:
                 run_status = outcome.run_status
                 break
@@ -377,24 +332,13 @@ def run_react_loop_impl(
             memories_hint=memories_hint,
             graph_hint=graph_hint,
             allowed=allowed,
-            plan_titles=plan_titles,
-            plan_items=plan_items,
-            plan_allows=plan_allows,
-            plan_artifacts=plan_artifacts,
+            plan_struct=plan_struct,
             agent_state=agent_state,
             observations=observations,
             max_steps_limit=max_steps_limit,
             run_replan_and_merge=run_replan_and_merge,
             safe_write_debug=_safe_write_debug,
         )
-        if artifacts_outcome.plan_titles is not None:
-            plan_titles = artifacts_outcome.plan_titles
-        if artifacts_outcome.plan_allows is not None:
-            plan_allows = artifacts_outcome.plan_allows
-        if artifacts_outcome.plan_items is not None:
-            plan_items = artifacts_outcome.plan_items
-        if artifacts_outcome.plan_artifacts is not None:
-            plan_artifacts = artifacts_outcome.plan_artifacts
         if artifacts_outcome.run_status:
             run_status = artifacts_outcome.run_status
             break
@@ -403,19 +347,13 @@ def run_react_loop_impl(
             continue
 
         # 当前步 -> running
-        if 0 <= idx < len(plan_items):
-            plan_items[idx]["status"] = "running"
-            yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[idx])
-        else:
-            yield sse_plan(task_id=task_id, plan_items=plan_items)
+        plan_struct.set_step_status(idx, "running")
+        yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
         # 尽早落库 running
         persist_loop_state(
             run_id=run_id,
-            plan_titles=plan_titles,
-            plan_items=plan_items,
-            plan_allows=plan_allows,
-            plan_artifacts=plan_artifacts,
+            plan_struct=plan_struct,
             agent_state=agent_state,
             step_order=step_order,
             observations=observations,
@@ -430,10 +368,11 @@ def run_react_loop_impl(
         obs_text = "\n".join(f"- {_truncate_observation(o)}" for o in observations[-3:]) or "(无)"
 
         react_prompt = AGENT_REACT_STEP_PROMPT_TEMPLATE.format(
+            now=now_iso(),
             workdir=workdir,
             agent_workspace=AGENT_EXPERIMENT_DIR_REL,
             message=message,
-            plan=json.dumps(plan_titles, ensure_ascii=False),
+            plan=plan_struct.get_titles_json(),
             step_index=step_order,
             step_title=title,
             allowed_actions=allowed_text,
@@ -462,7 +401,7 @@ def run_react_loop_impl(
 
         # 处理 action 验证失败
         if action_validate_error or not action_obj:
-            result = yield from handle_action_invalid(
+            status, next_idx = yield from handle_action_invalid(
                 task_id=task_id,
                 run_id=run_id,
                 step_order=step_order,
@@ -478,10 +417,7 @@ def run_react_loop_impl(
                 graph_hint=graph_hint,
                 action_validate_error=action_validate_error or "invalid_action",
                 last_action_text=last_action_text,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 context=context,
                 observations=observations,
@@ -489,7 +425,6 @@ def run_react_loop_impl(
                 run_replan_and_merge=run_replan_and_merge,
                 safe_write_debug=_safe_write_debug,
             )
-            status, next_idx, plan_titles, plan_items, plan_allows, plan_artifacts = result
             if status:
                 run_status = status
                 break
@@ -519,7 +454,7 @@ def run_react_loop_impl(
         )
 
         if allow_err or not action_obj or not action_type:
-            result = yield from handle_allow_failure(
+            status, next_idx = yield from handle_allow_failure(
                 task_id=task_id,
                 run_id=run_id,
                 step_order=step_order,
@@ -534,10 +469,7 @@ def run_react_loop_impl(
                 memories_hint=memories_hint,
                 graph_hint=graph_hint,
                 allow_err=allow_err or "action.type 不在 allow 内",
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 context=context,
                 observations=observations,
@@ -545,7 +477,6 @@ def run_react_loop_impl(
                 run_replan_and_merge=run_replan_and_merge,
                 safe_write_debug=_safe_write_debug,
             )
-            status, next_idx, plan_titles, plan_items, plan_allows, plan_artifacts = result
             if status:
                 run_status = status
                 break
@@ -558,18 +489,27 @@ def run_react_loop_impl(
         # plan_patch 处理
         patch_obj = action_obj.get("plan_patch")
         if isinstance(patch_obj, dict):
+            # apply_next_step_patch 仍使用 legacy 列表接口（后续可进一步收编到 PlanStructure）
+            patch_titles, patch_items, patch_allows, patch_artifacts = plan_struct.to_legacy_lists()
             patch_err = apply_next_step_patch(
                 current_step_index=step_order,
                 patch_obj=patch_obj,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_titles=patch_titles,
+                plan_items=patch_items,
+                plan_allows=patch_allows,
+                plan_artifacts=patch_artifacts,
                 max_steps=max_steps_limit,
             )
             if patch_err:
                 yield sse_json({"delta": f"{STREAM_TAG_FAIL} plan_patch 不合法（{patch_err}），已忽略\n"})
             else:
+                patched_plan = PlanStructure.from_legacy(
+                    plan_titles=patch_titles,
+                    plan_items=patch_items,
+                    plan_allows=patch_allows,
+                    plan_artifacts=patch_artifacts,
+                )
+                plan_struct.replace_from(patched_plan)
                 _safe_write_debug(
                     task_id=int(task_id),
                     run_id=int(run_id),
@@ -577,13 +517,10 @@ def run_react_loop_impl(
                     data={"current_step_order": int(step_order), "patch": patch_obj},
                     level="info",
                 )
-                yield sse_plan(task_id=task_id, plan_items=plan_items)
+                yield sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload())
                 persist_plan_only(
                     run_id=run_id,
-                    plan_titles=plan_titles,
-                    plan_items=plan_items,
-                    plan_allows=plan_allows,
-                    plan_artifacts=plan_artifacts,
+                    plan_struct=plan_struct,
                     safe_write_debug=_safe_write_debug,
                     task_id=task_id,
                     step_order=step_order,
@@ -609,11 +546,10 @@ def run_react_loop_impl(
             )
             if fallback_err:
                 run_status = RUN_STATUS_FAILED
-                if 0 <= step_order - 1 < len(plan_items):
-                    plan_items[step_order - 1]["status"] = "failed"
-                    yield sse_plan_delta(
-                        task_id=task_id, plan_items=plan_items, indices=[step_order - 1]
-                    )
+                plan_struct.set_step_status(step_order - 1, "failed")
+                yield sse_plan_delta(
+                    task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[step_order - 1]
+                )
                 yield sse_json({"delta": f"{STREAM_TAG_FAIL} {fallback_err}\n"})
                 break
             if forced_obj:
@@ -629,10 +565,7 @@ def run_react_loop_impl(
                 step_order=step_order,
                 title=title,
                 payload_obj=payload_obj,
-                plan_items=plan_items,
-                plan_titles=plan_titles,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 safe_write_debug=_safe_write_debug,
             )
@@ -702,7 +635,7 @@ def run_react_loop_impl(
 
         # 处理步骤失败
         if step_error:
-            handler_result = yield from handle_step_failure(
+            status, next_idx = yield from handle_step_failure(
                 task_id=task_id,
                 run_id=run_id,
                 step_id=step_id,
@@ -719,10 +652,7 @@ def run_react_loop_impl(
                 graph_hint=graph_hint,
                 action_type=action_type,
                 step_error=step_error,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 context=context,
                 observations=observations,
@@ -732,7 +662,6 @@ def run_react_loop_impl(
                 mark_task_step_failed=mark_task_step_failed,
                 finished_at=finished_at,
             )
-            status, next_idx, plan_titles, plan_items, plan_allows, plan_artifacts = handler_result
             if status:
                 run_status = status
                 break
@@ -775,17 +704,13 @@ def run_react_loop_impl(
             yield yield_memory_write_event(task_id=task_id, run_id=run_id, result=result)
 
         # 结算计划栏状态：步骤成功 -> done
-        if 0 <= idx < len(plan_items):
-            plan_items[idx]["status"] = "done"
-            yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[idx])
+        plan_struct.set_step_status(idx, "done")
+        yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
         # 持久化状态
         persist_loop_state(
             run_id=run_id,
-            plan_titles=plan_titles,
-            plan_items=plan_items,
-            plan_allows=plan_allows,
-            plan_artifacts=plan_artifacts,
+            plan_struct=plan_struct,
             agent_state=agent_state,
             step_order=step_order + 1,
             observations=observations,
@@ -799,4 +724,4 @@ def run_react_loop_impl(
 
         idx += 1
 
-    return ReactLoopResult(run_status=run_status, last_step_order=last_step_order)
+    return ReactLoopResult(run_status=run_status, last_step_order=last_step_order, plan_struct=plan_struct)

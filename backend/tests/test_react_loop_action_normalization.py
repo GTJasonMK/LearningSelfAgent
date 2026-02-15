@@ -53,6 +53,7 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         return task_id, run_id
 
     def _run_react_loop_once(self, *, plan_title: str, allow: list[str], llm_actions: list[dict]):
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
 
@@ -62,7 +63,13 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         plan_titles = [plan_title]
         plan_items = [{"id": 1, "brief": "t", "status": "pending"}]
         plan_allows = [allow]
-        plan_artifacts = []
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         # create_llm_call 会被调用 1..N 次（allow_mismatch/强制补齐等）
         llm_side_effect = []
@@ -92,10 +99,7 @@ class TestReactLoopActionNormalization(unittest.TestCase):
                 workdir=workdir,
                 model="gpt-4o-mini",
                 parameters={"temperature": 0},
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",
@@ -352,6 +356,57 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         exec_spec = obj["payload"]["tool_metadata"]["exec"]
         self.assertEqual(exec_spec["workdir"], workdir)
         self.assertIn("timeout_ms", exec_spec)
+
+    def test_tool_call_missing_tool_name_is_coerced_from_title_before_validation(self):
+        """
+        回归：模型可能只在 title 中写了 tool_name（tool_call:web_fetch ...），但 payload.tool_name 漏填。
+        归一化阶段应从 title 前缀补齐 tool_name，避免 tool_call 执行链路被无意义阻断。
+        """
+        detail, _ = self._run_react_loop_once(
+            plan_title="tool_call:web_fetch 抓取页面",
+            allow=["tool_call"],
+            llm_actions=[
+                {
+                    "action": {
+                        "type": "tool_call",
+                        "payload": {
+                            "input": "https://example.com",
+                            "output": "",
+                            "tool_metadata": {"exec": {"command": "echo {input}"}},
+                        },
+                    }
+                }
+            ],
+        )
+        obj = json.loads(detail)
+        self.assertEqual(obj["type"], "tool_call")
+        self.assertEqual(obj["payload"]["tool_name"], "web_fetch")
+
+
+    def test_tool_call_web_fetch_self_test_uses_stable_example_url(self):
+        """
+        回归：web_fetch 自测阶段优先使用稳定样例 URL，避免外部站点波动导致自测超时。
+        """
+        detail, _ = self._run_react_loop_once(
+            plan_title="tool_call:自测web_fetch工具 验证可用性",
+            allow=["tool_call"],
+            llm_actions=[
+                {
+                    "action": {
+                        "type": "tool_call",
+                        "payload": {
+                            "tool_name": "web_fetch",
+                            "input": "https://wttr.in/Chengdu?format=j1",
+                            "output": "",
+                        },
+                    }
+                }
+            ],
+        )
+        obj = json.loads(detail)
+        self.assertEqual(obj["type"], "tool_call")
+        self.assertEqual(obj["payload"]["tool_name"], "web_fetch")
+        self.assertEqual(obj["payload"]["input"], "https://example.com")
 
 
 if __name__ == "__main__":

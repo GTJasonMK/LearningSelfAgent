@@ -25,6 +25,8 @@ class TestTaskRecovery(unittest.TestCase):
     def test_stop_running_task_records_marks_running_as_stopped(self):
         from datetime import datetime, timezone
         from backend.src.constants import (
+            LLM_STATUS_ERROR,
+            LLM_STATUS_RUNNING,
             RUN_STATUS_RUNNING,
             RUN_STATUS_STOPPED,
             STATUS_RUNNING,
@@ -65,11 +67,26 @@ class TestTaskRecovery(unittest.TestCase):
                     created_at,
                 ),
             )
+            conn.execute(
+                "INSERT INTO llm_records (prompt, response, task_id, run_id, status, started_at, finished_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "hello",
+                    "",
+                    task_id,
+                    run_id,
+                    LLM_STATUS_RUNNING,
+                    created_at,
+                    None,
+                    created_at,
+                    created_at,
+                ),
+            )
 
         result = stop_running_task_records(reason="test")
         self.assertEqual(result["stopped_runs"], 1)
         self.assertEqual(result["stopped_tasks"], 1)
         self.assertEqual(result["reset_steps"], 1)
+        self.assertEqual(result["stopped_llm_records"], 1)
 
         with get_connection() as conn:
             run_row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
@@ -78,12 +95,16 @@ class TestTaskRecovery(unittest.TestCase):
                 "SELECT * FROM task_steps WHERE task_id = ? ORDER BY id ASC LIMIT 1",
                 (task_id,),
             ).fetchone()
+            llm_row = conn.execute("SELECT * FROM llm_records WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
 
         self.assertEqual(run_row["status"], RUN_STATUS_STOPPED)
         self.assertIsNotNone(run_row["finished_at"])
         self.assertEqual(task_row["status"], STATUS_STOPPED)
         self.assertIsNone(task_row["finished_at"])
         self.assertEqual(step_row["status"], STEP_STATUS_PLANNED)
+        self.assertEqual(llm_row["status"], LLM_STATUS_ERROR)
+        self.assertIsNotNone(llm_row["finished_at"])
+        self.assertIn("aborted:test", str(llm_row["error"] or ""))
 
 
 if __name__ == "__main__":

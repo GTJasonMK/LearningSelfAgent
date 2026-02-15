@@ -1,0 +1,46 @@
+import unittest
+from unittest.mock import patch
+
+
+class TestLlmCallsRetry(unittest.TestCase):
+    def test_retry_transient_error_then_success(self):
+        from backend.src.services.llm.llm_calls import create_llm_call
+
+        attempts = {"count": 0}
+
+        def fake_call_llm(prompt: str, model: str, parameters: dict, provider: str = ""):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise Exception("Connection error.")
+            return "ok", {"prompt": 1, "completion": 1, "total": 2}
+
+        with patch("backend.src.services.llm.llm_calls.call_llm", side_effect=fake_call_llm), patch(
+            "backend.src.services.llm.llm_calls.time.sleep", return_value=None
+        ):
+            result = create_llm_call({"prompt": "hello", "provider": "openai", "model": "deepseek-chat"})
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(str(result["record"].get("status") or ""), "success")
+        self.assertEqual(str(result["record"].get("response") or ""), "ok")
+
+    def test_non_transient_error_no_retry(self):
+        from backend.src.services.llm.llm_calls import create_llm_call
+
+        attempts = {"count": 0}
+
+        def fake_call_llm(prompt: str, model: str, parameters: dict, provider: str = ""):
+            attempts["count"] += 1
+            raise Exception("invalid api key")
+
+        with patch("backend.src.services.llm.llm_calls.call_llm", side_effect=fake_call_llm), patch(
+            "backend.src.services.llm.llm_calls.time.sleep", return_value=None
+        ):
+            result = create_llm_call({"prompt": "hello", "provider": "openai", "model": "deepseek-chat"})
+
+        self.assertEqual(attempts["count"], 1)
+        self.assertEqual(str(result["record"].get("status") or ""), "error")
+        self.assertIn("invalid api key", str(result["record"].get("error") or ""))
+
+
+if __name__ == "__main__":
+    unittest.main()

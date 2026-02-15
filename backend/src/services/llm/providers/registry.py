@@ -17,6 +17,8 @@ def normalize_provider_name(name: Optional[str]) -> str:
     raw = str(name or "").strip().lower()
     if not raw:
         raw = str(os.getenv("LLM_PROVIDER") or "").strip().lower()
+    if raw in {"deepseek", "deepseek-openai", "deepseek_openai"}:
+        return LLM_PROVIDER_OPENAI
     return raw or LLM_PROVIDER_OPENAI
 
 
@@ -45,4 +47,3 @@ def create_provider(
         message=f"{ERROR_MESSAGE_LLM_PROVIDER_UNAVAILABLE}:{name}",
         status_code=HTTP_STATUS_BAD_REQUEST,
     )
-

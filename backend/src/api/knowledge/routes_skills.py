@@ -36,6 +36,8 @@ def search_skills(
     q: Optional[str] = None,
     category: Optional[str] = None,
     tag: Optional[str] = None,
+    skill_type: Optional[str] = None,
+    status: Optional[str] = None,
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = DEFAULT_PAGE_OFFSET,
 ) -> dict:
@@ -45,11 +47,15 @@ def search_skills(
     - q：关键字（name/description/scope/category/tags/triggers 模糊匹配）
     - category：类目（支持前缀匹配：tool 会匹配 tool.*）
     - tag：标签（JSON 数组内精确匹配）
+    - skill_type：methodology / solution
+    - status：draft / approved / deprecated / abandoned
     """
     total, rows = search_skills_filtered_like(
         q=q,
         category=category,
         tag=tag,
+        skill_type=skill_type,
+        status=status,
         limit=limit,
         offset=offset,
     )
@@ -65,6 +71,8 @@ def skills_catalog(limit_tags: int = 30) -> dict:
 
     categories_map: Dict[str, int] = {}
     tags_map: Dict[str, int] = {}
+    types_map: Dict[str, int] = {}
+    status_map: Dict[str, int] = {}
 
     for row in rows:
         category = (row["category"] or "").strip() or "misc"
@@ -77,6 +85,12 @@ def skills_catalog(limit_tags: int = 30) -> dict:
                 continue
             tags_map[key] = tags_map.get(key, 0) + 1
 
+        stype = (row["skill_type"] or "").strip() or "methodology"
+        types_map[stype] = types_map.get(stype, 0) + 1
+
+        st = (row["status"] or "").strip().lower() or "approved"
+        status_map[st] = status_map.get(st, 0) + 1
+
     categories = [
         {"category": k, "count": v}
         for k, v in sorted(categories_map.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -85,11 +99,21 @@ def skills_catalog(limit_tags: int = 30) -> dict:
         {"tag": k, "count": v}
         for k, v in sorted(tags_map.items(), key=lambda kv: (-kv[1], kv[0]))[:limit_tags]
     ]
+    skill_types = [
+        {"skill_type": k, "count": v}
+        for k, v in sorted(types_map.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    statuses = [
+        {"status": k, "count": v}
+        for k, v in sorted(status_map.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
 
     return {
         "count": len(rows),
         "categories": categories,
         "tags": tags,
+        "skill_types": skill_types,
+        "statuses": statuses,
     }
 
 

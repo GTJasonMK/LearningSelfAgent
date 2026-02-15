@@ -4,6 +4,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 class TestKnowledgeSufficiency(unittest.TestCase):
@@ -92,6 +93,79 @@ class TestKnowledgeSufficiency(unittest.TestCase):
 
         self.assertTrue(callable(_assess_knowledge_sufficiency))
         self.assertIsNotNone(KnowledgeSufficiencyResult)
+
+    def test_assess_cold_start_overrides_ask_user_to_draft(self):
+        """
+        冷启动回归（docs/agent 对齐）：
+        - 当 skills/graph/memories 都为空且 LLM 建议 ask_user，
+          如果缺失类型是 skill/methodology/tool，应改为 create_draft_skill，
+          避免无意义的 pending_planning waiting 阻断主链路。
+        """
+        import json
+
+        from backend.src.agent.retrieval import _assess_knowledge_sufficiency
+
+        llm_json = json.dumps(
+            {
+                "sufficient": False,
+                "reason": "缺少获取黄金价格数据的具体技能或工具",
+                "missing_knowledge": "skill",
+                "suggestion": "ask_user",
+            },
+            ensure_ascii=False,
+        )
+
+        with patch(
+            "backend.src.agent.retrieval._cached_call_openai",
+            return_value=(llm_json, 0, None),
+        ):
+            result = _assess_knowledge_sufficiency(
+                message="收集黄金价格并保存 CSV",
+                skills=[],
+                graph_nodes=[],
+                memories=[],
+                model="base-model",
+                parameters={"temperature": 0},
+            )
+
+        self.assertFalse(bool(result.sufficient))
+        self.assertEqual(str(result.suggestion), "create_draft_skill")
+        self.assertIn("冷启动", str(result.reason))
+
+    def test_assess_domain_knowledge_ask_user_not_overridden(self):
+        """
+        ask_user 仍需保留：当缺失的是 domain_knowledge（用户约束/输入输出不完整）时，
+        应允许进入 pending_planning waiting，等待用户补充。
+        """
+        import json
+
+        from backend.src.agent.retrieval import _assess_knowledge_sufficiency
+
+        llm_json = json.dumps(
+            {
+                "sufficient": False,
+                "reason": "需要你指定目标文件路径",
+                "missing_knowledge": "domain_knowledge",
+                "suggestion": "ask_user",
+            },
+            ensure_ascii=False,
+        )
+
+        with patch(
+            "backend.src.agent.retrieval._cached_call_openai",
+            return_value=(llm_json, 0, None),
+        ):
+            result = _assess_knowledge_sufficiency(
+                message="写一个文件",
+                skills=[],
+                graph_nodes=[],
+                memories=[],
+                model="base-model",
+                parameters={"temperature": 0},
+            )
+
+        self.assertFalse(bool(result.sufficient))
+        self.assertEqual(str(result.suggestion), "ask_user")
 
 
 if __name__ == "__main__":

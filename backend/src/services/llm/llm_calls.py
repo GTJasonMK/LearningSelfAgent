@@ -25,6 +25,9 @@ from backend.src.storage import get_connection
 
 T = TypeVar("T")
 
+LLM_CALL_MAX_ATTEMPTS = 3
+LLM_CALL_RETRY_BASE_SECONDS = 0.6
+
 
 def _with_sqlite_locked_retry(op: Callable[[], T]) -> T:
     """
@@ -160,17 +163,43 @@ def create_llm_call(payload: Any) -> dict:
         return {"record": llm_record_from_row(row)}
 
     parameters = data.get("parameters") if isinstance(data.get("parameters"), dict) else None
-    try:
-        response_text, tokens = call_llm(prompt_text, model, parameters, provider=provider)
-        error_message = None
-    except AppError as exc:
-        response_text = None
-        tokens = None
-        error_message = exc.message or ERROR_MESSAGE_LLM_CALL_FAILED
-    except Exception as exc:
-        response_text = None
-        tokens = None
-        error_message = str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED
+    def _should_retry_llm_error(error_text: str) -> bool:
+        text = str(error_text or "").lower()
+        if not text:
+            return False
+        transient_markers = (
+            "connection error",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "service unavailable",
+            "rate limit",
+            "too many requests",
+            "429",
+            "502",
+            "503",
+            "504",
+        )
+        return any(marker in text for marker in transient_markers)
+
+    response_text = None
+    tokens = None
+    error_message = None
+    for attempt in range(1, int(LLM_CALL_MAX_ATTEMPTS) + 1):
+        try:
+            response_text, tokens = call_llm(prompt_text, model, parameters, provider=provider)
+            error_message = None
+            break
+        except AppError as exc:
+            error_message = exc.message or ERROR_MESSAGE_LLM_CALL_FAILED
+        except Exception as exc:
+            error_message = str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED
+
+        if attempt >= int(LLM_CALL_MAX_ATTEMPTS):
+            break
+        if not _should_retry_llm_error(error_message):
+            break
+        time.sleep(float(LLM_CALL_RETRY_BASE_SECONDS) * float(attempt))
     finished_at = now_iso()
     if error_message:
         def _mark_error():

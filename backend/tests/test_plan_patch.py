@@ -166,6 +166,122 @@ class TestPlanPatch(unittest.TestCase):
         self.assertEqual(plan_allows[3], ["task_output"])
         self.assertEqual([it.get("id") for it in plan_items], [1, 2, 3, 4])
 
+    def test_apply_next_step_patch_reorders_script_file_write_before_shell_command(self):
+        """
+        回归：insert_steps 内 shell_command 在前、脚本 file_write 在后时，应自动重排，
+        避免运行阶段先执行命令导致“脚本不存在”。
+        """
+        from backend.src.agent.support import apply_next_step_patch
+
+        plan_titles = ["步骤1", "task_output:输出结果"]
+        plan_items = [
+            {"id": 1, "brief": "一", "status": "pending"},
+            {"id": 2, "brief": "输出", "status": "pending"},
+        ]
+        plan_allows = [["llm_call"], ["task_output"]]
+        plan_artifacts = []
+
+        err = apply_next_step_patch(
+            current_step_index=1,
+            patch_obj={
+                "step_index": 2,
+                "insert_steps": [
+                    {"title": "shell_command:执行验证脚本", "brief": "执行", "allow": ["shell_command"]},
+                    {
+                        "title": "file_write:backend/.agent/workspace/verify_csv.py",
+                        "brief": "写脚本",
+                        "allow": ["file_write"],
+                    },
+                ],
+            },
+            plan_titles=plan_titles,
+            plan_items=plan_items,
+            plan_allows=plan_allows,
+            plan_artifacts=plan_artifacts,
+        )
+
+        self.assertIsNone(err)
+        self.assertEqual(plan_titles[1], "file_write:backend/.agent/workspace/verify_csv.py")
+        self.assertEqual(plan_titles[2], "shell_command:执行验证脚本")
+        self.assertEqual(plan_allows[1], ["file_write"])
+        self.assertEqual(plan_allows[2], ["shell_command"])
+
+    def test_apply_next_step_patch_keeps_experiment_file_write_not_compacted(self):
+        """
+        回归：当 artifacts 已覆盖时，实验目录脚本 file_write 也不能被压缩移除，
+        否则后续 shell_command 仍会找不到脚本。
+        """
+        from backend.src.agent.support import apply_next_step_patch
+
+        plan_titles = ["步骤1", "file_write:gold_prices.csv", "task_output:输出结果"]
+        plan_items = [
+            {"id": 1, "brief": "一", "status": "done"},
+            {"id": 2, "brief": "写csv", "status": "pending"},
+            {"id": 3, "brief": "输出", "status": "pending"},
+        ]
+        plan_allows = [["llm_call"], ["file_write"], ["task_output"]]
+        plan_artifacts = ["gold_prices.csv"]
+
+        err = apply_next_step_patch(
+            current_step_index=1,
+            patch_obj={
+                "step_index": 2,
+                "insert_steps": [
+                    {
+                        "title": "file_write:backend/.agent/workspace/verify_csv.py",
+                        "brief": "写脚本",
+                        "allow": ["file_write"],
+                    },
+                    {"title": "shell_command:执行验证脚本", "brief": "执行", "allow": ["shell_command"]},
+                ],
+            },
+            plan_titles=plan_titles,
+            plan_items=plan_items,
+            plan_allows=plan_allows,
+            plan_artifacts=plan_artifacts,
+        )
+
+        self.assertIsNone(err)
+        self.assertIn("file_write:backend/.agent/workspace/verify_csv.py", plan_titles)
+        self.assertIn("shell_command:执行验证脚本", plan_titles)
+        script_idx = plan_titles.index("file_write:backend/.agent/workspace/verify_csv.py")
+        exec_idx = plan_titles.index("shell_command:执行验证脚本")
+        self.assertLess(script_idx, exec_idx)
+
+
+    def test_apply_next_step_patch_skips_absolute_artifact_alias(self):
+        """
+        回归：当 patch.artifacts_add 给出绝对路径，但已存在同名相对 artifact 时，不应重复追加。
+        """
+        from backend.src.agent.support import apply_next_step_patch
+
+        plan_titles = ["步骤1", "file_write:gold_prices.csv", "task_output:输出结果"]
+        plan_items = [
+            {"id": 1, "brief": "一", "status": "pending"},
+            {"id": 2, "brief": "写csv", "status": "pending"},
+            {"id": 3, "brief": "输出", "status": "pending"},
+        ]
+        plan_allows = [["llm_call"], ["file_write"], ["task_output"]]
+        plan_artifacts = ["gold_prices.csv"]
+
+        err = apply_next_step_patch(
+            current_step_index=1,
+            patch_obj={
+                "step_index": 2,
+                "artifacts_add": [
+                    "E:/code/LearningSelfAgent/backend/.agent/workspace/gold_prices.csv"
+                ],
+            },
+            plan_titles=plan_titles,
+            plan_items=plan_items,
+            plan_allows=plan_allows,
+            plan_artifacts=plan_artifacts,
+        )
+
+        self.assertIsNone(err)
+        self.assertEqual(plan_artifacts, ["gold_prices.csv"])
+        self.assertEqual(len(plan_titles), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

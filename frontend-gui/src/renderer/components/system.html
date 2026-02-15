@@ -3,15 +3,93 @@
 
 <div class="system-root">
   <div class="system-subnav" role="tablist">
-    <button class="system-subnav-item is-active" type="button" data-system-target="system-page-search" data-i18n="SYSTEM_SUBTAB_SEARCH"></button>
-    <button class="system-subnav-item" type="button" data-system-target="system-page-tools" data-i18n="SYSTEM_SUBTAB_TOOLS"></button>
-    <button class="system-subnav-item" type="button" data-system-target="system-page-records" data-i18n="SYSTEM_SUBTAB_RECORDS"></button>
-    <button class="system-subnav-item" type="button" data-system-target="system-page-config" data-i18n="SYSTEM_SUBTAB_CONFIG"></button>
-    <button class="system-subnav-item" type="button" data-system-target="system-page-permissions" data-i18n="SYSTEM_SUBTAB_PERMISSIONS"></button>
+    <button class="system-subnav-item is-active" type="button" data-system-target="system-page-resources" data-i18n="SYSTEM_SUBTAB_RESOURCES"></button>
+    <button class="system-subnav-item" type="button" data-system-target="system-page-search" data-i18n="SYSTEM_SUBTAB_SEARCH"></button>
+    <button class="system-subnav-item" type="button" data-system-target="system-page-governance" data-i18n="SYSTEM_SUBTAB_GOVERNANCE"></button>
+    <button class="system-subnav-item" type="button" data-system-target="system-page-runtime" data-i18n="SYSTEM_SUBTAB_RUNTIME"></button>
   </div>
 
   <div class="system-pages">
-    <section id="system-page-search" class="system-page is-visible">
+    <section id="system-page-resources" class="system-page is-visible">
+      <div class="system-stack">
+        <div class="panel-card system-card">
+          <div class="panel-card-header">
+            <h3 class="panel-card-title" data-i18n="SYSTEM_RESOURCES_OVERVIEW_TITLE"></h3>
+            <button id="system-resources-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+          </div>
+
+          <div class="system-metrics-grid">
+            <div class="system-metric">
+              <div class="system-metric-label" data-i18n="SYSTEM_METRIC_DOMAINS"></div>
+              <div id="system-count-domains" class="system-metric-value" data-i18n="DASH"></div>
+            </div>
+            <div class="system-metric">
+              <div class="system-metric-label" data-i18n="SYSTEM_METRIC_SKILLS"></div>
+              <div id="system-count-skills" class="system-metric-value" data-i18n="DASH"></div>
+            </div>
+            <div class="system-metric">
+              <div class="system-metric-label" data-i18n="SYSTEM_METRIC_SOLUTIONS"></div>
+              <div id="system-count-solutions" class="system-metric-value" data-i18n="DASH"></div>
+            </div>
+            <div class="system-metric">
+              <div class="system-metric-label" data-i18n="SYSTEM_METRIC_TOOLS"></div>
+              <div id="system-count-tools" class="system-metric-value" data-i18n="DASH"></div>
+            </div>
+            <div class="system-metric">
+              <div class="system-metric-label" data-i18n="SYSTEM_METRIC_MEMORY"></div>
+              <div id="system-count-memory" class="system-metric-value" data-i18n="DASH"></div>
+            </div>
+            <div class="system-metric">
+              <div class="system-metric-label" data-i18n="SYSTEM_METRIC_GRAPH"></div>
+              <div class="system-metric-value">
+                <span id="system-count-graph-nodes" data-i18n="DASH"></span>
+                <span class="system-metric-split" data-i18n="SYSTEM_METRIC_GRAPH_SPLIT"></span>
+                <span id="system-count-graph-edges" data-i18n="DASH"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-card system-card">
+          <div class="panel-card-header">
+            <h3 class="panel-card-title" data-i18n="SYSTEM_DOMAINS_TITLE"></h3>
+            <button id="system-domains-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+          </div>
+          <div class="panel-status">
+            <span data-i18n="SYSTEM_DOMAINS_STATUS_LABEL"></span>
+            <span id="system-domains-status" class="panel-status-pill" data-i18n="DASH"></span>
+          </div>
+          <div id="system-domains-tree" class="system-domain-tree"></div>
+        </div>
+
+        <div class="panel-card system-card">
+          <div class="panel-card-header">
+            <h3 class="panel-card-title" data-i18n="SYSTEM_SOLUTIONS_TITLE"></h3>
+            <button id="system-solutions-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+          </div>
+          <form id="system-solutions-form" class="panel-form system-inline-form">
+            <input id="system-solutions-query" type="text" data-placeholder="SYSTEM_SOLUTIONS_QUERY_PLACEHOLDER" />
+            <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_SEARCH"></button>
+          </form>
+          <div class="panel-status">
+            <span data-i18n="SYSTEM_SOLUTIONS_STATUS_LABEL"></span>
+            <span id="system-solutions-status" class="panel-status-pill" data-i18n="DASH"></span>
+          </div>
+          <ul id="system-solutions-list" class="panel-list"></ul>
+        </div>
+
+        <div class="panel-card system-card">
+          <div class="panel-card-header">
+            <h3 class="panel-card-title" data-i18n="SYSTEM_TOOLS_TITLE"></h3>
+            <button id="system-tools-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+          </div>
+          <input id="system-tools-filter" class="panel-input system-filter-input" type="text" data-placeholder="SYSTEM_TOOLS_FILTER_PLACEHOLDER" />
+          <ul id="system-tools-list" class="panel-list"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="system-page-search" class="system-page">
       <div class="panel-card system-card">
         <div class="panel-card-header">
           <h3 class="panel-card-title" data-i18n="SYSTEM_SEARCH_TITLE"></h3>
@@ -41,58 +119,74 @@
       </div>
     </section>
 
-    <section id="system-page-tools" class="system-page">
-      <div class="panel-card system-card">
-        <div class="panel-card-header">
-          <h3 class="panel-card-title" data-i18n="SYSTEM_TOOLS_TITLE"></h3>
-          <button id="tool-list-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
-        </div>
-        <form id="tool-form" class="panel-form system-tool-form">
-          <input id="tool-name" type="text" data-placeholder="TOOL_NAME_PLACEHOLDER" required />
-          <input id="tool-desc" type="text" data-placeholder="TOOL_DESC_PLACEHOLDER" required />
-          <input id="tool-version" type="text" data-placeholder="TOOL_VERSION_PLACEHOLDER" required />
-          <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_REGISTER_TOOL"></button>
-        </form>
-        <ul id="tool-list" class="panel-list"></ul>
-      </div>
-    </section>
-
-    <section id="system-page-records" class="system-page">
+    <section id="system-page-governance" class="system-page">
       <div class="system-stack">
-        <div class="panel-card system-card">
-          <div class="panel-card-header">
-            <h3 class="panel-card-title" data-i18n="SYSTEM_LLM_RECORDS_TITLE"></h3>
-            <button id="llm-record-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+        <div class="system-permissions">
+          <div class="panel-card system-card">
+            <div class="panel-card-header">
+              <h3 class="panel-card-title" data-i18n="SYSTEM_PERMISSIONS_TITLE"></h3>
+              <div class="panel-status-inline">
+                <span data-i18n="PERMISSIONS_STATUS_LABEL"></span>
+                <span id="permissions-status" class="panel-status-pill" data-i18n="DASH"></span>
+              </div>
+            </div>
+            <form id="permissions-form" class="system-toggle-form">
+              <input id="permissions-paths" type="text" data-placeholder="PERMISSIONS_PATHS_PLACEHOLDER" />
+              <div class="system-toggle-group">
+                <label class="panel-inline"><input id="permissions-read" type="checkbox" /><span data-i18n="PERMISSIONS_READ_LABEL"></span></label>
+                <label class="panel-inline"><input id="permissions-write" type="checkbox" /><span data-i18n="PERMISSIONS_WRITE_LABEL"></span></label>
+                <label class="panel-inline"><input id="permissions-exec" type="checkbox" /><span data-i18n="PERMISSIONS_EXEC_LABEL"></span></label>
+              </div>
+              <div class="system-actions">
+                <button id="permissions-load" class="panel-button" type="button" data-i18n="PERMISSIONS_LOAD_LABEL"></button>
+                <button id="permissions-save" class="panel-button panel-button--primary" type="submit" data-i18n="PERMISSIONS_SAVE_LABEL"></button>
+              </div>
+            </form>
           </div>
-          <form id="llm-record-form" class="panel-form system-llm-form">
-            <input id="llm-prompt" type="text" data-placeholder="LLM_PROMPT_PLACEHOLDER" required />
-            <input id="llm-response" type="text" data-placeholder="LLM_RESPONSE_PLACEHOLDER" required />
-            <input id="llm-task-id" type="number" data-placeholder="LLM_TASK_ID_PLACEHOLDER" data-attrs="LLM_TASK_ID" />
-            <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_WRITE_LLM"></button>
-          </form>
-          <ul id="llm-record-list" class="panel-list"></ul>
+
+          <div class="panel-card system-card">
+            <div class="panel-card-header">
+              <h3 class="panel-card-title" data-i18n="SYSTEM_ACTIONS_TITLE"></h3>
+            </div>
+            <ul id="permissions-actions" class="panel-list"></ul>
+          </div>
+
+          <div class="panel-card system-card">
+            <div class="panel-card-header">
+              <h3 class="panel-card-title" data-i18n="SYSTEM_TOOLS_TOGGLE_TITLE"></h3>
+            </div>
+            <ul id="permissions-tools" class="panel-list"></ul>
+          </div>
         </div>
 
         <div class="panel-card system-card">
           <div class="panel-card-header">
-            <h3 class="panel-card-title" data-i18n="SYSTEM_TOOL_RECORDS_TITLE"></h3>
-            <button id="tool-record-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+            <h3 class="panel-card-title" data-i18n="SYSTEM_REUSE_TITLE"></h3>
+            <button id="system-reuse-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
           </div>
-          <form id="tool-record-form" class="panel-form system-tool-record-form">
-            <input id="tool-record-tool" type="number" data-placeholder="TOOL_RECORD_TOOL_PLACEHOLDER" data-attrs="TOOL_RECORD_TOOL" required />
-            <input id="tool-record-task" type="number" data-placeholder="TOOL_RECORD_TASK_PLACEHOLDER" data-attrs="TOOL_RECORD_TASK" />
-            <input id="tool-record-skill" type="number" data-placeholder="TOOL_RECORD_SKILL_PLACEHOLDER" data-attrs="TOOL_RECORD_SKILL" />
-            <select id="tool-record-reuse"></select>
-            <input id="tool-record-input" type="text" data-placeholder="TOOL_RECORD_INPUT_PLACEHOLDER" required />
-            <input id="tool-record-output" type="text" data-placeholder="TOOL_RECORD_OUTPUT_PLACEHOLDER" required />
-            <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_WRITE_TOOL_RECORD"></button>
-          </form>
-          <ul id="tool-record-list" class="panel-list"></ul>
+          <div class="system-reuse-grid">
+            <div class="system-reuse-pane">
+              <div class="system-pane-title" data-i18n="SYSTEM_REUSE_TOOLS_TITLE"></div>
+              <div class="panel-status">
+                <span data-i18n="SYSTEM_REUSE_SUMMARY_LABEL"></span>
+                <span id="system-tool-reuse-summary" class="panel-status-pill" data-i18n="DASH"></span>
+              </div>
+              <ul id="system-tool-reuse-list" class="panel-list"></ul>
+            </div>
+            <div class="system-reuse-pane">
+              <div class="system-pane-title" data-i18n="SYSTEM_REUSE_SKILLS_TITLE"></div>
+              <div class="panel-status">
+                <span data-i18n="SYSTEM_REUSE_SUMMARY_LABEL"></span>
+                <span id="system-skill-reuse-summary" class="panel-status-pill" data-i18n="DASH"></span>
+              </div>
+              <ul id="system-skill-reuse-list" class="panel-list"></ul>
+            </div>
+          </div>
         </div>
       </div>
     </section>
 
-    <section id="system-page-config" class="system-page">
+    <section id="system-page-runtime" class="system-page">
       <div class="panel-card system-card">
         <div class="panel-card-header">
           <h3 class="panel-card-title" data-i18n="SYSTEM_CONFIG_TITLE"></h3>
@@ -113,43 +207,60 @@
           </div>
         </form>
       </div>
-    </section>
-
-    <section id="system-page-permissions" class="system-page">
-      <div class="panel-card system-card">
-        <div class="panel-card-header">
-          <h3 class="panel-card-title" data-i18n="SYSTEM_PERMISSIONS_TITLE"></h3>
-          <div class="panel-status-inline">
-            <span data-i18n="PERMISSIONS_STATUS_LABEL"></span>
-            <span id="permissions-status" class="panel-status-pill" data-i18n="DASH"></span>
-          </div>
-        </div>
-        <form id="permissions-form" class="system-toggle-form">
-          <input id="permissions-paths" type="text" data-placeholder="PERMISSIONS_PATHS_PLACEHOLDER" />
-          <div class="system-toggle-group">
-            <label class="panel-inline"><input id="permissions-read" type="checkbox" /><span data-i18n="PERMISSIONS_READ_LABEL"></span></label>
-            <label class="panel-inline"><input id="permissions-write" type="checkbox" /><span data-i18n="PERMISSIONS_WRITE_LABEL"></span></label>
-            <label class="panel-inline"><input id="permissions-exec" type="checkbox" /><span data-i18n="PERMISSIONS_EXEC_LABEL"></span></label>
-          </div>
-          <div class="system-actions">
-            <button id="permissions-load" class="panel-button" type="button" data-i18n="PERMISSIONS_LOAD_LABEL"></button>
-            <button id="permissions-save" class="panel-button panel-button--primary" type="submit" data-i18n="PERMISSIONS_SAVE_LABEL"></button>
-          </div>
-        </form>
-      </div>
 
       <div class="panel-card system-card">
         <div class="panel-card-header">
-          <h3 class="panel-card-title" data-i18n="SYSTEM_ACTIONS_TITLE"></h3>
+          <h3 class="panel-card-title" data-i18n="SYSTEM_ADVANCED_TITLE"></h3>
         </div>
-        <ul id="permissions-actions" class="panel-list"></ul>
-      </div>
+        <details class="system-advanced">
+          <summary data-i18n="SYSTEM_ADVANCED_SUMMARY"></summary>
+          <div class="system-advanced-body">
+            <div class="system-stack">
+              <div class="panel-card system-card">
+                <div class="panel-card-header">
+                  <h3 class="panel-card-title" data-i18n="SYSTEM_TOOLS_REGISTER_TITLE"></h3>
+                </div>
+                <form id="tool-form" class="panel-form system-tool-form">
+                  <input id="tool-name" type="text" data-placeholder="TOOL_NAME_PLACEHOLDER" required />
+                  <input id="tool-desc" type="text" data-placeholder="TOOL_DESC_PLACEHOLDER" required />
+                  <input id="tool-version" type="text" data-placeholder="TOOL_VERSION_PLACEHOLDER" required />
+                  <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_REGISTER_TOOL"></button>
+                </form>
+              </div>
 
-      <div class="panel-card system-card">
-        <div class="panel-card-header">
-          <h3 class="panel-card-title" data-i18n="SYSTEM_TOOLS_TOGGLE_TITLE"></h3>
-        </div>
-        <ul id="permissions-tools" class="panel-list"></ul>
+              <div class="panel-card system-card">
+                <div class="panel-card-header">
+                  <h3 class="panel-card-title" data-i18n="SYSTEM_LLM_RECORDS_TITLE"></h3>
+                  <button id="llm-record-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+                </div>
+                <form id="llm-record-form" class="panel-form system-llm-form">
+                  <input id="llm-prompt" type="text" data-placeholder="LLM_PROMPT_PLACEHOLDER" required />
+                  <input id="llm-response" type="text" data-placeholder="LLM_RESPONSE_PLACEHOLDER" required />
+                  <input id="llm-task-id" type="number" data-placeholder="LLM_TASK_ID_PLACEHOLDER" data-attrs="LLM_TASK_ID" />
+                  <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_WRITE_LLM"></button>
+                </form>
+                <ul id="llm-record-list" class="panel-list"></ul>
+              </div>
+
+              <div class="panel-card system-card">
+                <div class="panel-card-header">
+                  <h3 class="panel-card-title" data-i18n="SYSTEM_TOOL_RECORDS_TITLE"></h3>
+                  <button id="tool-record-refresh" class="panel-button panel-button--small" type="button" data-i18n="BUTTON_REFRESH"></button>
+                </div>
+                <form id="tool-record-form" class="panel-form system-tool-record-form">
+                  <input id="tool-record-tool" type="number" data-placeholder="TOOL_RECORD_TOOL_PLACEHOLDER" data-attrs="TOOL_RECORD_TOOL" required />
+                  <input id="tool-record-task" type="number" data-placeholder="TOOL_RECORD_TASK_PLACEHOLDER" data-attrs="TOOL_RECORD_TASK" />
+                  <input id="tool-record-skill" type="number" data-placeholder="TOOL_RECORD_SKILL_PLACEHOLDER" data-attrs="TOOL_RECORD_SKILL" />
+                  <select id="tool-record-reuse"></select>
+                  <input id="tool-record-input" type="text" data-placeholder="TOOL_RECORD_INPUT_PLACEHOLDER" required />
+                  <input id="tool-record-output" type="text" data-placeholder="TOOL_RECORD_OUTPUT_PLACEHOLDER" required />
+                  <button class="panel-button panel-button--primary" type="submit" data-i18n="BUTTON_WRITE_TOOL_RECORD"></button>
+                </form>
+                <ul id="tool-record-list" class="panel-list"></ul>
+              </div>
+            </div>
+          </div>
+        </details>
       </div>
     </section>
   </div>

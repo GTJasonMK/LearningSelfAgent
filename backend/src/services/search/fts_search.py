@@ -10,13 +10,23 @@ def fts_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     说明：
     - 某些 Python/SQLite 构建可能未开启 FTS5；此时 init_db 创建 FTS 会失败并被忽略。
     - 查询侧必须容错：表不存在就回退到 LIKE 方案。
+    - reset 脚本/手工操作误删 FTS5 shadow tables（*_fts_config/_data/_idx/_docsize）会导致
+      “vtable constructor failed”。此时虽然 sqlite_master 仍存在表名，但该 FTS 表不可用，
+      需要回退到 LIKE，避免接口直接 500。
     """
     try:
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
             (str(table_name),),
         ).fetchone()
-        return bool(row and row["name"])
+        if not (row and row["name"]):
+            return False
+        # 仅靠 sqlite_master 无法判断“是否可用”：FTS shadow tables 被误删会导致 vtable 无法打开。
+        try:
+            conn.execute(f"SELECT 1 FROM {row['name']} LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return False
+        return True
     except Exception:
         return False
 

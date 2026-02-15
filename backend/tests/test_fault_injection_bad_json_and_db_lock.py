@@ -39,6 +39,14 @@ class TestFaultInjectionBadJsonAndDbLock(unittest.TestCase):
 
     def test_persist_loop_state_handles_db_locked(self):
         from backend.src.agent.runner import react_state_manager as sm
+        from backend.src.agent.core.plan_structure import PlanStructure
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=["a"],
+            plan_items=[{"id": 1, "brief": "a", "status": "running"}],
+            plan_allows=[["llm_call"]],
+            plan_artifacts=[],
+        )
 
         with patch(
             "backend.src.agent.runner.react_state_manager.update_task_run",
@@ -46,10 +54,7 @@ class TestFaultInjectionBadJsonAndDbLock(unittest.TestCase):
         ):
             ok = sm.persist_loop_state(
                 run_id=1,
-                plan_titles=["a"],
-                plan_items=[{"id": 1, "brief": "a", "status": "running"}],
-                plan_allows=[["llm_call"]],
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 agent_state={},
                 step_order=1,
                 observations=[],

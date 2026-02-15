@@ -103,12 +103,36 @@ def seed_builtin_tools(conn: sqlite3.Connection) -> None:
         conn: 数据库连接
     """
     try:
-        tool_row = conn.execute(
-            "SELECT id FROM tools_items WHERE name = ? ORDER BY id ASC LIMIT 1",
+        rows = conn.execute(
+            "SELECT id, metadata FROM tools_items WHERE name = ? ORDER BY id ASC",
             (TOOL_NAME_WEB_FETCH,),
-        ).fetchone()
+        ).fetchall()
 
-        if not tool_row:
+        def _is_draft_tool(metadata_text: object) -> bool:
+            try:
+                meta = json.loads(str(metadata_text or ""))
+            except Exception:
+                return False
+            if not isinstance(meta, dict):
+                return False
+            approval = meta.get("approval")
+            if not isinstance(approval, dict):
+                return False
+            return str(approval.get("status") or "").strip().lower() == "draft"
+
+        # 仅当不存在“非 draft 的可用 web_fetch”时才插入内置版本：
+        # - 避免被 Agent 运行时创建的 draft 版本占坑，导致后续任务只能选到不可复用的工具；
+        # - 与 tools_repo.get_tool_by_name 的优先级策略配合：优先非 draft。
+        has_non_draft = False
+        for row in rows or []:
+            if not row:
+                continue
+            if _is_draft_tool(row["metadata"]):
+                continue
+            has_non_draft = True
+            break
+
+        if not has_non_draft:
             now = now_iso()
             metadata = json.dumps(
                 {
@@ -116,6 +140,7 @@ def seed_builtin_tools(conn: sqlite3.Connection) -> None:
                         "type": "shell",
                         "args": list(TOOL_WEB_FETCH_ARGS_TEMPLATE),
                         "timeout_ms": TOOL_WEB_FETCH_TIMEOUT_MS,
+                        "retry": {"max_attempts": 3, "backoff_ms": 200},
                     }
                 },
                 ensure_ascii=False,

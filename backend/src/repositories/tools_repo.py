@@ -64,6 +64,28 @@ def _exec_supports_input(metadata_text: Optional[str]) -> bool:
     return False
 
 
+def _tool_is_draft(metadata_text: Optional[str]) -> bool:
+    """
+    判断 tools_items.metadata 中是否包含 approval.status=draft。
+
+    说明：
+    - Agent 执行阶段创建的新工具默认是 draft（待评估通过后再批准）；
+    - draft 工具不应优先进入后续任务的 tools_hint，否则容易把“未验证/不稳定工具”当成默认依赖。
+    """
+    if not metadata_text:
+        return False
+    try:
+        meta = json.loads(metadata_text)
+    except Exception:
+        return False
+    if not isinstance(meta, dict):
+        return False
+    approval = meta.get("approval")
+    if not isinstance(approval, dict):
+        return False
+    return str(approval.get("status") or "").strip().lower() == "draft"
+
+
 def get_tool_by_name(*, name: str, conn: Optional[sqlite3.Connection] = None) -> Optional[sqlite3.Row]:
     """
     按 name 获取工具记录：
@@ -76,6 +98,13 @@ def get_tool_by_name(*, name: str, conn: Optional[sqlite3.Connection] = None) ->
         rows = list(inner.execute(sql, params).fetchall())
         if not rows:
             return None
+        # 优先选择“非 draft 且可用”的工具：避免 draft 工具抢占默认选择。
+        for row in rows:
+            if _tool_is_draft(row["metadata"]):
+                continue
+            if _exec_supports_input(row["metadata"]):
+                return row
+        # 退化：允许选择 draft（但仍要求支持 {input}）。
         for row in rows:
             if _exec_supports_input(row["metadata"]):
                 return row

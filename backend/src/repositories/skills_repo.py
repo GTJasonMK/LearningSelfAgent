@@ -282,9 +282,9 @@ def search_skills_fts_or_like(*, q: str, limit: int = 10, conn: Optional[sqlite3
 
 def list_skill_catalog_source(*, conn: Optional[sqlite3.Connection] = None) -> List[sqlite3.Row]:
     """
-    catalog 聚合所需的最小列集合（category/tags）。
+    catalog 聚合所需的最小列集合（category/tags/skill_type/status）。
     """
-    sql = "SELECT category, tags FROM skills_items"
+    sql = "SELECT category, tags, skill_type, status FROM skills_items"
     with provide_connection(conn) as inner:
         return list(inner.execute(sql).fetchall())
 
@@ -294,6 +294,8 @@ def search_skills_filtered_like(
     q: Optional[str],
     category: Optional[str],
     tag: Optional[str],
+    skill_type: Optional[str],
+    status: Optional[str],
     limit: int,
     offset: int,
     conn: Optional[sqlite3.Connection] = None,
@@ -342,6 +344,18 @@ def search_skills_filtered_like(
                 conditions.append("(tags LIKE ? OR tags LIKE ?)")
                 params.append(f"%{v1}%")
                 params.append(f"%{v2}%")
+
+        if skill_type:
+            st = skill_type.strip()
+            if st:
+                conditions.append("skill_type = ?")
+                params.append(st)
+
+        if status:
+            st = status.strip().lower()
+            if st:
+                conditions.append("LOWER(status) = ?")
+                params.append(st)
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 

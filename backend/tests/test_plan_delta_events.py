@@ -114,6 +114,7 @@ class TestPlanDeltaEvents(unittest.TestCase):
         return task_id, run_id
 
     def test_react_loop_emits_plan_delta_and_reaches_done(self):
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
 
@@ -125,6 +126,13 @@ class TestPlanDeltaEvents(unittest.TestCase):
             {"id": 2, "brief": "输出", "status": "pending"},
         ]
         plan_allows = [["shell_command"], ["task_output"]]
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         # 两步收敛：shell_command -> task_output
         llm_actions = [
@@ -158,10 +166,7 @@ class TestPlanDeltaEvents(unittest.TestCase):
                 workdir=os.getcwd(),
                 model="gpt-4o-mini",
                 parameters={"temperature": 0},
-                plan_titles=list(plan_titles),
-                plan_items=plan_items,
-                plan_allows=[list(a) for a in plan_allows],
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",

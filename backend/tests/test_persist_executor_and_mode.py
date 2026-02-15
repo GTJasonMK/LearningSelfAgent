@@ -53,6 +53,7 @@ class TestPersistExecutorAndMode(unittest.TestCase):
         return task_id, run_id
 
     def test_react_loop_persists_executor_from_agent_state(self):
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
         from backend.src.storage import get_connection
@@ -72,7 +73,13 @@ class TestPersistExecutorAndMode(unittest.TestCase):
             ["file_write"],
             ["file_write"],
         ]
-        plan_artifacts = []
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         llm_actions = [
             {"action": {"type": "file_write", "payload": {"path": "README.md", "content": "doc"}}},
@@ -109,10 +116,7 @@ class TestPersistExecutorAndMode(unittest.TestCase):
                 workdir=workdir,
                 model="base-model",
                 parameters={"temperature": 0.2},
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",

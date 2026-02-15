@@ -30,6 +30,7 @@ from backend.src.constants import (
     ACTION_TYPE_TASK_OUTPUT,
     ACTION_TYPE_TOOL_CALL,
     ACTION_TYPE_USER_PROMPT,
+    AGENT_REACT_OBSERVATION_MAX_CHARS,
 )
 
 # Action 执行函数统一签名：尽量让 executor 不需要知道每个 action 的“特殊参数形态”。
@@ -166,13 +167,83 @@ def _validate_user_prompt(payload: dict) -> Optional[str]:
     question = payload.get("question")
     if not isinstance(question, str) or not question.strip():
         return "user_prompt.question 不能为空"
+
+    if "kind" in payload and payload.get("kind") is not None:
+        kind = payload.get("kind")
+        if not isinstance(kind, str):
+            return "user_prompt.kind 必须是字符串"
+
+    if "choices" in payload and payload.get("choices") is not None:
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            return "user_prompt.choices 必须是数组"
+        for idx, item in enumerate(choices):
+            if isinstance(item, str):
+                if not item.strip():
+                    return f"user_prompt.choices[{idx}] 不能为空"
+                continue
+            if not isinstance(item, dict):
+                return f"user_prompt.choices[{idx}] 必须是对象或字符串"
+            label = item.get("label")
+            if not isinstance(label, str) or not label.strip():
+                return f"user_prompt.choices[{idx}].label 不能为空"
+            if "value" in item and item.get("value") is not None:
+                value = item.get("value")
+                if not isinstance(value, str) or not value.strip():
+                    return f"user_prompt.choices[{idx}].value 不能为空"
     return None
+
+
+def _truncate_text_with_tail(text: str, max_chars: int) -> str:
+    raw = str(text or "")
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw
+    half = max(64, int((max_chars - 8) / 2))
+    if half * 2 >= len(raw):
+        return raw
+    return f"{raw[:half]}\n...\n{raw[-half:]}"
+
+
+def _inject_latest_parse_input_prompt(prompt: str, context: Optional[dict]) -> tuple[str, bool]:
+    """
+    为 llm_call 自动注入最近一次真实观测，减少“提示词未携带数据”导致的空转。
+    """
+    if not isinstance(context, dict):
+        return prompt, False
+    base = str(prompt or "").strip()
+    if not base:
+        return prompt, False
+
+    parse_text = str(context.get("latest_parse_input_text") or "").strip()
+    if not parse_text:
+        return prompt, False
+
+    marker = "【可用观测数据（自动注入）】"
+    if marker in base or parse_text in base:
+        return prompt, False
+
+    limit = int(AGENT_REACT_OBSERVATION_MAX_CHARS or 4000)
+    snippet = _truncate_text_with_tail(parse_text, max_chars=max(800, limit))
+    injected_prompt = (
+        f"{base}\n\n"
+        f"{marker}\n"
+        f"{snippet}\n"
+        "【约束】仅可基于上述真实观测进行计算/抽取；若数据不足，请先继续抓取或读取。"
+    )
+    return injected_prompt, True
 
 
 def _exec_llm_call(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
     _ = step_row
-    _ = context
-    return execute_llm_call(task_id, run_id, payload)
+    patched_payload = dict(payload or {})
+    prompt = str(patched_payload.get("prompt") or "").strip()
+    if prompt:
+        injected_prompt, injected = _inject_latest_parse_input_prompt(prompt, context)
+        if injected:
+            patched_payload["prompt"] = injected_prompt
+            if isinstance(context, dict):
+                context["llm_prompt_auto_observation_injected"] = True
+    return execute_llm_call(task_id, run_id, patched_payload)
 
 
 def _exec_memory_write(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
@@ -183,8 +254,7 @@ def _exec_memory_write(task_id: int, run_id: int, step_row: dict, payload: dict,
 
 
 def _exec_task_output(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
-    _ = step_row
-    return execute_task_output(task_id, run_id, payload, context=context)
+    return execute_task_output(task_id, run_id, payload, context=context, step_row=step_row)
 
 
 def _exec_tool_call(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
@@ -193,19 +263,20 @@ def _exec_tool_call(task_id: int, run_id: int, step_row: dict, payload: dict, co
 
 
 def _exec_shell_command(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
-    _ = task_id
-    _ = run_id
-    _ = step_row
-    _ = context
-    return execute_shell_command(payload)
+    return execute_shell_command(
+        int(task_id),
+        int(run_id),
+        step_row,
+        payload,
+        context=context,
+    )
 
 
 def _exec_file_write(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
     _ = task_id
     _ = run_id
     _ = step_row
-    _ = context
-    return execute_file_write(payload)
+    return execute_file_write(payload, context=context)
 
 
 def _exec_file_append(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
@@ -236,8 +307,7 @@ def _exec_json_parse(task_id: int, run_id: int, step_row: dict, payload: dict, c
     _ = task_id
     _ = run_id
     _ = step_row
-    _ = context
-    return execute_json_parse(payload)
+    return execute_json_parse(payload, context=context)
 
 
 def _exec_file_read(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
@@ -444,6 +514,7 @@ def _register_builtin_specs() -> None:
                 "allow_redirects",
                 "encoding",
                 "max_bytes",
+                "strict_business_success",
             },
             aliases={"http", "http_request", "request"},
             executor=_exec_http_request,
@@ -507,7 +578,7 @@ def _register_builtin_specs() -> None:
     register_action_type(
         ActionTypeSpec(
             action_type=ACTION_TYPE_USER_PROMPT,
-            allowed_payload_keys={"question"},
+            allowed_payload_keys={"question", "kind", "choices"},
             aliases={"ask", "user"},
             executor=_exec_user_prompt,
             validate_payload=_validate_user_prompt,

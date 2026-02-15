@@ -38,6 +38,11 @@ export function bind(section, onStatusChange) {
   const drawerTime = section.querySelector("#drawer-time");
   const drawerSteps = section.querySelector("#drawer-steps");
   const drawerTimeline = section.querySelector("#drawer-timeline");
+  const drawerNeedInput = section.querySelector("#drawer-need-input");
+  const drawerNeedInputQuestion = section.querySelector("#drawer-need-input-question");
+  const drawerNeedInputChoices = section.querySelector("#drawer-need-input-choices");
+  const drawerNeedInputInput = section.querySelector("#drawer-need-input-value");
+  const drawerNeedInputSend = section.querySelector("#drawer-need-input-send");
   const actionDone = section.querySelector("#action-done");
   const actionCancel = section.querySelector("#action-cancel");
   const actionResume = section.querySelector("#action-resume");
@@ -45,18 +50,208 @@ export function bind(section, onStatusChange) {
   // 状态
   let currentTaskId = null;
   let executingTask = false;
+  let currentNeedInput = null;
+  let resumingNeedInput = false;
+
+  function normalizeNeedInputChoices(rawChoices) {
+    if (!Array.isArray(rawChoices)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const rawItem of rawChoices) {
+      let label = "";
+      let value = "";
+      if (typeof rawItem === "string") {
+        label = String(rawItem || "").trim();
+        value = label;
+      } else if (rawItem && typeof rawItem === "object") {
+        label = String(rawItem.label || "").trim();
+        const rawValue = rawItem.value;
+        value = String(rawValue != null ? rawValue : label).trim();
+      }
+      if (!label || !value) continue;
+      const dedupeKey = `${label}__${value}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      out.push({ label, value });
+      if (out.length >= 12) break;
+    }
+    return out;
+  }
+
+  function inferNeedInputChoices(question, kind) {
+    const normalizedKind = String(kind || "").trim().toLowerCase();
+    if (normalizedKind === "task_feedback") {
+      return [{ label: "是", value: "是" }, { label: "否", value: "否" }];
+    }
+    const text = String(question || "").trim();
+    if (!text) return [];
+    const looksLikeYesNo = (
+      text.includes("是否")
+      || text.includes("可否")
+      || text.includes("能否")
+      || text.includes("要不要")
+      || text.includes("确认")
+      || text.endsWith("吗")
+      || text.endsWith("吗？")
+      || text.endsWith("吗?")
+    );
+    if (looksLikeYesNo) {
+      return [{ label: "是", value: "是" }, { label: "否", value: "否" }];
+    }
+    return [];
+  }
+
+  function buildNeedInputPendingFromRunDetail(detail) {
+    const run = detail?.run && typeof detail.run === "object" ? detail.run : null;
+    if (!run) return null;
+    const runId = Number(run.run_id);
+    if (!Number.isFinite(runId) || runId <= 0) return null;
+    const status = String(run.status || "").trim().toLowerCase();
+    if (status !== TASK_STATUS.WAITING) return null;
+
+    const taskId = Number(run.task_id) || null;
+    const agentState = detail?.agent_state && typeof detail.agent_state === "object" ? detail.agent_state : null;
+    const paused = agentState?.paused && typeof agentState.paused === "object" ? agentState.paused : null;
+    if (!paused) {
+      return {
+        runId,
+        taskId,
+        question: UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION,
+        kind: null,
+        choices: []
+      };
+    }
+
+    const question = String(paused.question || "").trim() || UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION;
+    const kind = String(paused.kind || "").trim() || null;
+    const choices = normalizeNeedInputChoices(paused.choices);
+    const finalChoices = choices.length ? choices : inferNeedInputChoices(question, kind);
+    return { runId, taskId, question, kind, choices: finalChoices };
+  }
+
+  function setNeedInputControlsDisabled(disabled) {
+    const nextDisabled = !!disabled;
+    if (drawerNeedInputInput) drawerNeedInputInput.disabled = nextDisabled;
+    if (drawerNeedInputSend) drawerNeedInputSend.disabled = nextDisabled;
+    if (drawerNeedInputChoices) {
+      const buttons = drawerNeedInputChoices.querySelectorAll("button");
+      for (const btn of Array.from(buttons)) {
+        btn.disabled = nextDisabled;
+      }
+    }
+  }
+
+  async function consumeStreamResponse(response) {
+    const reader = response?.body?.getReader ? response.body.getReader() : null;
+    if (!reader) {
+      await response.text();
+      return;
+    }
+    try {
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch (error) {
+      }
+    }
+  }
+
+  async function handleNeedInputSubmit(rawValue = null) {
+    const pending = currentNeedInput;
+    if (!pending?.runId || !currentTaskId) return;
+    if (resumingNeedInput) return;
+
+    const text = String(rawValue != null ? rawValue : (drawerNeedInputInput?.value || "")).trim();
+    if (!text) {
+      if (drawerNeedInputInput) drawerNeedInputInput.focus();
+      return;
+    }
+
+    resumingNeedInput = true;
+    setNeedInputControlsDisabled(true);
+    if (actionResume) actionResume.disabled = true;
+
+    try {
+      const response = await api.streamAgentResume({ run_id: Number(pending.runId), message: text });
+      if (!response || !response.ok) {
+        throw new Error("resume_failed");
+      }
+      await consumeStreamResponse(response);
+      if (drawerNeedInputInput) drawerNeedInputInput.value = "";
+      await loadTaskDetail(currentTaskId);
+      loadTasks();
+      if (onStatusChange) onStatusChange();
+    } catch (error) {
+      alert(UI_TEXT.TASK_NEED_INPUT_RESUME_FAIL);
+      setNeedInputControlsDisabled(false);
+      if (drawerNeedInputInput) drawerNeedInputInput.focus();
+    } finally {
+      resumingNeedInput = false;
+    }
+  }
+
+  function renderNeedInputSection(pending) {
+    currentNeedInput = pending && typeof pending === "object" ? pending : null;
+    if (!drawerNeedInput) return;
+
+    if (!currentNeedInput) {
+      drawerNeedInput.classList.add("is-hidden");
+      if (drawerNeedInputQuestion) drawerNeedInputQuestion.textContent = "";
+      if (drawerNeedInputChoices) drawerNeedInputChoices.innerHTML = "";
+      if (drawerNeedInputInput) drawerNeedInputInput.value = "";
+      return;
+    }
+
+    drawerNeedInput.classList.remove("is-hidden");
+    if (drawerNeedInputQuestion) {
+      drawerNeedInputQuestion.textContent = String(currentNeedInput.question || UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION);
+    }
+
+    if (drawerNeedInputChoices) {
+      drawerNeedInputChoices.innerHTML = "";
+      const choices = Array.isArray(currentNeedInput.choices) ? currentNeedInput.choices : [];
+      for (const choice of choices) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "panel-button panel-button--small task-choice-btn";
+        btn.textContent = String(choice?.label || "").trim() || UI_TEXT.TASK_NEED_INPUT_CUSTOM;
+        btn.addEventListener("click", () => {
+          handleNeedInputSubmit(String(choice?.value || "").trim());
+        });
+        drawerNeedInputChoices.appendChild(btn);
+      }
+      const customBtn = document.createElement("button");
+      customBtn.type = "button";
+      customBtn.className = "panel-button panel-button--small task-choice-btn";
+      customBtn.textContent = UI_TEXT.TASK_NEED_INPUT_CUSTOM;
+      customBtn.addEventListener("click", () => {
+        if (drawerNeedInputInput) drawerNeedInputInput.focus();
+      });
+      drawerNeedInputChoices.appendChild(customBtn);
+    }
+
+    setNeedInputControlsDisabled(resumingNeedInput);
+  }
 
   // --- 抽屉函数 ---
 
   function openDrawer(taskId) {
     currentTaskId = taskId;
     drawerOverlay.classList.add("is-visible");
+    renderNeedInputSection(null);
     loadTaskDetail(taskId);
   }
 
   function closeDrawer() {
     drawerOverlay.classList.remove("is-visible");
     currentTaskId = null;
+    currentNeedInput = null;
+    resumingNeedInput = false;
+    renderNeedInputSection(null);
   }
 
   async function loadTaskDetail(taskId) {
@@ -65,6 +260,7 @@ export function bind(section, onStatusChange) {
     drawerStatus.textContent = UI_TEXT.TASK_STATUS_LOADING;
     drawerSteps.innerHTML = `<div class="panel-loading">${UI_TEXT.TASK_STEPS_LOADING}</div>`;
     drawerTimeline.innerHTML = `<div class="panel-loading">${UI_TEXT.TASK_TIMELINE_LOADING}</div>`;
+    renderNeedInputSection(null);
 
     try {
       // 并行获取
@@ -83,6 +279,28 @@ export function bind(section, onStatusChange) {
       drawerStatus.textContent = task.status;
       drawerStatus.className = `panel-tag panel-tag--${getStatusColor(task.status)}`;
       drawerTime.textContent = task.created_at || UI_TEXT.TASK_CREATED_RECENT;
+
+      const runRows = Array.isArray(record.runs) ? record.runs.slice() : [];
+      runRows.sort((left, right) => Number(right?.id || 0) - Number(left?.id || 0));
+      const waitingRun = runRows.find(
+        (row) => String(row?.status || "").trim().toLowerCase() === TASK_STATUS.WAITING
+      );
+      const inspectRun = waitingRun || runRows[0] || null;
+      let pendingNeedInput = null;
+      if (inspectRun && Number(inspectRun.id) > 0) {
+        try {
+          const runDetail = await api.fetchAgentRunDetail(Number(inspectRun.id));
+          pendingNeedInput = buildNeedInputPendingFromRunDetail(runDetail);
+        } catch (error) {
+          pendingNeedInput = null;
+        }
+      }
+      renderNeedInputSection(pendingNeedInput);
+      if (actionResume) {
+        const blockedByNeedInput = !!pendingNeedInput;
+        actionResume.disabled = !!(executingTask || blockedByNeedInput);
+        actionResume.title = blockedByNeedInput ? UI_TEXT.TASK_RESUME_DISABLED_WAITING : "";
+      }
 
       // 渲染步骤
       if (record.steps && record.steps.length > 0) {
@@ -176,6 +394,11 @@ export function bind(section, onStatusChange) {
       console.error(error);
       drawerSteps.innerHTML = `<div class="panel-error">${UI_TEXT.TASK_DETAIL_LOAD_FAIL}</div>`;
       drawerTimeline.innerHTML = "";
+      renderNeedInputSection(null);
+      if (actionResume) {
+        actionResume.disabled = !!executingTask;
+        actionResume.title = "";
+      }
     }
   }
 
@@ -207,6 +430,10 @@ export function bind(section, onStatusChange) {
 
   async function handleTaskResume() {
     if (!currentTaskId) return;
+    if (currentNeedInput?.runId) {
+      if (drawerNeedInputInput) drawerNeedInputInput.focus();
+      return;
+    }
     if (executingTask) return;
     executingTask = true;
     if (actionResume) actionResume.disabled = true;
@@ -260,14 +487,26 @@ export function bind(section, onStatusChange) {
 
       listEl.innerHTML = "";
       items.forEach(item => {
+        const normalizedStatus = String(item?.status || "").trim().toLowerCase();
+        const isWaiting = normalizedStatus === TASK_STATUS.WAITING;
+        const waitingBadge = isWaiting
+          ? `<span class="task-card-waiting-badge" title="${UI_TEXT.TASK_CARD_WAITING_TITLE}">${UI_TEXT.TASK_CARD_WAITING_BADGE}</span>`
+          : "";
+        const waitingHint = isWaiting
+          ? `<div class="task-card-waiting-hint">${UI_TEXT.TASK_CARD_WAITING_HINT}</div>`
+          : "";
         const card = document.createElement("div");
-        card.className = "task-card";
+        card.className = isWaiting ? "task-card task-card--waiting" : "task-card";
         card.innerHTML = `
             <div class="task-card-header">
                 <span class="task-card-id">#${item.id}</span>
-                <span class="panel-tag panel-tag--${getStatusColor(item.status)}">${item.status}</span>
+                <div class="task-card-header-right">
+                    ${waitingBadge}
+                    <span class="panel-tag panel-tag--${getStatusColor(item.status)}">${item.status}</span>
+                </div>
             </div>
             <div class="task-card-title">${item.title}</div>
+            ${waitingHint}
             <div style="font-size: 11px; color: var(--color_muted);">
                 ${item.created_at || UI_TEXT.TASK_CREATED_RECENT}
             </div>
@@ -291,6 +530,12 @@ export function bind(section, onStatusChange) {
   eventManager.add(actionDone, "click", () => handleTaskAction(TASK_STATUS.DONE));
   eventManager.add(actionCancel, "click", () => handleTaskAction(TASK_STATUS.CANCELLED));
   eventManager.add(actionResume, "click", handleTaskResume);
+  eventManager.add(drawerNeedInputSend, "click", () => handleNeedInputSubmit());
+  eventManager.add(drawerNeedInputInput, "keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    handleNeedInputSubmit();
+  });
 
   // 创建任务
   if (formEl && titleEl) {

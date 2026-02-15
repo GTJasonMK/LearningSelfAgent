@@ -1,20 +1,36 @@
 import asyncio
 import logging
 import os
-import time
+import sqlite3
 from typing import AsyncGenerator, Dict, List, Optional
 
+from backend.src.agent.core.run_context import AgentRunContext
+from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.planning_phase import PlanPhaseFailure, run_planning_phase
 from backend.src.agent.runner.feedback import append_task_feedback_step
-from backend.src.agent.runner.react_loop import run_react_loop
-from backend.src.agent.runner.stream_pump import pump_sync_generator
+from backend.src.agent.runner.mode_do_runner import DoExecutionConfig, run_do_mode_execution_from_config
+from backend.src.agent.runner.debug_utils import safe_write_debug as _safe_write_debug
+from backend.src.agent.runner.planning_runner import run_do_planning_phase_with_stream
+from backend.src.agent.runner.run_startup import start_new_mode_run
+from backend.src.agent.runner.run_stage import persist_run_stage
+from backend.src.agent.runner.pending_planning_wait_runner import (
+    PendingPlanningWaitConfig,
+    iter_pending_planning_wait_events,
+)
+from backend.src.agent.runner.planning_enrich_runner import (
+    PlanningEnrichRunConfig,
+    iter_planning_enrich_events,
+)
+from backend.src.agent.runner.run_context_knowledge import apply_knowledge_identity_to_run_ctx
+from backend.src.agent.runner.stream_entry_common import (
+    done_sse_event,
+    iter_execution_exception_events,
+    iter_finalization_events,
+)
+from backend.src.agent.runner.stream_task_events import iter_stream_task_events
 from backend.src.agent.runner.execution_pipeline import (
     create_sse_response,
-    pump_async_task_messages,
-    enter_pending_planning_waiting,
     prepare_planning_knowledge_do,
-    run_finalization_sequence,
-    handle_execution_exception,
     handle_stream_cancellation,
     build_base_agent_state,
     persist_agent_state,
@@ -38,8 +54,8 @@ from backend.src.api.schemas import AgentCommandStreamRequest
 from backend.src.common.utils import error_response, now_iso
 from backend.src.constants import (
     AGENT_DEFAULT_MAX_STEPS,
+    AGENT_MAX_STEPS_UNLIMITED,
     AGENT_EXPERIMENT_DIR_REL,
-    AGENT_PLAN_RESERVED_STEPS,
     AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS,
     AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
     ERROR_CODE_INVALID_REQUEST,
@@ -58,15 +74,12 @@ from backend.src.constants import (
     STREAM_TAG_SOLUTIONS,
     SSE_TYPE_MEMORY_ITEM,
 )
-from backend.src.services.debug.debug_output import write_task_debug_output
 from backend.src.services.llm.llm_client import resolve_default_model, sse_json
 from backend.src.services.permissions.permission_checks import ensure_write_permission
-from backend.src.repositories.task_runs_repo import update_task_run
 from backend.src.repositories.skills_repo import create_skill
 from backend.src.services.skills.skills_publish import publish_skill_file
 from backend.src.services.tasks.task_run_lifecycle import (
     check_missing_artifacts,
-    create_task_and_run_records_for_agent,
     enqueue_postprocess_thread,
     enqueue_review_on_feedback_waiting,
     enqueue_stop_task_run_records,
@@ -75,31 +88,7 @@ from backend.src.services.tasks.task_run_lifecycle import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_write_debug(
-    task_id: Optional[int],
-    run_id: Optional[int],
-    *,
-    message: str,
-    data: Optional[dict] = None,
-    level: str = "debug",
-) -> None:
-    """
-    调试输出不应影响主链路：失败时降级为 logger.exception。
-    """
-    if task_id is None or run_id is None:
-        return
-    try:
-        write_task_debug_output(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            message=message,
-            data=data if isinstance(data, dict) else None,
-            level=level,
-        )
-    except Exception:
-        logger.exception("write_task_debug_output failed: %s", message)
+NON_FATAL_STREAM_ERRORS = (sqlite3.Error, RuntimeError, TypeError, ValueError, OSError, AttributeError)
 
 
 def stream_agent_command(payload: AgentCommandStreamRequest):
@@ -131,26 +120,23 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
         task_id: Optional[int] = None
         run_id: Optional[int] = None
         plan_items: List[dict] = []
+        plan_struct = PlanStructure(steps=[], artifacts=[])
+        run_ctx: Optional[AgentRunContext] = None
 
         try:
-            created_at = now_iso()
             workdir = os.getcwd()
 
-            # 先创建 task/run：即使后续规划失败，也能在“最近动态/时间线”里留下可追溯记录，便于排查复杂 bug。
-            task_id, run_id = await asyncio.to_thread(
-                create_task_and_run_records_for_agent,
+            started = await start_new_mode_run(
                 message=message,
-                created_at=created_at,
-            )
-
-            # 让前端尽早拿到 run_id：用于 evaluate/continue/debug（不走 delta，避免污染气泡文本）
-            yield sse_json({"type": "run_created", "task_id": task_id, "run_id": run_id})
-
-            _safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.start",
-                data={
+                mode="do",
+                model=model,
+                parameters=parameters,
+                max_steps=int(max_steps) if isinstance(max_steps, int) else None,
+                workdir=workdir,
+                stage_where_prefix="new_run",
+                safe_write_debug=_safe_write_debug,
+                start_debug_message="agent.start",
+                start_debug_data={
                     "model": model,
                     "max_steps": max_steps,
                     "dry_run": dry_run,
@@ -158,25 +144,23 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                     "agent_workspace": AGENT_EXPERIMENT_DIR_REL,
                 },
             )
+            task_id = int(started.task_id)
+            run_id = int(started.run_id)
+            run_ctx = started.run_ctx
+            for event in started.events:
+                yield str(event)
             # 工具清单会在“方案匹配”之后汇总（方案提到的工具优先）
             tools_hint = "(无)"
             solutions_hint = "(无)"
 
             # --- 检索：图谱→领域→技能→方案（收敛到 execution_pipeline）---
-            out_q: "asyncio.Queue[str]" = asyncio.Queue()
-
-            def _emit(msg: str) -> None:
-                try:
-                    out_q.put_nowait(str(msg))
-                except Exception:
-                    return
-
-            knowledge_task = asyncio.create_task(
-                retrieve_all_knowledge(
+            knowledge = None
+            async for event_type, event_payload in iter_stream_task_events(
+                task_builder=lambda emit: retrieve_all_knowledge(
                     message=message,
                     model=model,
                     parameters=parameters,
-                    yield_func=_emit,
+                    yield_func=emit,
                     task_id=task_id,
                     run_id=run_id,
                     include_memories=False,
@@ -189,10 +173,13 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                     format_solutions_for_prompt_func=_format_solutions_for_prompt,
                     collect_tools_from_solutions_func=_collect_tools_from_solutions,
                 )
-            )
-            async for msg in pump_async_task_messages(knowledge_task, out_q):
-                yield msg
-            knowledge = await knowledge_task
+            ):
+                if event_type == "msg":
+                    yield str(event_payload)
+                    continue
+                knowledge = event_payload
+            if not isinstance(knowledge, dict):
+                raise RuntimeError("knowledge retrieval 结果为空")
 
             graph_nodes = list(knowledge.get("graph_nodes") or [])
             graph_hint = str(knowledge.get("graph_hint") or "")
@@ -207,42 +194,41 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
             solutions = list(knowledge.get("solutions") or [])
 
             # --- do 模式 planning 前“知识增强”（收敛到 execution_pipeline）---
-            enrich_q: "asyncio.Queue[str]" = asyncio.Queue()
-
-            def _emit_enrich(msg: str) -> None:
-                try:
-                    enrich_q.put_nowait(str(msg))
-                except Exception:
-                    return
-
-            enrich_task = asyncio.create_task(
-                prepare_planning_knowledge_do(
-                    message=message,
-                    model=model,
-                    parameters=parameters,
-                    graph_nodes=graph_nodes,
-                    graph_hint=graph_hint,
-                    domain_ids=domain_ids,
-                    skills=skills,
-                    skills_hint=skills_hint,
-                    solutions=solutions,
-                    yield_func=_emit_enrich,
-                    task_id=task_id,
-                    run_id=run_id,
-                    assess_knowledge_sufficiency_func=_assess_knowledge_sufficiency,
-                    compose_skills_func=_compose_skills,
-                    draft_skill_from_message_func=_draft_skill_from_message,
-                    draft_solution_from_skills_func=_draft_solution_from_skills,
-                    create_skill_func=create_skill,
-                    publish_skill_file_func=publish_skill_file,
-                    format_skills_for_prompt_func=_format_skills_for_prompt,
-                    format_solutions_for_prompt_func=_format_solutions_for_prompt,
-                    collect_tools_from_solutions_func=_collect_tools_from_solutions,
+            enriched = None
+            async for event_type, event_payload in iter_planning_enrich_events(
+                config=PlanningEnrichRunConfig(
+                    task_builder=lambda emit: prepare_planning_knowledge_do(
+                        message=message,
+                        model=model,
+                        parameters=parameters,
+                        graph_nodes=graph_nodes,
+                        graph_hint=graph_hint,
+                        domain_ids=domain_ids,
+                        skills=skills,
+                        skills_hint=skills_hint,
+                        solutions=solutions,
+                        yield_func=emit,
+                        task_id=task_id,
+                        run_id=run_id,
+                        assess_knowledge_sufficiency_func=_assess_knowledge_sufficiency,
+                        compose_skills_func=_compose_skills,
+                        draft_skill_from_message_func=_draft_skill_from_message,
+                        draft_solution_from_skills_func=_draft_solution_from_skills,
+                        create_skill_func=create_skill,
+                        publish_skill_file_func=publish_skill_file,
+                        format_skills_for_prompt_func=_format_skills_for_prompt,
+                        format_solutions_for_prompt_func=_format_solutions_for_prompt,
+                        collect_tools_from_solutions_func=_collect_tools_from_solutions,
+                    ),
+                    empty_result_error="planning enrich 结果为空",
                 )
-            )
-            async for msg in pump_async_task_messages(enrich_task, enrich_q):
-                yield msg
-            enriched = await enrich_task
+            ):
+                if event_type == "msg":
+                    yield str(event_payload)
+                    continue
+                enriched = event_payload
+            if not isinstance(enriched, dict):
+                raise RuntimeError("planning enrich 结果为空")
 
             skills = list(enriched.get("skills") or skills or [])
             skills_hint = str(enriched.get("skills_hint") or skills_hint or "(无)")
@@ -255,17 +241,9 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
 
             # --- 知识不足且需询问用户：进入 waiting，并在 resume 后重新检索+规划 ---
             if need_user_prompt and user_prompt_question and task_id is not None and run_id is not None:
-                out_q: "asyncio.Queue[str]" = asyncio.Queue()
-
-                def _emit_wait(msg: str) -> None:
-                    try:
-                        if msg:
-                            out_q.put_nowait(str(msg))
-                    except Exception:
-                        return
-
-                wait_task = asyncio.create_task(
-                    enter_pending_planning_waiting(
+                wait_result = None
+                async for event_type, event_payload in iter_pending_planning_wait_events(
+                    config=PendingPlanningWaitConfig(
                         task_id=int(task_id),
                         run_id=int(run_id),
                         mode="do",
@@ -283,72 +261,76 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                         domain_ids=list(domain_ids or []),
                         skills=list(skills or []),
                         solutions=list(solutions_for_prompt or []),
-                        draft_solution_id=int(draft_solution_id)
-                        if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0
-                        else None,
-                        yield_func=_emit_wait,
+                        draft_solution_id=(
+                            int(draft_solution_id)
+                            if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0
+                            else None
+                        ),
                         safe_write_debug_func=_safe_write_debug,
                     )
-                )
-                async for msg in pump_async_task_messages(wait_task, out_q):
-                    yield msg
-                await wait_task
+                ):
+                    if event_type == "msg":
+                        yield str(event_payload)
+                        continue
+                    wait_result = event_payload
+                if wait_result is None:
+                    raise RuntimeError("pending_planning waiting 结果为空")
                 return
 
             # --- 规划 ---
             try:
-                # 预留步数：确认满意度 + 评估不通过后的自修复/重试（避免 plan 直接占满 max_steps 导致无法继续推进）。
-                reserved = int(AGENT_PLAN_RESERVED_STEPS or 0)
-                if reserved < 1:
-                    reserved = 1
-                planning_max_steps = int(max_steps) - reserved if int(max_steps) > 1 else 1
-                if planning_max_steps < 1:
-                    planning_max_steps = 1
-                inner = run_planning_phase(
-                    task_id=int(task_id),
+                if run_ctx is None:
+                    run_ctx = AgentRunContext.from_agent_state(
+                        {},
+                        mode="do",
+                        message=message,
+                        model=model,
+                        parameters=parameters,
+                        max_steps=int(max_steps) if isinstance(max_steps, int) else None,
+                        workdir=workdir,
+                    )
+                _, _, stage_event = await persist_run_stage(
+                    run_ctx=run_ctx,
+                    task_id=task_id,
                     run_id=int(run_id),
-                    message=message,
-                    workdir=workdir,
-                    model=model,
-                    parameters=parameters,
-                    max_steps=planning_max_steps,
-                    tools_hint=tools_hint,
-                    skills_hint=skills_hint,
-                    solutions_hint=solutions_hint,
-                    memories_hint=memories_hint,
-                    graph_hint=graph_hint,
+                    stage="planning",
+                    where="new_run.stage.planning",
+                    safe_write_debug=_safe_write_debug,
                 )
-                plan_started_at = time.monotonic()
+                if stage_event:
+                    yield stage_event
+                # 开发阶段：规划步数不设上限（用超大值近似无限），避免被 max_steps 门槛截断。
+                planning_max_steps = int(AGENT_MAX_STEPS_UNLIMITED)
                 plan_result = None
-                async for kind, payload in pump_sync_generator(
-                    inner=inner,
-                    label="planning",
-                    poll_interval_seconds=AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
-                    idle_timeout_seconds=AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS,
+                async for event_type, event_payload in iter_stream_task_events(
+                    task_builder=lambda emit: run_do_planning_phase_with_stream(
+                        task_id=int(task_id),
+                        run_id=int(run_id),
+                        message=message,
+                        workdir=workdir,
+                        model=model,
+                        parameters=parameters,
+                        max_steps=planning_max_steps,
+                        tools_hint=tools_hint,
+                        skills_hint=skills_hint,
+                        solutions_hint=solutions_hint,
+                        memories_hint=memories_hint,
+                        graph_hint=graph_hint,
+                        yield_func=emit,
+                        safe_write_debug=_safe_write_debug,
+                        debug_done_message="agent.plan.done",
+                        pump_label="planning",
+                        poll_interval_seconds=AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
+                        idle_timeout_seconds=AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS,
+                        planning_phase_func=run_planning_phase,
+                    )
                 ):
-                    if kind == "msg":
-                        if payload:
-                            yield str(payload)
+                    if event_type == "msg":
+                        yield str(event_payload)
                         continue
-                    if kind == "done":
-                        plan_result = payload
-                        break
-                    if kind == "err":
-                        if isinstance(payload, BaseException):
-                            raise payload  # noqa: TRY301
-                        raise RuntimeError(f"planning 异常:{payload}")  # noqa: TRY301
-
+                    plan_result = event_payload
                 if plan_result is None:
-                    raise RuntimeError("planning 返回为空")  # noqa: TRY301
-
-                duration_ms = int((time.monotonic() - plan_started_at) * 1000)
-                _safe_write_debug(
-                    task_id,
-                    run_id,
-                    message="agent.plan.done",
-                    data={"duration_ms": duration_ms, "steps": len(plan_result.plan_titles or [])},
-                    level="info",
-                )
+                    raise RuntimeError("planning 结果为空")
             except PlanPhaseFailure as exc:
                 if task_id is not None and run_id is not None:
                     # 规划失败也要收敛状态：避免 UI 永久显示 running
@@ -371,6 +353,13 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
             plan_allows = plan_result.plan_allows
             plan_artifacts = plan_result.plan_artifacts
             plan_items = plan_result.plan_items
+            plan_struct = PlanStructure.from_legacy(
+                plan_titles=list(plan_titles or []),
+                plan_items=list(plan_items or []),
+                plan_allows=[list(value or []) for value in (plan_allows or [])],
+                plan_artifacts=list(plan_artifacts or []),
+            )
+            plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
 
             # 任务闭环：在计划末尾追加“确认满意度”步骤（由后端控制，避免前端硬编码逻辑漂移）。
             append_task_feedback_step(
@@ -379,8 +368,15 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                 plan_allows=plan_allows,
                 max_steps=int(max_steps) if isinstance(max_steps, int) else None,
             )
+            plan_struct = PlanStructure.from_legacy(
+                plan_titles=list(plan_titles or []),
+                plan_items=list(plan_items or []),
+                plan_allows=[list(value or []) for value in (plan_allows or [])],
+                plan_artifacts=list(plan_artifacts or []),
+            )
+            plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
 
-            yield sse_json({"type": "plan", "task_id": task_id, "items": plan_items})
+            yield sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items})
 
             # 持久化 agent 运行态：用于中途需要用户交互时可恢复执行
             agent_state = build_base_agent_state(
@@ -395,33 +391,29 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                 graph_hint=graph_hint,
             )
             # 用于后处理“方案沉淀/溯源”（docs/agent 依赖）
-            agent_state["mode"] = "do"
-            agent_state["solutions_hint"] = solutions_hint
-            agent_state["domain_ids"] = list(domain_ids or [])
-            agent_state["skill_ids"] = [
-                s.get("id")
-                for s in (skills or [])
-                if isinstance(s, dict) and isinstance(s.get("id"), int) and int(s.get("id")) > 0
-            ]
-            agent_state["solution_ids"] = [
-                s.get("id")
-                for s in (solutions_for_prompt or [])
-                if isinstance(s, dict) and isinstance(s.get("id"), int) and int(s.get("id")) > 0
-            ]
-            if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0:
-                agent_state["draft_solution_id"] = int(draft_solution_id)
+            run_ctx = AgentRunContext.from_agent_state(agent_state)
+            run_ctx.mode = "do"
+            run_ctx.set_stage("planned", now_iso())
+            run_ctx.set_hints(solutions_hint=solutions_hint)
+            apply_knowledge_identity_to_run_ctx(
+                run_ctx,
+                domain_ids=list(domain_ids or []),
+                skills=list(skills or []),
+                solutions=list(solutions_for_prompt or []),
+                draft_solution_id=(
+                    int(draft_solution_id)
+                    if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0
+                    else None
+                ),
+            )
+            agent_state = run_ctx.to_agent_state()
             try:
                 await persist_agent_state(
                     run_id=int(run_id),
-                    agent_plan={
-                        "titles": plan_titles,
-                        "items": plan_items,
-                        "allows": plan_allows,
-                        "artifacts": plan_artifacts,
-                    },
+                    agent_plan=plan_struct.to_agent_plan_payload(),
                     agent_state=agent_state,
                 )
-            except Exception as exc:
+            except NON_FATAL_STREAM_ERRORS as exc:
                 # 状态持久化失败不应阻塞执行（会降低“中断恢复/交互恢复”的能力），但必须留痕便于排查。
                 logger.exception("agent.state.persist_failed: %s", exc)
                 _safe_write_debug(
@@ -448,7 +440,7 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                         data={"steps": len(plan_titles or [])},
                         level="info",
                     )
-                except Exception as exc:
+                except NON_FATAL_STREAM_ERRORS as exc:
                     logger.exception("agent.dry_run.finalize_failed: %s", exc)
                     _safe_write_debug(
                         task_id,
@@ -461,88 +453,77 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
 
             yield sse_json({"delta": f"{STREAM_TAG_EXEC} 开始执行…\n"})
 
-            # 执行上下文：用于 task_output 自动填充等
-            context: dict = {"last_llm_response": None}
-            observations: List[str] = []
-            agent_state["context"] = context
-            agent_state["observations"] = observations
+            if run_ctx is None:
+                run_ctx = AgentRunContext.from_agent_state(agent_state)
+            run_ctx.ensure_defaults()
+            agent_state, _, stage_event = await persist_run_stage(
+                run_ctx=run_ctx,
+                task_id=task_id,
+                run_id=int(run_id),
+                stage="execute",
+                where="new_run.stage.execute",
+                safe_write_debug=_safe_write_debug,
+            )
+            context: dict = run_ctx.context
+            observations: List[str] = run_ctx.observations
+            if stage_event:
+                yield stage_event
 
-            inner_react = run_react_loop(
+            react_result = None
+            async for event_type, event_payload in iter_stream_task_events(
+                task_builder=lambda emit: run_do_mode_execution_from_config(
+                    DoExecutionConfig(
+                        task_id=int(task_id),
+                        run_id=int(run_id),
+                        message=message,
+                        workdir=workdir,
+                        model=model,
+                        parameters=parameters,
+                        plan_struct=plan_struct,
+                        tools_hint=tools_hint,
+                        skills_hint=skills_hint,
+                        memories_hint=memories_hint,
+                        graph_hint=graph_hint,
+                        agent_state=agent_state,
+                        context=context,
+                        observations=observations,
+                        start_step_order=1,
+                        variables_source="agent_react",
+                        yield_func=emit,
+                        safe_write_debug=_safe_write_debug,
+                        debug_done_message="agent.react.done",
+                        pump_label="react",
+                        poll_interval_seconds=AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
+                        idle_timeout_seconds=AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS,
+                    )
+                )
+            ):
+                if event_type == "msg":
+                    yield str(event_payload)
+                    continue
+                react_result = event_payload
+            if react_result is None:
+                raise RuntimeError("do execution 结果为空")
+            run_status = str(react_result.run_status or "")
+            if not isinstance(getattr(react_result, "plan_struct", None), PlanStructure):
+                raise RuntimeError("do 执行器返回缺少有效 plan_struct")
+            plan_struct = react_result.plan_struct
+            plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
+
+            async for event_type, event_payload in iter_finalization_events(
                 task_id=int(task_id),
                 run_id=int(run_id),
+                run_status=str(run_status),
+                agent_state=agent_state,
+                plan_items=plan_items,
+                plan_artifacts=plan_artifacts,
                 message=message,
                 workdir=workdir,
-                model=model,
-                parameters=parameters,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
-                tools_hint=tools_hint,
-                skills_hint=skills_hint,
-                memories_hint=memories_hint,
-                graph_hint=graph_hint,
-                agent_state=agent_state,
-                context=context,
-                observations=observations,
-                start_step_order=1,
-                variables_source="agent_react",
-            )
-            react_started_at = time.monotonic()
-            react_result = None
-            async for kind, payload in pump_sync_generator(
-                inner=inner_react,
-                label="react",
-                poll_interval_seconds=AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
-                idle_timeout_seconds=AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS,
             ):
-                if kind == "msg":
-                    if payload:
-                        yield str(payload)
-                    continue
-                if kind == "done":
-                    react_result = payload
-                    break
-                if kind == "err":
-                    if isinstance(payload, BaseException):
-                        raise payload  # noqa: TRY301
-                    raise RuntimeError(f"react 异常:{payload}")  # noqa: TRY301
-
-            if react_result is None:
-                raise RuntimeError("react 返回为空")  # noqa: TRY301
-
-            run_status = react_result.run_status
-            duration_ms = int((time.monotonic() - react_started_at) * 1000)
-            _safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.react.done",
-                data={
-                    "duration_ms": duration_ms,
-                    "run_status": str(run_status),
-                    "last_step_order": int(getattr(react_result, "last_step_order", 0) or 0),
-                },
-                level="info",
-            )
-
-            # 统一后处理闭环（收敛到 execution_pipeline）
-            out_q = asyncio.Queue()
-            final_task = asyncio.create_task(
-                run_finalization_sequence(
-                    task_id=int(task_id),
-                    run_id=int(run_id),
-                    run_status=str(run_status),
-                    agent_state=agent_state,
-                    plan_items=plan_items,
-                    plan_artifacts=plan_artifacts,
-                    message=message,
-                    workdir=workdir,
-                    yield_func=_emit,
-                )
-            )
-            async for msg in pump_async_task_messages(final_task, out_q):
-                yield msg
-            run_status = await final_task
+                if event_type == "msg":
+                    yield str(event_payload)
+                elif event_type == "status":
+                    run_status = str(event_payload or "")
 
         except (asyncio.CancelledError, GeneratorExit):
             # SSE 连接被关闭（客户端断开/窗口退出）时不要再尝试继续 yield，否则会触发
@@ -550,23 +531,17 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
             handle_stream_cancellation(task_id=task_id, run_id=run_id, reason="agent_stream_cancelled")
             raise
         except Exception as exc:
-            out_q = asyncio.Queue()
-            err_task = asyncio.create_task(
-                handle_execution_exception(
-                    exc,
-                    task_id=task_id,
-                    run_id=run_id,
-                    yield_func=_emit,
-                    mode_prefix="agent",
-                )
-            )
-            async for msg in pump_async_task_messages(err_task, out_q):
-                yield msg
-            await err_task
+            async for chunk in iter_execution_exception_events(
+                exc=exc,
+                task_id=task_id,
+                run_id=run_id,
+                mode_prefix="agent",
+            ):
+                yield chunk
 
         # 正常结束/异常结束均尽量发送 done；若客户端已断开则直接结束 generator。
         try:
-            yield sse_json({"type": "done"}, event="done")
+            yield done_sse_event()
         except BaseException:
             return
 

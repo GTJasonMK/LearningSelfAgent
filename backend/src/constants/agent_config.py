@@ -32,6 +32,8 @@ CHAT_MESSAGES_MAX_LIMIT: Final = 200
 
 # Agent 执行参数
 AGENT_DEFAULT_MAX_STEPS: Final = 30
+# 开发阶段默认关闭“计划步数上限”：使用超大值近似无限，避免规划/修复因步数门槛提前失败。
+AGENT_MAX_STEPS_UNLIMITED: Final = 10**9
 AGENT_EXPERIMENT_DIR_REL: Final = "backend/.agent/workspace"
 AGENT_PLAN_RESERVED_STEPS: Final = 4
 AGENT_PLAN_BRIEF_MAX_CHARS: Final = 10
@@ -74,6 +76,35 @@ AGENT_REACT_ACTION_RETRY_MAX_ATTEMPTS: Final = 2
 AGENT_REACT_ARTIFACT_AUTOFIX_MAX_ATTEMPTS: Final = 2
 AGENT_REACT_REPLAN_MAX_ATTEMPTS: Final = 2
 
+# shell_command 执行保护（P0）
+# 说明：当 shell_command 运行本地脚本时，要求脚本必须由当前 run 的 file_write/file_append 产生，
+# 以避免计划/执行漂移导致“引用不存在脚本”或“执行了未知来源脚本”。
+SHELL_COMMAND_REQUIRE_FILE_WRITE_BINDING_DEFAULT: Final = True
+
+# 禁止复杂 python -c（P0）
+# 说明：复杂逻辑（多语句+复合语句）强制走 file_write 脚本，避免语法脆弱和不可追溯。
+SHELL_COMMAND_DISALLOW_COMPLEX_PYTHON_C_DEFAULT: Final = True
+
+# 复杂 python -c 自动重写（P0）
+# 说明：默认开启自动重写，优先把复杂 python -c 安全落盘为脚本后再执行，
+# 以降低语法脆弱导致的中断；若需要严格模式可在 run context 中显式关闭。
+SHELL_COMMAND_AUTO_REWRITE_COMPLEX_PYTHON_C_DEFAULT: Final = True
+
+# CSV 产物质量门闩（P0）
+# 说明：用于阻断“已写出 CSV 但数据无效/占位/不可验证”的 task_output 成功结论。
+AGENT_ARTIFACT_CSV_QUALITY_GATE_DEFAULT: Final = True
+AGENT_ARTIFACT_CSV_QUALITY_HARD_FAIL_DEFAULT: Final = True
+AGENT_ARTIFACT_CSV_MIN_ROWS: Final = 5
+AGENT_ARTIFACT_CSV_MIN_NUMERIC_ROWS: Final = 3
+AGENT_ARTIFACT_CSV_MIN_NUMERIC_RATIO: Final = 0.2
+AGENT_ARTIFACT_CSV_MAX_PLACEHOLDER_RATIO: Final = 0.8
+AGENT_ARTIFACT_CSV_MIN_DATE_SPAN_DAYS: Final = 7
+
+# json_parse 来源绑定（P0）
+# 说明：解析 JSON 时优先要求 payload.text 来自最近成功步骤输出，降低模型直接内联/编造数据的风险。
+JSON_PARSE_REQUIRE_RECENT_SOURCE_DEFAULT: Final = True
+JSON_PARSE_SOURCE_MIN_TEXT_CHARS: Final = 80
+
 # 评估与知识沉淀门槛（P1）
 # 说明：
 # - pass 门槛：用于判断“任务是否完成到可交付”的最低标准；
@@ -87,6 +118,8 @@ AGENT_REVIEW_DISTILL_STATUS_MANUAL: Final = "manual"
 
 # 任务反馈
 AGENT_TASK_FEEDBACK_KIND: Final = "task_feedback"
+AGENT_KNOWLEDGE_SUFFICIENCY_KIND: Final = "knowledge_sufficiency"
+AGENT_USER_PROMPT_CHOICES_MAX: Final = 12
 AGENT_TASK_FEEDBACK_STEP_TITLE: Final = "确认满意度"
 AGENT_TASK_FEEDBACK_STEP_BRIEF: Final = "确认满意度"
 AGENT_TASK_FEEDBACK_QUESTION: Final = (
@@ -163,14 +196,28 @@ AUTO_TOOL_DESCRIPTION_TEMPLATE: Final = "自动生成工具：{step_title}"
 TOOL_METADATA_SOURCE_AUTO: Final = "auto"
 TOOL_VERSION_CHANGE_NOTE_AUTO: Final = "自动同步版本"
 TOOL_METADATA_APPROVAL_KEY: Final = "approval"
+TOOL_CALL_STRICT_AUTHENTICITY_DEFAULT: Final = True
+TOOL_CALL_SIMULATED_SOURCE_MARKERS: Final[Tuple] = (
+    "simulated",
+    "mock",
+    "demo",
+    "fake",
+    "sample",
+    "模拟",
+)
 AUTO_SKILL_SUFFIX: Final = "技能"
 
 # 内置工具
 TOOL_NAME_WEB_FETCH: Final = "web_fetch"
-TOOL_DESCRIPTION_WEB_FETCH: Final = "抓取指定 URL 内容（curl -sL）"
+TOOL_DESCRIPTION_WEB_FETCH: Final = "抓取指定 URL 内容（curl -fsSL + UA，HTTP>=400 视为失败，带重试）"
 TOOL_VERSION_WEB_FETCH: Final = "0.1.0"
 TOOL_WEB_FETCH_TIMEOUT_MS: Final = 15000
-TOOL_WEB_FETCH_ARGS_TEMPLATE: Final[Tuple] = ("curl", "-sL", "{input}")
+# curl:
+# -f：HTTP>=400 直接返回非 0（否则 429/403 会被当作“成功抓取”而污染后续步骤）
+# -sS：静默输出但保留错误信息
+# -L：跟随重定向
+# -A：弱化部分站点的反爬（仍可能 429/403，需要上层 replan 走备用源）
+TOOL_WEB_FETCH_ARGS_TEMPLATE: Final[Tuple] = ("curl", "-fsSL", "-A", "Mozilla/5.0", "{input}")
 
 # Prompt 模板配置
 PROMPT_TEMPLATE_NAME_MAX_CHARS: Final = 80

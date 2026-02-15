@@ -38,6 +38,8 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
         from backend.src.api.utils import now_iso
 
         created_at = now_iso()
+        step_id = None
+        output_id = None
         with get_connection() as conn:
             cursor = conn.execute(
                 "INSERT INTO tasks (title, status, created_at, expectation_id, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -59,7 +61,7 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
                 ),
             )
             run_id = int(cursor.lastrowid)
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO task_steps (task_id, run_id, title, status, detail, result, error, attempts, started_at, finished_at, step_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
@@ -77,10 +79,16 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
                     created_at,
                 ),
             )
+            step_id = int(cursor.lastrowid)
             conn.execute(
                 "INSERT INTO task_outputs (task_id, run_id, output_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
                 (task_id, run_id, "text", "hi", created_at),
             )
+            output_row = conn.execute(
+                "SELECT id FROM task_outputs WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+                (int(run_id),),
+            ).fetchone()
+            output_id = int(output_row["id"]) if output_row and output_row["id"] is not None else None
 
         fake_eval_json = json.dumps(
             {
@@ -92,7 +100,10 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
                     "score": 95,
                     "threshold": 90,
                     "reason": "任务完成且技能可迁移",
-                    "evidence_refs": [{"kind": "output", "output_id": 1}],
+                    "evidence_refs": [
+                        {"kind": "step", "step_id": int(step_id), "step_order": 1},
+                        {"kind": "output", "output_id": int(output_id)},
+                    ],
                 },
                 "summary": "任务完成，可沉淀技能。",
                 "issues": [
@@ -100,7 +111,7 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
                         "title": "示例问题",
                         "severity": "low",
                         "details": "这里只是测试",
-                        "evidence_refs": [{"kind": "output", "output_id": 1}],
+                        "evidence_refs": [{"kind": "output", "output_id": int(output_id)}],
                         "evidence_quote": "output: hi",
                         "suggestion": "无",
                     }
@@ -168,7 +179,13 @@ class TestAgentEvaluate(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
             self.assertIsNotNone(review)
             refs = json.loads(review["distill_evidence_refs"] or "[]")
-            self.assertEqual(refs, [{"kind": "output", "output_id": 1}])
+            self.assertEqual(
+                refs,
+                [
+                    {"kind": "step", "step_id": int(step_id), "step_order": 1},
+                    {"kind": "output", "output_id": int(output_id)},
+                ],
+            )
             skill = conn.execute(
                 "SELECT * FROM skills_items WHERE name = ? ORDER BY id DESC LIMIT 1",
                 ("测试技能",),

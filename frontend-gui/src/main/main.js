@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, screen } = require("electron");
 const { spawn } = require("child_process");
 const http = require("http");
+const net = require("net");
 const path = require("path");
 
 let tray = null;
@@ -17,7 +18,50 @@ let petHitTestTimer = null;
 let petRecoveryTimer = null;
 let petWindowCreating = false;
 let quitting = false;
-const backendPort = 8123;
+const BACKEND_DEFAULT_PORT = 8123;
+
+function parseBackendPort(raw) {
+  const value = Number.parseInt(String(raw || "").trim(), 10);
+  if (Number.isInteger(value) && value >= 1 && value <= 65535) return value;
+  return null;
+}
+
+function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.once("listening", () => {
+      server.close(() => resolve(true));
+    });
+    server.listen(port, "127.0.0.1");
+  });
+}
+
+function getEphemeralPort() {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(BACKEND_DEFAULT_PORT));
+    server.once("listening", () => {
+      const address = server.address();
+      const port = (address && typeof address === "object") ? Number(address.port) : BACKEND_DEFAULT_PORT;
+      server.close(() => resolve(port));
+    });
+    server.listen(0, "127.0.0.1");
+  });
+}
+
+async function resolveAvailableBackendPort(preferredPort) {
+  if (await isPortAvailable(preferredPort)) return preferredPort;
+  const scanStart = Math.max(1024, Number(preferredPort) + 1);
+  const scanEnd = Math.min(65535, scanStart + 200);
+  for (let candidate = scanStart; candidate <= scanEnd; candidate += 1) {
+    if (await isPortAvailable(candidate)) return candidate;
+  }
+  return getEphemeralPort();
+}
+
+let backendPort = parseBackendPort(process.env.LSA_BACKEND_PORT) || BACKEND_DEFAULT_PORT;
+process.env.LSA_BACKEND_PORT = String(backendPort);
 const PET_HIT_TEST_INTERVAL = 33;
 const PET_DRAG_INTERVAL = 16;
 const PET_RECOVERY_INTERVAL = 2000;
@@ -36,9 +80,17 @@ function startBackend() {
   }
 
   // 如果端口上已经有健康的后端在跑，就不要再启动第二个（避免 10048 端口占用）
-  checkBackendReady(800).then((state) => {
+  checkBackendReady(800).then(async (state) => {
     // ready: 后端已就绪；occupied: 端口被占用但非本后端/尚未就绪；free: 可启动
-    if (state !== "free") return;
+    if (state === "ready") return;
+    if (state === "occupied") {
+      const nextPort = await resolveAvailableBackendPort(backendPort);
+      if (Number(nextPort) !== Number(backendPort)) {
+        console.warn("[backend] 端口 " + backendPort + " 已占用，自动切换到 " + nextPort);
+        backendPort = Number(nextPort);
+        process.env.LSA_BACKEND_PORT = String(backendPort);
+      }
+    }
     spawnBackendProcess();
   });
 }

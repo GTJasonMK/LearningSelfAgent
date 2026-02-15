@@ -309,6 +309,7 @@
 .pet-bubble-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 8px 10px 10px;
   border-top: 1px solid rgba(31, 28, 23, 0.12);

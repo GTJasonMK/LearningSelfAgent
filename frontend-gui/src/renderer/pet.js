@@ -45,7 +45,7 @@ const {
 const bubble = new PetBubble(bubbleEl);
 // 桌宠关键会话状态：集中管理，避免散落的全局变量在并发/拖拽时漂移
 const petSession = createStore({
-  pendingResume: null, // {runId, taskId?, question}
+  pendingResume: null, // {runId, taskId?, question, kind?, choices?}
   lastRun: null, // {runId, taskId?}
   // P1：把关键状态从“顶层全局变量”收敛进 store，减少并发/拖拽/输入历史造成的隐式耦合
   streaming: false,
@@ -90,15 +90,40 @@ async function refreshPetInputHistoryFromBackend(throttleMs = 3000) {
   }
 }
 
+function normalizeNeedInputChoices(rawChoices) {
+  if (!Array.isArray(rawChoices)) return [];
+  const out = [];
+  for (const rawItem of rawChoices) {
+    if (typeof rawItem === "string") {
+      const text = String(rawItem || "").trim();
+      if (!text) continue;
+      out.push({ label: text, value: text });
+      if (out.length >= 12) break;
+      continue;
+    }
+    if (!rawItem || typeof rawItem !== "object") continue;
+    const label = String(rawItem?.label || "").trim();
+    if (!label) continue;
+    const value = String(rawItem?.value != null ? rawItem.value : label).trim();
+    if (!value) continue;
+    out.push({ label, value });
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
 function setPendingAgentResume(payload) {
   const runId = Number(payload?.run_id);
   if (!Number.isFinite(runId) || runId <= 0) return;
+  const rawChoices = payload?.choices;
   petSession.setState(
     {
       pendingResume: {
         runId,
         taskId: Number(payload?.task_id) || null,
-        question: String(payload?.question || "").trim()
+        question: String(payload?.question || "").trim(),
+        kind: String(payload?.kind || "").trim() || null,
+        choices: normalizeNeedInputChoices(rawChoices)
       }
     },
     { reason: "need_input" }
@@ -121,6 +146,12 @@ function setLastAgentRun(payload) {
 function resetTaskFeedbackUi() {
   if (petSession.getState().taskFeedbackPending) {
     petSession.setState({ taskFeedbackPending: false }, { reason: "task_feedback_reset" });
+  }
+  if (bubbleActionsEl) {
+    const nodes = bubbleActionsEl.querySelectorAll(".pet-bubble-action-dynamic");
+    for (const el of Array.from(nodes)) {
+      try { el.remove(); } catch (e) {}
+    }
   }
   if (bubbleActionsEl) bubbleActionsEl.classList.add("is-hidden");
   if (bubbleYesEl) bubbleYesEl.classList.add("is-hidden");
@@ -194,6 +225,75 @@ function showTaskFeedbackUi() {
     }
     refreshHitAfterUiChange();
   };
+  refreshHitAfterUiChange();
+}
+
+function showNeedInputChoicesUi(payload) {
+  if (!bubbleActionsEl) return;
+
+  const kind = String(payload?.kind || "").trim();
+  if (kind === "task_feedback") {
+    showTaskFeedbackUi();
+    return;
+  }
+
+  const choices = normalizeNeedInputChoices(payload?.choices);
+
+  // 清空旧的动态按钮
+  const nodes = bubbleActionsEl.querySelectorAll(".pet-bubble-action-dynamic");
+  for (const el of Array.from(nodes)) {
+    try { el.remove(); } catch (e) {}
+  }
+
+  bubbleActionsEl.classList.remove("is-hidden");
+  if (bubbleYesEl) bubbleYesEl.classList.add("is-hidden");
+  if (bubbleNoEl) bubbleNoEl.classList.add("is-hidden");
+
+  function focusCustomInput() {
+    showChat();
+    if (chatInputEl) {
+      try {
+        chatInputEl.focus();
+        chatInputEl.setSelectionRange(chatInputEl.value.length, chatInputEl.value.length);
+      } catch (e) {}
+    }
+  }
+
+  for (const c of choices) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "pet-bubble-action pet-bubble-action-dynamic";
+    btn.textContent = String(c?.label || "").trim() || "选项";
+    btn.onclick = async () => {
+      const pending = petSession.getState().pendingResume;
+      if (!pending?.runId) return;
+      // 禁用所有动态按钮，避免重复提交
+      for (const node of Array.from(bubbleActionsEl.querySelectorAll(".pet-bubble-action-dynamic"))) {
+        try { node.disabled = true; } catch (e) {}
+      }
+      bubbleSet(`收到：${btn.textContent}。正在继续执行…`, BUBBLE_TYPES.INFO);
+      try {
+        await handleResumeMode(String(c?.value || "").trim());
+      } catch (e) {
+        bubbleSet("继续执行失败：请稍后重试或在输入框手动回复。", BUBBLE_TYPES.ERROR);
+        focusCustomInput();
+      }
+      refreshHitAfterUiChange();
+    };
+    bubbleActionsEl.appendChild(btn);
+  }
+
+  // “自定义输入”：只聚焦输入框，不自动发送（符合用户期望）
+  const customBtn = document.createElement("button");
+  customBtn.type = "button";
+  customBtn.className = "pet-bubble-action pet-bubble-action-dynamic";
+  customBtn.textContent = "自定义输入";
+  customBtn.onclick = () => {
+    focusCustomInput();
+    refreshHitAfterUiChange();
+  };
+  bubbleActionsEl.appendChild(customBtn);
+
   refreshHitAfterUiChange();
 }
 
@@ -542,7 +642,11 @@ async function updateAgentPlanFromBackend() {
   if (status === "waiting" && question) {
     const pending = session.pendingResume;
     if (!pending || Number(pending.runId) !== runId) {
-      setPendingAgentResume({ run_id: runId, task_id: detail?.run?.task_id, question });
+      const payload = { run_id: runId, task_id: detail?.run?.task_id, question, kind: paused?.kind, choices: paused?.choices };
+      setPendingAgentResume(payload);
+      bubbleSet(question, BUBBLE_TYPES.INFO);
+      showNeedInputChoicesUi(payload);
+      showChat();
     }
   } else {
     const pending = session.pendingResume;
@@ -917,6 +1021,7 @@ async function streamAndShow(makeRequest, options = {}) {
         const question = String(obj?.question || "").trim();
         if (question) {
           bubbleSet(question, BUBBLE_TYPES.INFO);
+          showNeedInputChoicesUi(obj);
           // 需要用户补充信息属于“对话的一部分”：落库后世界页/状态页可一致回放。
           writePetChatMessage("assistant", question, {
             task_id: Number(obj?.task_id) || null,
@@ -940,7 +1045,7 @@ async function streamAndShow(makeRequest, options = {}) {
       onEvent: (obj) => {
         // 复用现有 SSE：把关键结构化事件转发给主面板（跨窗口同步）
         if (!isStreamActive(chatStream, mySeq)) return;
-        if (obj?.type === "memory_item") {
+        if (obj?.type === "memory_item" || obj?.type === "agent_stage" || obj?.type === "plan" || obj?.type === "plan_delta") {
           emitAgentEvent(obj, { broadcast: true });
         }
       },

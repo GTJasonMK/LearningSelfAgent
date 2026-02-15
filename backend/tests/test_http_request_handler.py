@@ -116,5 +116,146 @@ class TestHttpRequestHandler(unittest.TestCase):
         self.assertEqual(created["read_calls"], 1)
 
 
+    def test_http_request_strict_business_success_blocks_success_false_payload(self):
+        from backend.src.actions.handlers.http_request import execute_http_request
+
+        class FakeResponse:
+            def __init__(self):
+                self.url = "http://example.test/"
+                self.status_code = 200
+                self.headers = {"content-type": "application/json"}
+                self.encoding = "utf-8"
+
+            def iter_bytes(self):
+                yield b'{"success":false,"error":{"statusCode":102,"message":"invalid key"}}'
+
+            def read(self):
+                return b'{"success":false,"error":{"statusCode":102,"message":"invalid key"}}'
+
+        class FakeStream:
+            def __init__(self, resp):
+                self._resp = resp
+
+            def __enter__(self):
+                return self._resp
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeClient:
+            def __init__(self, timeout=None):
+                _ = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, headers=None, params=None, data=None, json=None, follow_redirects=True):
+                _ = method, url, headers, params, data, json, follow_redirects
+                return FakeStream(FakeResponse())
+
+        with patch("backend.src.actions.handlers.http_request.httpx.Client", FakeClient):
+            result, error_message = execute_http_request({"url": "http://example.test/"})
+
+        self.assertIsNone(result)
+        self.assertIn("http_request 业务失败", str(error_message))
+        self.assertIn("code=102", str(error_message))
+
+    def test_http_request_strict_status_code_blocks_4xx_by_default(self):
+        from backend.src.actions.handlers.http_request import execute_http_request
+
+        class FakeResponse:
+            def __init__(self):
+                self.url = "http://example.test/blocked"
+                self.status_code = 403
+                self.headers = {"content-type": "text/plain"}
+                self.encoding = "utf-8"
+
+            def iter_bytes(self):
+                yield b"Forbidden"
+
+            def read(self):
+                return b"Forbidden"
+
+        class FakeStream:
+            def __init__(self, resp):
+                self._resp = resp
+
+            def __enter__(self):
+                return self._resp
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeClient:
+            def __init__(self, timeout=None):
+                _ = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, headers=None, params=None, data=None, json=None, follow_redirects=True):
+                _ = method, url, headers, params, data, json, follow_redirects
+                return FakeStream(FakeResponse())
+
+        with patch("backend.src.actions.handlers.http_request.httpx.Client", FakeClient):
+            result, error_message = execute_http_request({"url": "http://example.test/blocked"})
+
+        self.assertIsNone(result)
+        self.assertIn("HTTP 403", str(error_message))
+        self.assertIn("Forbidden", str(error_message))
+
+    def test_http_request_strict_status_code_can_be_disabled(self):
+        from backend.src.actions.handlers.http_request import execute_http_request
+
+        class FakeResponse:
+            def __init__(self):
+                self.url = "http://example.test/blocked"
+                self.status_code = 403
+                self.headers = {"content-type": "text/plain"}
+                self.encoding = "utf-8"
+
+            def iter_bytes(self):
+                yield b"Forbidden"
+
+            def read(self):
+                return b"Forbidden"
+
+        class FakeStream:
+            def __init__(self, resp):
+                self._resp = resp
+
+            def __enter__(self):
+                return self._resp
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeClient:
+            def __init__(self, timeout=None):
+                _ = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, headers=None, params=None, data=None, json=None, follow_redirects=True):
+                _ = method, url, headers, params, data, json, follow_redirects
+                return FakeStream(FakeResponse())
+
+        with patch("backend.src.actions.handlers.http_request.httpx.Client", FakeClient):
+            result, error_message = execute_http_request({"url": "http://example.test/blocked", "strict_status_code": False})
+
+        self.assertIsNone(error_message)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result.get("status_code"), 403)
+
 if __name__ == "__main__":
     unittest.main()

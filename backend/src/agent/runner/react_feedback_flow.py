@@ -2,6 +2,7 @@ import json
 from dataclasses import dataclass
 from typing import Callable, Dict, Generator, List, Optional
 
+from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.support import _truncate_observation, apply_next_step_patch
 from backend.src.agent.runner.feedback import (
     append_task_feedback_step,
@@ -11,9 +12,9 @@ from backend.src.agent.runner.feedback import (
     task_feedback_need_input_kind,
 )
 from backend.src.agent.runner.plan_events import sse_plan, sse_plan_delta
-from backend.src.agent.runner.react_plan_state import build_agent_plan_payload
 from backend.src.common.utils import now_iso
 from backend.src.constants import (
+    AGENT_MAX_STEPS_UNLIMITED,
     AGENT_REACT_REPLAN_MAX_ATTEMPTS,
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
@@ -40,18 +41,15 @@ from backend.src.services.llm.llm_client import sse_json
 @dataclass
 class TaskFeedbackOutcome:
     """
-    处理“确认满意度”步骤后的控制结果：
+    处理"确认满意度"步骤后的控制结果：
     - run_status != None：外层应 break 并以该状态结束本次生成器；
     - next_idx != None：外层应把 idx 设为 next_idx 并 continue；
-    - plan_* 不为 None：外层应替换当前 plan 引用（通常发生在 replan 之后）。
+    - plan_changed: 计划是否被修改（replan 后），外层通过 plan_struct 直接读取最新状态。
     """
 
     run_status: Optional[str] = None
     next_idx: Optional[int] = None
-    plan_titles: Optional[List[str]] = None
-    plan_items: Optional[List[dict]] = None
-    plan_allows: Optional[List[List[str]]] = None
-    plan_artifacts: Optional[List[str]] = None
+    plan_changed: bool = False
 
 
 def maybe_apply_review_gate_before_feedback(
@@ -64,16 +62,14 @@ def maybe_apply_review_gate_before_feedback(
     react_params: dict,
     variables_source: str,
     llm_call: Callable[[dict], dict],
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     max_steps_limit: Optional[int],
+    agent_state: Dict,
     safe_write_debug: Callable[..., None],
 ) -> Generator[str, None, bool]:
     """
-    评估门闩（在“确认满意度”之前）：
-    - 若评估未通过，则在“确认满意度”之前插入修复步骤并继续执行（不立刻进入 waiting）；
+    评估门闩（在"确认满意度"之前）：
+    - 若评估未通过，则在"确认满意度"之前插入修复步骤并继续执行（不立刻进入 waiting）；
     - 直到评估通过，才允许进入 waiting 询问满意度。
 
     返回：是否已插入修复步骤（True 表示外层应 continue，开始执行插入的新步骤）。
@@ -121,6 +117,32 @@ def maybe_apply_review_gate_before_feedback(
 
     normalized_review_status = str(review_status or "").strip().lower()
     if not (review_row and normalized_review_status and normalized_review_status != "pass"):
+        if isinstance(agent_state, dict):
+            agent_state["review_gate_attempts"] = 0
+        return False
+
+    review_gate_attempts = 0
+    if isinstance(agent_state, dict):
+        try:
+            review_gate_attempts = int(agent_state.get("review_gate_attempts") or 0)
+        except (TypeError, ValueError):
+            review_gate_attempts = 0
+
+    repair_budget = int(AGENT_REACT_REPLAN_MAX_ATTEMPTS or 0)
+    if repair_budget > 0 and review_gate_attempts >= repair_budget:
+        safe_write_debug(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            message="agent.review_gate.repair_budget_exhausted",
+            data={
+                "review_id": int(review_id) if review_id else None,
+                "review_status": normalized_review_status,
+                "attempts": int(review_gate_attempts),
+                "budget": int(repair_budget),
+            },
+            level="warning",
+        )
+        yield sse_json({"delta": f"{STREAM_TAG_EXEC} 评估修复已达预算，先进入反馈确认。\n"})
         return False
 
     try:
@@ -131,7 +153,7 @@ def maybe_apply_review_gate_before_feedback(
             review_summary=review_summary,
             review_next_actions=review_next_actions,
         )
-        repair_text, repair_err = review_repair.call_llm_for_text(
+        deliberation_text, deliberation_err = review_repair.call_llm_for_text(
             llm_call,
             prompt=repair_prompt,
             task_id=int(task_id),
@@ -144,21 +166,149 @@ def maybe_apply_review_gate_before_feedback(
                 "review_status": normalized_review_status,
             },
         )
-        insert_steps = review_repair.parse_insert_steps_from_text(repair_text or "")
-        if repair_err or not isinstance(insert_steps, list) or not insert_steps:
-            raise ValueError(str(repair_err or "repair_output_invalid"))
+        decision = review_repair.parse_review_gate_decision_from_text(deliberation_text or "")
 
+        safe_write_debug(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            message="agent.review_gate.deliberation_decision",
+            data={
+                "review_id": int(review_id) if review_id else None,
+                "review_status": normalized_review_status,
+                "decision": decision.decision,
+                "reasons": decision.reasons,
+                "evidence": decision.evidence,
+                "parse_error": decision.parse_error,
+            },
+            level="info",
+        )
+
+        if deliberation_err and not str(deliberation_text or "").strip():
+            safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.review_gate.deliberation_failed",
+                data={
+                    "review_id": int(review_id) if review_id else None,
+                    "error": str(deliberation_err),
+                },
+                level="warning",
+            )
+            return False
+
+        if decision.parse_error:
+            safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.review_gate.deliberation_parse_warning",
+                data={
+                    "review_id": int(review_id) if review_id else None,
+                    "decision": decision.decision,
+                    "parse_error": decision.parse_error,
+                },
+                level="warning",
+            )
+
+        if decision.decision != review_repair.REVIEW_GATE_DECISION_REPAIR:
+            if isinstance(agent_state, dict):
+                agent_state["review_gate_attempts"] = 0
+            if decision.decision == review_repair.REVIEW_GATE_DECISION_FINALIZE_WITH_RISK:
+                yield sse_json({"delta": f"{STREAM_TAG_EXEC} 评估建议先保留风险并进入反馈。\n"})
+            elif decision.decision == review_repair.REVIEW_GATE_DECISION_ASK_USER:
+                yield sse_json({"delta": f"{STREAM_TAG_EXEC} 评估建议先向用户确认，再决定是否修复。\n"})
+            else:
+                yield sse_json({"delta": f"{STREAM_TAG_EXEC} 评估建议先进入反馈，暂不插入修复步骤。\n"})
+            return False
+
+        insert_steps = decision.insert_steps
+        if not isinstance(insert_steps, list) or not insert_steps:
+            safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.review_gate.repair_steps_missing",
+                data={
+                    "review_id": int(review_id) if review_id else None,
+                    "decision": decision.decision,
+                    "parse_error": decision.parse_error,
+                },
+                level="warning",
+            )
+            return False
+
+        # apply_next_step_patch 仍使用 legacy 列表接口（后续可进一步收编到 PlanStructure）
+        plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
+        patch_obj = {"step_index": int(idx) + 1, "insert_steps": insert_steps}
         patch_err = apply_next_step_patch(
             current_step_index=int(idx),
-            patch_obj={"step_index": int(idx) + 1, "insert_steps": insert_steps},
+            patch_obj=patch_obj,
             plan_titles=plan_titles,
             plan_items=plan_items,
             plan_allows=plan_allows,
             plan_artifacts=plan_artifacts,
             max_steps=max_steps_limit,
         )
+
+        if patch_err and "超出 max_steps" in str(patch_err):
+            # 修复器可能返回多条步骤；当超过 max_steps 时自动裁剪，避免整次修复直接失败。
+            allowed_inserts = 0
+            if isinstance(max_steps_limit, int) and max_steps_limit > 0:
+                allowed_inserts = max(0, int(max_steps_limit) - len(plan_titles))
+            if allowed_inserts > 0:
+                original_count = len(insert_steps)
+                trimmed_insert_steps = list(insert_steps)[:allowed_inserts]
+                patch_obj = {"step_index": int(idx) + 1, "insert_steps": trimmed_insert_steps}
+                patch_err = apply_next_step_patch(
+                    current_step_index=int(idx),
+                    patch_obj=patch_obj,
+                    plan_titles=plan_titles,
+                    plan_items=plan_items,
+                    plan_allows=plan_allows,
+                    plan_artifacts=plan_artifacts,
+                    max_steps=max_steps_limit,
+                )
+                if not patch_err:
+                    insert_steps = trimmed_insert_steps
+                    safe_write_debug(
+                        task_id=int(task_id),
+                        run_id=int(run_id),
+                        message="agent.review_gate.repair_steps_trimmed",
+                        data={
+                            "review_id": int(review_id) if review_id else None,
+                            "original_count": int(original_count),
+                            "trimmed_count": len(insert_steps),
+                            "max_steps": int(max_steps_limit),
+                        },
+                        level="info",
+                    )
+
+        if patch_err and "超出 max_steps" in str(patch_err):
+            reached_limit = False
+            if isinstance(max_steps_limit, int) and max_steps_limit > 0:
+                reached_limit = len(plan_titles) >= int(max_steps_limit)
+            if reached_limit:
+                safe_write_debug(
+                    task_id=int(task_id),
+                    run_id=int(run_id),
+                    message="agent.review_gate.repair_skipped_max_steps",
+                    data={
+                        "review_id": int(review_id) if review_id else None,
+                        "plan_len": len(plan_titles),
+                        "max_steps": int(max_steps_limit),
+                    },
+                    level="info",
+                )
+                return False
         if patch_err:
             raise ValueError(f"plan_patch_invalid:{patch_err}")
+
+        # 回写到 plan_struct
+        patched_plan = PlanStructure.from_legacy(
+            plan_titles=plan_titles,
+            plan_items=plan_items,
+            plan_allows=plan_allows,
+            plan_artifacts=plan_artifacts,
+        )
+        plan_struct.replace_from(patched_plan)
 
         safe_write_debug(
             task_id=int(task_id),
@@ -168,23 +318,23 @@ def maybe_apply_review_gate_before_feedback(
                 "review_id": int(review_id) if review_id else None,
                 "review_status": normalized_review_status,
                 "insert_steps_count": len(insert_steps),
+                "decision_reasons": decision.reasons,
             },
             level="info",
         )
-        yield sse_plan(task_id=task_id, plan_items=plan_items)
+        if isinstance(agent_state, dict):
+            agent_state["review_gate_attempts"] = int(review_gate_attempts) + 1
+
+        yield sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload())
         try:
             updated_at = now_iso()
             update_task_run(
                 run_id=int(run_id),
-                agent_plan=build_agent_plan_payload(
-                    plan_titles=plan_titles,
-                    plan_items=plan_items,
-                    plan_allows=plan_allows,
-                    plan_artifacts=plan_artifacts,
-                ),
+                agent_plan=plan_struct.to_agent_plan_payload(),
+                agent_state=agent_state,
                 updated_at=updated_at,
             )
-        except Exception as exc:
+        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -220,10 +370,7 @@ def handle_task_feedback_step(
     skills_hint: str,
     memories_hint: str,
     graph_hint: str,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     agent_state: Dict,
     context: Dict,
     observations: List[str],
@@ -242,11 +389,11 @@ def handle_task_feedback_step(
     # 1) 首次到达该步骤：提出满意度问题并暂停 run（waiting），等待用户回复
     if not asked:
         question = build_task_feedback_question()
+        choices = [{"label": "是", "value": "是"}, {"label": "否", "value": "否"}]
         created_at = now_iso()
 
-        if 0 <= idx < len(plan_items):
-            plan_items[idx]["status"] = "waiting"
-            yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[idx])
+        plan_struct.set_step_status(idx, "waiting")
+        yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
         try:
             create_task_output(
@@ -256,7 +403,7 @@ def handle_task_feedback_step(
                 content=question,
                 created_at=created_at,
             )
-        except Exception as exc:
+        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -278,6 +425,8 @@ def handle_task_feedback_step(
             "step_order": step_order,
             "step_title": title,
             "created_at": created_at,
+            "kind": task_feedback_need_input_kind(),
+            "choices": choices,
         }
         agent_state["step_order"] = step_order
         agent_state["task_feedback_asked"] = True
@@ -287,17 +436,12 @@ def handle_task_feedback_step(
             update_task_run(
                 run_id=int(run_id),
                 status=RUN_STATUS_WAITING,
-                agent_plan=build_agent_plan_payload(
-                    plan_titles=plan_titles,
-                    plan_items=plan_items,
-                    plan_allows=plan_allows,
-                    plan_artifacts=plan_artifacts,
-                ),
+                agent_plan=plan_struct.to_agent_plan_payload(),
                 agent_state=agent_state,
                 updated_at=updated_at,
             )
             update_task(task_id=int(task_id), status=STATUS_WAITING, updated_at=updated_at)
-        except Exception as exc:
+        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -313,19 +457,19 @@ def handle_task_feedback_step(
                 "run_id": run_id,
                 "question": question,
                 "kind": task_feedback_need_input_kind(),
+                "choices": choices,
             }
         )
         yield sse_json({"delta": f"{STREAM_TAG_ASK} {question}\n"})
         return TaskFeedbackOutcome(run_status=RUN_STATUS_WAITING)
 
-    # 2) 用户已回复：根据满意度决定“结束 or 追加步骤继续”
+    # 2) 用户已回复：根据满意度决定"结束 or 追加步骤继续"
     answer = str(agent_state.get("last_user_input") or "").strip()
     satisfied = is_positive_feedback(answer)
 
-    # 当前步骤先标为 running，便于 UI 呈现“正在处理反馈”
-    if 0 <= idx < len(plan_items):
-        plan_items[idx]["status"] = "running"
-        yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[idx])
+    # 当前步骤先标为 running，便于 UI 呈现"正在处理反馈"
+    plan_struct.set_step_status(idx, "running")
+    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
     step_created_at = now_iso()
     detail = json.dumps(
@@ -334,24 +478,21 @@ def handle_task_feedback_step(
     )
 
     executor_value = None
-    try:
-        assignments = agent_state.get("executor_assignments") if isinstance(agent_state, dict) else None
-        if isinstance(assignments, list):
-            for a in assignments:
-                if not isinstance(a, dict):
-                    continue
-                raw_order = a.get("step_order")
-                try:
-                    order_value = int(raw_order)
-                except Exception:
-                    continue
-                if order_value != int(step_order):
-                    continue
-                ev = str(a.get("executor") or "").strip()
-                executor_value = ev or None
-                break
-    except Exception:
-        executor_value = None
+    assignments = agent_state.get("executor_assignments") if isinstance(agent_state, dict) else None
+    if isinstance(assignments, list):
+        for a in assignments:
+            if not isinstance(a, dict):
+                continue
+            raw_order = a.get("step_order")
+            try:
+                order_value = int(raw_order)
+            except (TypeError, ValueError):
+                continue
+            if order_value != int(step_order):
+                continue
+            ev = str(a.get("executor") or "").strip()
+            executor_value = ev or None
+            break
 
     step_id, _created, _updated = create_task_step(
         TaskStepCreateParams(
@@ -378,16 +519,15 @@ def handle_task_feedback_step(
             {"satisfied": bool(satisfied), "answer": answer},
             ensure_ascii=False,
         )
-    except Exception:
+    except (TypeError, ValueError):
         result_value = json.dumps(
             {"satisfied": bool(satisfied), "answer": str(answer)},
             ensure_ascii=False,
         )
     mark_task_step_done(step_id=int(step_id), result=result_value, finished_at=finished_at)
 
-    if 0 <= idx < len(plan_items):
-        plan_items[idx]["status"] = "done"
-        yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[idx])
+    plan_struct.set_step_status(idx, "done")
+    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
     yield sse_json({"delta": f"{STREAM_TAG_OK} {title}\n"})
 
@@ -408,16 +548,11 @@ def handle_task_feedback_step(
             updated_at = now_iso()
             update_task_run(
                 run_id=int(run_id),
-                agent_plan=build_agent_plan_payload(
-                    plan_titles=plan_titles,
-                    plan_items=plan_items,
-                    plan_allows=plan_allows,
-                    plan_artifacts=plan_artifacts,
-                ),
+                agent_plan=plan_struct.to_agent_plan_payload(),
                 agent_state=agent_state,
                 updated_at=updated_at,
             )
-        except Exception as exc:
+        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -430,7 +565,7 @@ def handle_task_feedback_step(
     # 不满意：进入 Replan（重新规划剩余步骤），避免反复 insert_steps 造成冗余
     try:
         replan_attempts = int(agent_state.get("replan_attempts") or 0)
-    except Exception:
+    except (TypeError, ValueError):
         replan_attempts = 0
     done_count = int(step_order)
     remaining_limit = None
@@ -449,7 +584,12 @@ def handle_task_feedback_step(
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} 已收到反馈，但重新规划次数已达上限。\n"})
         return TaskFeedbackOutcome(run_status=RUN_STATUS_FAILED)
 
-    max_steps_value = int(remaining_limit) if remaining_limit is not None else int(max_steps_limit or len(plan_titles))
+    if remaining_limit is not None:
+        max_steps_value = int(remaining_limit)
+    elif isinstance(max_steps_limit, int) and max_steps_limit > 0:
+        max_steps_value = int(max_steps_limit)
+    else:
+        max_steps_value = int(AGENT_MAX_STEPS_UNLIMITED)
     replan_result = yield from run_replan_and_merge(
         task_id=int(task_id),
         run_id=int(run_id),
@@ -462,10 +602,7 @@ def handle_task_feedback_step(
         skills_hint=skills_hint,
         memories_hint=memories_hint,
         graph_hint=graph_hint,
-        plan_titles=plan_titles,
-        plan_items=plan_items,
-        plan_allows=plan_allows,
-        plan_artifacts=plan_artifacts,
+        plan_struct=plan_struct,
         agent_state=agent_state,
         observations=observations,
         done_count=done_count,
@@ -479,34 +616,34 @@ def handle_task_feedback_step(
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} 重新规划失败，无法继续。\\n"})
         return TaskFeedbackOutcome(run_status=RUN_STATUS_FAILED)
 
-    # replan_result 结构由上层提供；这里按约定读取字段（避免强耦合具体类型）
-    plan_titles = getattr(replan_result, "plan_titles", plan_titles)
-    plan_allows = getattr(replan_result, "plan_allows", plan_allows)
-    plan_items = getattr(replan_result, "plan_items", plan_items)
-    plan_artifacts = getattr(replan_result, "plan_artifacts", plan_artifacts)
+    plan_struct.replace_from(replan_result.plan_struct)
 
+    # append_task_feedback_step 仍使用 legacy 列表接口（后续可进一步收编）
+    new_titles, new_items, new_allows, new_artifacts = plan_struct.to_legacy_lists()
     append_task_feedback_step(
-        plan_titles=plan_titles,
-        plan_items=plan_items,
-        plan_allows=plan_allows,
+        plan_titles=new_titles,
+        plan_items=new_items,
+        plan_allows=new_allows,
         max_steps=int(max_steps_limit) if isinstance(max_steps_limit, int) else None,
     )
+    feedback_plan = PlanStructure.from_legacy(
+        plan_titles=new_titles,
+        plan_items=new_items,
+        plan_allows=new_allows,
+        plan_artifacts=new_artifacts,
+    )
+    plan_struct.replace_from(feedback_plan)
 
-    yield sse_plan(task_id=task_id, plan_items=plan_items)
+    yield sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload())
     try:
         updated_at = now_iso()
         update_task_run(
             run_id=int(run_id),
-            agent_plan=build_agent_plan_payload(
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
-            ),
+            agent_plan=plan_struct.to_agent_plan_payload(),
             agent_state=agent_state,
             updated_at=updated_at,
         )
-    except Exception as exc:
+    except (TypeError, ValueError, RuntimeError, KeyError) as exc:
         safe_write_debug(
             task_id=int(task_id),
             run_id=int(run_id),
@@ -517,8 +654,5 @@ def handle_task_feedback_step(
 
     return TaskFeedbackOutcome(
         next_idx=done_count,
-        plan_titles=plan_titles,
-        plan_items=plan_items,
-        plan_allows=plan_allows,
-        plan_artifacts=plan_artifacts,
+        plan_changed=True,
     )

@@ -1,5 +1,18 @@
 import unittest
 
+from backend.src.agent.core.plan_structure import PlanStructure
+
+
+def _make_plan_struct(plan_titles, plan_allows, plan_artifacts=None):
+    """测试辅助：从标题/允许列表快速构建 PlanStructure。"""
+    plan_items = [{"id": i + 1, "brief": "", "status": "pending"} for i in range(len(plan_titles))]
+    return PlanStructure.from_legacy(
+        plan_titles=list(plan_titles),
+        plan_items=plan_items,
+        plan_allows=[list(a) for a in plan_allows],
+        plan_artifacts=list(plan_artifacts or []),
+    )
+
 
 class TestThinkParallelDependencyMap(unittest.TestCase):
     """回归：think_parallel_loop 依赖图构建的健壮性与推断能力。"""
@@ -15,9 +28,7 @@ class TestThinkParallelDependencyMap(unittest.TestCase):
         plan_allows = [["file_write"], ["file_read"], ["task_output"]]
 
         dep_map = _build_dependency_map(
-            plan_titles=plan_titles,
-            plan_allows=plan_allows,
-            plan_artifacts=[],
+            plan_struct=_make_plan_struct(plan_titles, plan_allows),
             dependencies=None,
         )
 
@@ -37,9 +48,7 @@ class TestThinkParallelDependencyMap(unittest.TestCase):
         plan_allows = [["file_write"], ["file_write"], ["file_read"]]
 
         dep_map = _build_dependency_map(
-            plan_titles=plan_titles,
-            plan_allows=plan_allows,
-            plan_artifacts=[],
+            plan_struct=_make_plan_struct(plan_titles, plan_allows),
             dependencies=None,
         )
 
@@ -55,13 +64,14 @@ class TestThinkParallelDependencyMap(unittest.TestCase):
         from backend.src.agent.runner.think_parallel_loop import _build_dependency_map
 
         dep_map = _build_dependency_map(
-            plan_titles=[
-                "file_write:out.txt 写入 v1",
-                "file_append:out.txt 追加 v2",
-                "file_read:out.txt 读取结果",
-            ],
-            plan_allows=[["file_write"], ["file_append"], ["file_read"]],
-            plan_artifacts=[],
+            plan_struct=_make_plan_struct(
+                [
+                    "file_write:out.txt 写入 v1",
+                    "file_append:out.txt 追加 v2",
+                    "file_read:out.txt 读取结果",
+                ],
+                [["file_write"], ["file_append"], ["file_read"]],
+            ),
             dependencies=None,
         )
 
@@ -73,9 +83,10 @@ class TestThinkParallelDependencyMap(unittest.TestCase):
         from backend.src.agent.runner.think_parallel_loop import _build_dependency_map
 
         dep_map = _build_dependency_map(
-            plan_titles=["task_output 输出结果"],
-            plan_allows=[["task_output"]],
-            plan_artifacts=[],
+            plan_struct=_make_plan_struct(
+                ["task_output 输出结果"],
+                [["task_output"]],
+            ),
             dependencies=[{"step_index": 999, "depends_on": [0]}],
         )
 
@@ -88,9 +99,10 @@ class TestThinkParallelDependencyMap(unittest.TestCase):
         from backend.src.agent.runner.think_parallel_loop import _build_dependency_map
 
         dep_map = _build_dependency_map(
-            plan_titles=["步骤1", "步骤2", "步骤3"],
-            plan_allows=[["tool_call"], ["tool_call"], ["tool_call"]],
-            plan_artifacts=[],
+            plan_struct=_make_plan_struct(
+                ["步骤1", "步骤2", "步骤3"],
+                [["tool_call"], ["tool_call"], ["tool_call"]],
+            ),
             dependencies=[
                 {"from_step": 1, "to_step": 3, "reason": "1-based from/to"},
                 {"step_index": 3, "depends_on": [1, 2], "reason": "1-based depends_on"},

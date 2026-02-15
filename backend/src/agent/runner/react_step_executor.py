@@ -15,6 +15,8 @@ from backend.src.agent.runner.react_helpers import (
     needs_nonempty_task_output_content,
     validate_and_normalize_action_text,
 )
+from backend.src.agent.runner.need_input_choices import resolve_need_input_choices
+from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.plan_events import sse_plan_delta
 from backend.src.common.utils import now_iso
 from backend.src.constants import (
@@ -159,9 +161,33 @@ def build_observation_line(
     visible_content = None
 
     if action_type == ACTION_TYPE_SHELL_COMMAND and isinstance(result, dict):
-        stdout = _truncate_observation(str(result.get("stdout") or ""))
-        stderr = _truncate_observation(str(result.get("stderr") or ""))
-        obs_line = f"{title}: shell stdout={stdout} stderr={stderr}"
+        stdout_raw = str(result.get("stdout") or "")
+        stderr_raw = str(result.get("stderr") or "")
+        stdout = _truncate_observation(stdout_raw)
+        stderr = _truncate_observation(stderr_raw)
+
+        auto_retry = result.get("auto_retry") if isinstance(result.get("auto_retry"), dict) else None
+        retry_tail = ""
+        parse_candidates = [stdout_raw.strip(), stderr_raw.strip()]
+        if isinstance(auto_retry, dict):
+            retry_trigger = str(auto_retry.get("trigger") or "").strip()
+            retry_url = str(auto_retry.get("fallback_url") or "").strip()
+            initial_stderr = str(auto_retry.get("initial_stderr") or "").strip()
+            initial_stdout = str(auto_retry.get("initial_stdout") or "").strip()
+            if retry_trigger:
+                retry_tail = f" auto_retry={retry_trigger}"
+                if retry_url:
+                    retry_tail += f"({retry_url})"
+            if initial_stderr:
+                parse_candidates.append(initial_stderr)
+            if initial_stdout:
+                parse_candidates.append(initial_stdout)
+            context["latest_shell_auto_retry"] = auto_retry
+
+        obs_line = f"{title}: shell stdout={stdout} stderr={stderr}{retry_tail}".strip()
+        parse_input = next((item for item in parse_candidates if str(item).strip()), "")
+        if parse_input:
+            context["latest_parse_input_text"] = parse_input
 
     elif action_type == ACTION_TYPE_LLM_CALL and isinstance(result, dict):
         resp = str(result.get("response") or "")
@@ -178,14 +204,21 @@ def build_observation_line(
         path = str(result.get("path") or "").strip()
         size = result.get("bytes")
         tail = f"{size} bytes" if isinstance(size, int) else ""
-        obs_line = f"{title}: file_write {path} {tail}".strip()
+        warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+        warn_tail = ""
+        if warnings:
+            warn_tail = f" warn={_truncate_observation(str(warnings[0] or ''))}"
+        obs_line = f"{title}: file_write {path} {tail}{warn_tail}".strip()
 
     elif action_type == ACTION_TYPE_FILE_READ and isinstance(result, dict):
         path = str(result.get("path") or "").strip()
         size = result.get("bytes")
         tail = f"{size} bytes" if isinstance(size, int) else ""
-        content = _truncate_observation(str(result.get("content") or ""))
+        content_raw = str(result.get("content") or "")
+        content = _truncate_observation(content_raw)
         obs_line = f"{title}: file_read {path} {tail} content={content}".strip()
+        if content_raw.strip():
+            context["latest_parse_input_text"] = content_raw.strip()
 
     elif action_type == ACTION_TYPE_FILE_APPEND and isinstance(result, dict):
         path = str(result.get("path") or "").strip()
@@ -204,13 +237,28 @@ def build_observation_line(
     elif action_type == ACTION_TYPE_TOOL_CALL and isinstance(result, dict):
         tool_name = str(result.get("tool_id") or "")
         out = str(result.get("output") or "")
-        obs_line = f"{title}: tool#{tool_name} output={_truncate_observation(out)}"
+        warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+        warn_tail = ""
+        if warnings:
+            warn_tail = f" warn={_truncate_observation(str(warnings[0] or ''))}"
+        obs_line = f"{title}: tool#{tool_name} output={_truncate_observation(out)}{warn_tail}"
+        if out.strip():
+            context["latest_parse_input_text"] = out.strip()
+        tool_input = str(result.get("input") or "").strip()
+        if tool_input.startswith("http://") or tool_input.startswith("https://"):
+            context["latest_external_url"] = tool_input
 
     elif action_type == ACTION_TYPE_HTTP_REQUEST and isinstance(result, dict):
         status_code = result.get("status_code")
         size = result.get("bytes")
         tail = f"{size} bytes" if isinstance(size, int) else ""
         obs_line = f"{title}: http {status_code} {tail}".strip()
+        content_raw = str(result.get("content") or "")
+        if content_raw.strip():
+            context["latest_parse_input_text"] = content_raw.strip()
+        url_raw = str(result.get("url") or "").strip()
+        if url_raw.startswith("http://") or url_raw.startswith("https://"):
+            context["latest_external_url"] = url_raw
 
     elif action_type == ACTION_TYPE_JSON_PARSE and isinstance(result, dict):
         picked = result.get("picked")
@@ -307,10 +355,7 @@ def handle_user_prompt_action(
     step_order: int,
     title: str,
     payload_obj: dict,
-    plan_items: List[dict],
-    plan_titles: List[str],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     agent_state: Dict,
     safe_write_debug: Callable,
     db_lock: Optional[object] = None,
@@ -324,10 +369,7 @@ def handle_user_prompt_action(
         step_order: 步骤序号
         title: 步骤标题
         payload_obj: 动作载荷
-        plan_items: 计划项列表
-        plan_titles: 计划标题列表
-        plan_allows: 允许的动作类型列表
-        plan_artifacts: 产物列表
+        plan_struct: 计划结构
         agent_state: Agent 状态字典
         safe_write_debug: 调试输出函数
 
@@ -337,20 +379,23 @@ def handle_user_prompt_action(
     Returns:
         (run_status, should_break) 运行状态和是否应该终止循环
     """
-    from backend.src.agent.runner.react_plan_state import build_agent_plan_payload
-
     question = str(payload_obj.get("question") or "").strip()
     if not question:
-        if 0 <= step_order - 1 < len(plan_items):
-            plan_items[step_order - 1]["status"] = "failed"
-            yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[step_order - 1])
+        plan_struct.set_step_status(step_order - 1, "failed")
+        yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[step_order - 1])
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} user_prompt.question 不能为空\n"})
         return RUN_STATUS_FAILED, True
 
+    kind = str(payload_obj.get("kind") or "").strip() or None
+    normalized_choices = resolve_need_input_choices(
+        raw_choices=payload_obj.get("choices"),
+        question=question,
+        kind=kind,
+    )
+
     # 更新计划栏：当前步骤标记为 waiting
-    if 0 <= step_order - 1 < len(plan_items):
-        plan_items[step_order - 1]["status"] = "waiting"
-        yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[step_order - 1])
+    plan_struct.set_step_status(step_order - 1, "waiting")
+    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[step_order - 1])
 
     # docs/agent：waiting 也应落库到 task_steps，便于中断恢复与审计。
     step_created_at = now_iso()
@@ -459,7 +504,7 @@ def handle_user_prompt_action(
         task_id=int(task_id),
         run_id=int(run_id),
         message="agent.waiting_input",
-        data={"step_order": int(step_order), "question": question},
+        data={"step_order": int(step_order), "question": question, "choices_count": len(normalized_choices or [])},
         level="info",
     )
 
@@ -470,6 +515,10 @@ def handle_user_prompt_action(
         "step_title": title,
         "created_at": created_at,
     }
+    if kind:
+        agent_state["paused"]["kind"] = kind
+    if normalized_choices:
+        agent_state["paused"]["choices"] = normalized_choices
     if step_id is not None:
         agent_state["paused"]["step_id"] = int(step_id)
     agent_state["step_order"] = step_order
@@ -481,12 +530,7 @@ def handle_user_prompt_action(
                 update_task_run(
                     run_id=int(run_id),
                     status=RUN_STATUS_WAITING,
-                    agent_plan=build_agent_plan_payload(
-                        plan_titles=plan_titles,
-                        plan_items=plan_items,
-                        plan_allows=plan_allows,
-                        plan_artifacts=plan_artifacts,
-                    ),
+                    agent_plan=plan_struct.to_agent_plan_payload(),
                     agent_state=agent_state,
                     updated_at=updated_at,
                 )
@@ -495,12 +539,7 @@ def handle_user_prompt_action(
             update_task_run(
                 run_id=int(run_id),
                 status=RUN_STATUS_WAITING,
-                agent_plan=build_agent_plan_payload(
-                    plan_titles=plan_titles,
-                    plan_items=plan_items,
-                    plan_allows=plan_allows,
-                    plan_artifacts=plan_artifacts,
-                ),
+                agent_plan=plan_struct.to_agent_plan_payload(),
                 agent_state=agent_state,
                 updated_at=updated_at,
             )
@@ -514,10 +553,11 @@ def handle_user_prompt_action(
             level="error",
         )
 
-    kind = str(payload_obj.get("kind") or "").strip()
     need_input_payload = {"type": "need_input", "task_id": task_id, "run_id": run_id, "question": question}
     if kind:
         need_input_payload["kind"] = kind
+    if normalized_choices:
+        need_input_payload["choices"] = normalized_choices
 
     yield sse_json(need_input_payload)
     yield sse_json({"delta": f"{STREAM_TAG_ASK} {question}\n"})

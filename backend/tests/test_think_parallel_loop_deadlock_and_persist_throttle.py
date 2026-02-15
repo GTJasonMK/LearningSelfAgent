@@ -2,6 +2,8 @@ import json
 import unittest
 from unittest.mock import patch
 
+from backend.src.agent.core.plan_structure import PlanStructure
+
 
 class TestThinkParallelLoopGuardrails(unittest.TestCase):
     """
@@ -14,7 +16,6 @@ class TestThinkParallelLoopGuardrails(unittest.TestCase):
         from backend.src.agent.runner.think_parallel_loop import run_think_parallel_loop
 
         plan_titles = [f"file_write:file_{i}.txt 写文件" for i in range(1, 13)] + ["task_output 输出结果"]
-        plan_items = [{} for _ in plan_titles]
         plan_allows = [["file_write"] for _ in range(0, 12)] + [["task_output"]]
 
         persist_calls: list[dict] = []
@@ -70,10 +71,12 @@ class TestThinkParallelLoopGuardrails(unittest.TestCase):
                 workdir=".",
                 model="base",
                 parameters={},
-                plan_titles=list(plan_titles),
-                plan_items=list(plan_items),
-                plan_allows=[list(a) for a in plan_allows],
-                plan_artifacts=[],
+                plan_struct=PlanStructure.from_legacy(
+                    plan_titles=list(plan_titles),
+                    plan_items=[{"id": i + 1, "brief": "", "status": "pending"} for i in range(len(plan_titles))],
+                    plan_allows=[list(a) for a in plan_allows],
+                    plan_artifacts=[],
+                ),
                 tools_hint="",
                 skills_hint="",
                 memories_hint="",
@@ -121,7 +124,6 @@ class TestThinkParallelLoopGuardrails(unittest.TestCase):
             "file_write:utils.py 写工具",
             "task_output 输出结果",
         ]
-        plan_items = [{} for _ in plan_titles]
         plan_allows = [["file_write"], ["file_write"], ["file_write"], ["task_output"]]
 
         # 人为制造：第 1 步依赖第 3 步（utils.py），但本次仅执行到第 2 步（第 3/4 步被排除）
@@ -170,10 +172,12 @@ class TestThinkParallelLoopGuardrails(unittest.TestCase):
                 workdir=".",
                 model="base",
                 parameters={},
-                plan_titles=list(plan_titles),
-                plan_items=list(plan_items),
-                plan_allows=[list(a) for a in plan_allows],
-                plan_artifacts=[],
+                plan_struct=PlanStructure.from_legacy(
+                    plan_titles=list(plan_titles),
+                    plan_items=[{"id": i + 1, "brief": "", "status": "pending"} for i in range(len(plan_titles))],
+                    plan_allows=[list(a) for a in plan_allows],
+                    plan_artifacts=[],
+                ),
                 tools_hint="",
                 skills_hint="",
                 memories_hint="",

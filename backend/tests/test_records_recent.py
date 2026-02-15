@@ -97,6 +97,76 @@ class TestRecentRecords(unittest.IsolatedAsyncioTestCase):
         self.assertIn("step", types)
         self.assertIn("output", types)
 
+    async def test_records_recent_supports_run_id_filter(self):
+        from backend.src.main import create_app
+        from backend.src.storage import get_connection
+
+        t1 = "2026-01-01T00:00:00Z"
+        t2 = "2026-01-02T00:00:00Z"
+        t3 = "2026-01-03T00:00:00Z"
+
+        with get_connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO tasks (title, status, created_at, expectation_id, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("任务B", "running", t1, None, t1, None),
+            )
+            task_id = int(cursor.lastrowid)
+
+            cursor = conn.execute(
+                "INSERT INTO task_runs (task_id, status, summary, started_at, finished_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, "running", "agent_command_react", t2, None, t2, t2),
+            )
+            run_id = int(cursor.lastrowid)
+
+            conn.execute(
+                "INSERT INTO task_steps (task_id, run_id, title, status, detail, result, error, attempts, started_at, finished_at, step_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    run_id,
+                    "步骤1",
+                    "done",
+                    '{"type":"task_output","payload":{"output_type":"text","content":"ok"}}',
+                    None,
+                    None,
+                    1,
+                    t2,
+                    t2,
+                    1,
+                    t2,
+                    t2,
+                ),
+            )
+
+            conn.execute(
+                "INSERT INTO task_outputs (task_id, run_id, output_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, run_id, "text", "结果内容", t2),
+            )
+
+            # task 级事件：run_id 过滤时不应该出现
+            conn.execute(
+                "INSERT INTO memory_items (content, created_at, memory_type, tags, task_id) VALUES (?, ?, ?, ?, ?)",
+                ("记忆内容", t3, "note", "[]", task_id),
+            )
+
+        app = create_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/records/recent", params={"limit": 50, "run_id": run_id})
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertIsInstance(payload.get("items"), list)
+        items = payload["items"]
+        self.assertTrue(items)
+
+        types = [it.get("type") for it in items]
+        self.assertIn("run", types)
+        self.assertIn("step", types)
+        self.assertIn("output", types)
+        self.assertNotIn("memory", types)
+
+        for it in items:
+            self.assertEqual(int(it.get("run_id") or 0), int(run_id))
+
 
 if __name__ == "__main__":
     unittest.main()

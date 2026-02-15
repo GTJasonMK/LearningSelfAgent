@@ -47,10 +47,11 @@ class TestReviewGateBeforeFeedback(unittest.TestCase):
     def test_review_gate_inserts_steps_before_feedback_until_pass(self):
         """
         预期行为：
-        - 到达“确认满意度”前，先触发 Eval Agent 检查是否完成；
+        - 到达"确认满意度"前，先触发 Eval Agent 检查是否完成；
         - 若评估未通过，则插入修复步骤并继续执行（不立刻进入 waiting 询问满意度）；
         - 直到评估通过，才进入 waiting 询问满意度。
         """
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import AGENT_TASK_FEEDBACK_STEP_TITLE, RUN_STATUS_WAITING
 
@@ -63,6 +64,13 @@ class TestReviewGateBeforeFeedback(unittest.TestCase):
             {"id": 2, "brief": "反馈", "status": "pending"},
         ]
         plan_allows = [["task_output"], ["user_prompt"]]
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         # step1（原计划）+ step2（插入的修复步骤）
         llm_actions = [
@@ -133,10 +141,7 @@ class TestReviewGateBeforeFeedback(unittest.TestCase):
                 workdir=workdir,
                 model="gpt-4o-mini",
                 parameters={"temperature": 0},
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=[],
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",
@@ -160,9 +165,129 @@ class TestReviewGateBeforeFeedback(unittest.TestCase):
         self.assertEqual(react_llm_mock.call_count, 2)
         # 应执行 2 个 task_output：原计划输出 + 修复后输出（确认满意度不算执行 action）
         self.assertEqual(exec_calls["count"], 2)
-        self.assertEqual(plan_titles, ["输出结果", "输出结果(修复)", AGENT_TASK_FEEDBACK_STEP_TITLE])
+        # 验证内部计划结构已正确更新（PlanStructure 就地变更后通过 result.plan_struct 返回）
+        result_titles = [s.title for s in result.plan_struct.steps]
+        self.assertEqual(result_titles, ["输出结果", "输出结果(修复)", AGENT_TASK_FEEDBACK_STEP_TITLE])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_review_gate_trim_insert_steps_when_max_steps_limited(self):
+        """
+        回归：修复器返回过多 insert_steps 且超过 max_steps 时，
+        应自动裁剪到可插入数量，而不是直接报 plan_patch_invalid 失败。
+        """
+        from backend.src.agent.core.plan_structure import PlanStructure
+        from backend.src.agent.runner.react_loop import run_react_loop
+        from backend.src.constants import AGENT_TASK_FEEDBACK_STEP_TITLE, RUN_STATUS_WAITING
+
+        task_id, run_id = self._create_task_and_run()
+        workdir = os.getcwd()
+
+        plan_titles = ["输出结果", AGENT_TASK_FEEDBACK_STEP_TITLE]
+        plan_items = [
+            {"id": 1, "brief": "输出", "status": "pending"},
+            {"id": 2, "brief": "反馈", "status": "pending"},
+        ]
+        plan_allows = [["task_output"], ["user_prompt"]]
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
+
+        llm_actions = [
+            {"action": {"type": "task_output", "payload": {"output_type": "text", "content": "draft"}}},
+            {"action": {"type": "task_output", "payload": {"output_type": "text", "content": "fixed"}}},
+        ]
+        llm_side_effect = [
+            {"record": {"status": "success", "response": json.dumps(action, ensure_ascii=False)}}
+            for action in llm_actions
+        ]
+
+        ensure_review_side_effect = [11, 12]
+
+        def _fake_get_review(review_id: int):
+            if int(review_id) == 11:
+                return {
+                    "status": "needs_changes",
+                    "summary": "未完成",
+                    "issues": "[]",
+                    "next_actions": "[{\"title\":\"补齐执行\",\"details\":\"需要真实执行并验证\"}]",
+                }
+            return {
+                "status": "pass",
+                "summary": "完成",
+                "issues": "[]",
+                "next_actions": "[]",
+            }
+
+        # 故意返回 2 个修复步骤；max_steps=3 时仅允许插入 1 个。
+        repair_text = json.dumps(
+            {
+                "insert_steps": [
+                    {"title": "输出结果(修复-1)", "brief": "补齐1", "allow": ["task_output"]},
+                    {"title": "输出结果(修复-2)", "brief": "补齐2", "allow": ["task_output"]},
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+        def _fake_execute_step_action(_task_id, _run_id, _step_row, context=None):
+            detail = json.loads(_step_row.get("detail") or "{}")
+            if detail.get("type") == "task_output":
+                payload = detail.get("payload") or {}
+                return {"content": str(payload.get("content") or "")}, None
+            if detail.get("type") == "llm_call":
+                return {"response": "ok"}, None
+            return {"ok": True}, None
+
+        with patch(
+            "backend.src.services.tasks.task_postprocess.ensure_agent_review_record",
+            side_effect=ensure_review_side_effect,
+        ) as ensure_mock, patch(
+            "backend.src.repositories.agent_reviews_repo.get_agent_review",
+            side_effect=_fake_get_review,
+        ), patch(
+            "backend.src.agent.runner.review_repair.call_llm_for_text",
+            return_value=(repair_text, None),
+        ), patch(
+            "backend.src.agent.runner.react_loop.create_llm_call",
+            side_effect=llm_side_effect,
+        ), patch(
+            "backend.src.agent.runner.react_loop._execute_step_action",
+            side_effect=_fake_execute_step_action,
+        ):
+            gen = run_react_loop(
+                task_id=task_id,
+                run_id=run_id,
+                message="m",
+                workdir=workdir,
+                model="gpt-4o-mini",
+                parameters={"temperature": 0},
+                plan_struct=plan_struct,
+                tools_hint="(无)",
+                skills_hint="(无)",
+                memories_hint="(无)",
+                graph_hint="(无)",
+                agent_state={"max_steps": 3},
+                context={"last_llm_response": None},
+                observations=[],
+                start_step_order=1,
+                variables_source="test",
+            )
+            try:
+                while True:
+                    next(gen)
+            except StopIteration as exc:
+                result = exc.value
+
+        self.assertEqual(result.run_status, RUN_STATUS_WAITING)
+        self.assertEqual(ensure_mock.call_count, 2)
+        result_titles = [s.title for s in result.plan_struct.steps]
+        self.assertLessEqual(len(result_titles), 3)
+        self.assertEqual(result_titles, ["输出结果", "输出结果(修复-1)", AGENT_TASK_FEEDBACK_STEP_TITLE])
 

@@ -53,6 +53,7 @@ class TestReactLoopStepModelResolver(unittest.TestCase):
         return task_id, run_id
 
     def test_step_llm_config_resolver_overrides_model_per_step(self):
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
 
@@ -71,7 +72,13 @@ class TestReactLoopStepModelResolver(unittest.TestCase):
             ["file_write"],
             ["file_write"],
         ]
-        plan_artifacts = []
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         models: list[str] = []
         llm_actions = [
@@ -108,10 +115,7 @@ class TestReactLoopStepModelResolver(unittest.TestCase):
                 workdir=workdir,
                 model="base-model",
                 parameters={"temperature": 0.2},
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",
@@ -133,6 +137,7 @@ class TestReactLoopStepModelResolver(unittest.TestCase):
         self.assertEqual(models, ["doc-model", "code-model"])
 
     def test_llm_call_action_uses_resolved_model_and_overrides(self):
+        from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
 
@@ -142,13 +147,17 @@ class TestReactLoopStepModelResolver(unittest.TestCase):
         plan_titles = ["llm_call:验证 生成文本"]
         plan_items = [{"id": 1, "brief": "verify", "status": "pending"}]
         plan_allows = [["llm_call"]]
-        plan_artifacts = []
+
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=list(plan_titles),
+            plan_items=list(plan_items),
+            plan_allows=[list(a) for a in plan_allows],
+            plan_artifacts=[],
+        )
 
         executed_payloads: list[dict] = []
 
         def _fake_llm_call(_payload):
-            # 返回 llm_call action（payload 中故意带一个“错误模型”和自定义参数）
-            # 预期：执行阶段应使用 resolver 解析出的 model/参数覆盖，而不是信任 action payload。
             action = {
                 "action": {
                     "type": "llm_call",
@@ -185,10 +194,7 @@ class TestReactLoopStepModelResolver(unittest.TestCase):
                 workdir=workdir,
                 model="base-model",
                 parameters={"temperature": 0.2},
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 tools_hint="(无)",
                 skills_hint="(无)",
                 memories_hint="(无)",

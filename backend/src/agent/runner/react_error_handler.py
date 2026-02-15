@@ -9,6 +9,7 @@ import json
 import logging
 from typing import Callable, Dict, Generator, List, Optional, Tuple
 
+from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.support import _truncate_observation
 from backend.src.agent.runner.react_state_manager import (
     ReplanContext,
@@ -45,6 +46,13 @@ def should_force_replan_on_action_error(error_text: str) -> bool:
                 "action 输出不是有效 JSON",
                 "action.payload 不是对象",
                 "action.type 不能为空",
+                "LLM调用失败",
+                "Connection error",
+                "Read timed out",
+                "timeout",
+                "csv_artifact_quality_failed",
+                "高风险单行控制流 python -c",
+                "complex python -c requires file_write script",
             )
         )
     except Exception:
@@ -68,61 +76,30 @@ def handle_action_invalid(
     graph_hint: str,
     action_validate_error: str,
     last_action_text: Optional[str],
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     agent_state: Dict,
     context: Dict,
     observations: List[str],
     max_steps_limit: Optional[int],
     run_replan_and_merge: Callable,
     safe_write_debug: Callable,
-) -> Generator[str, None, Tuple[str, Optional[int], List[str], List[dict], List[List[str]], List[str]]]:
+) -> Generator[str, None, Tuple[str, Optional[int]]]:
     """
     处理 action 验证失败的情况。
-
-    Args:
-        task_id: 任务 ID
-        run_id: 执行尝试 ID
-        step_order: 步骤序号（1-based）
-        idx: 步骤索引（0-based）
-        title: 步骤标题
-        message: 原始用户消息
-        workdir: 工作目录
-        model: 模型名称
-        react_params: LLM 参数
-        tools_hint: 工具提示
-        skills_hint: 技能提示
-        memories_hint: 记忆提示
-        graph_hint: 图谱提示
-        action_validate_error: 验证错误信息
-        last_action_text: 最后的 action 文本
-        plan_titles: 计划标题列表
-        plan_items: 计划项列表
-        plan_allows: 允许的动作类型列表
-        plan_artifacts: 产物列表
-        agent_state: Agent 状态字典
-        context: 上下文字典
-        observations: 观测列表
-        max_steps_limit: 最大步骤数限制
-        run_replan_and_merge: replan 函数
-        safe_write_debug: 调试输出函数
 
     Yields:
         SSE 事件
 
     Returns:
-        (run_status, next_idx, plan_titles, plan_items, plan_allows, plan_artifacts)
+        (run_status, next_idx)
         run_status 为空字符串表示继续执行，非空表示终止
         next_idx 为 None 表示正常递增，否则跳转到指定索引
     """
-    will_continue = step_order < len(plan_titles)
+    will_continue = step_order < plan_struct.step_count
 
     # 更新计划栏状态
-    if 0 <= idx < len(plan_items):
-        plan_items[idx]["status"] = "failed"
-        yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[idx])
+    plan_struct.set_step_status(idx, "failed")
+    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
     # 输出错误信息
     if action_validate_error in {"empty_response", "action 输出不是有效 JSON"}:
@@ -188,7 +165,7 @@ def handle_action_invalid(
             step_order=step_order,
             agent_state=agent_state,
             max_steps_limit=max_steps_limit,
-            plan_titles=plan_titles,
+            plan_titles=plan_struct.get_titles(),
         )
 
         if replan_ctx.can_replan:
@@ -206,10 +183,7 @@ def handle_action_invalid(
                 skills_hint=skills_hint,
                 memories_hint=memories_hint,
                 graph_hint=graph_hint,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 observations=observations,
                 done_count=replan_ctx.done_count,
@@ -220,20 +194,14 @@ def handle_action_invalid(
             )
 
             if replan_result:
-                # replan 成功，更新计划并持久化
-                plan_titles = replan_result.plan_titles
-                plan_allows = replan_result.plan_allows
-                plan_items = replan_result.plan_items
-                plan_artifacts = replan_result.plan_artifacts
+                # replan 成功，替换计划
+                plan_struct.replace_from(replan_result.plan_struct)
 
-                yield sse_plan(task_id=task_id, plan_items=plan_items)
+                yield sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload())
 
                 persist_loop_state(
                     run_id=run_id,
-                    plan_titles=plan_titles,
-                    plan_items=plan_items,
-                    plan_allows=plan_allows,
-                    plan_artifacts=plan_artifacts,
+                    plan_struct=plan_struct,
                     agent_state=agent_state,
                     step_order=step_order,
                     observations=observations,
@@ -246,15 +214,12 @@ def handle_action_invalid(
                 )
 
                 # 跳转到已完成步骤的下一步
-                return "", replan_ctx.done_count, plan_titles, plan_items, plan_allows, plan_artifacts
+                return "", replan_ctx.done_count
 
     # replan 未执行或失败，继续下一步或终止
     persist_loop_state(
         run_id=run_id,
-        plan_titles=plan_titles,
-        plan_items=plan_items,
-        plan_allows=plan_allows,
-        plan_artifacts=plan_artifacts,
+        plan_struct=plan_struct,
         agent_state=agent_state,
         step_order=step_order + 1,
         observations=observations,
@@ -267,11 +232,14 @@ def handle_action_invalid(
     )
 
     if will_continue:
+        if force_replan:
+            yield sse_json({"delta": f"{STREAM_TAG_FAIL} 动作生成失败且无法恢复，终止本轮执行。\n"})
+            return RUN_STATUS_FAILED, None
         # 继续下一步
-        return "", idx + 1, plan_titles, plan_items, plan_allows, plan_artifacts
+        return "", idx + 1
 
     # 计划耗尽，终止
-    return RUN_STATUS_FAILED, None, plan_titles, plan_items, plan_allows, plan_artifacts
+    return RUN_STATUS_FAILED, None
 
 
 def handle_allow_failure(
@@ -290,29 +258,25 @@ def handle_allow_failure(
     memories_hint: str,
     graph_hint: str,
     allow_err: str,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     agent_state: Dict,
     context: Dict,
     observations: List[str],
     max_steps_limit: Optional[int],
     run_replan_and_merge: Callable,
     safe_write_debug: Callable,
-) -> Generator[str, None, Tuple[str, Optional[int], List[str], List[dict], List[List[str]], List[str]]]:
+) -> Generator[str, None, Tuple[str, Optional[int]]]:
     """
     处理 allow 约束验证失败的情况。
 
     Returns:
-        (run_status, next_idx, plan_titles, plan_items, plan_allows, plan_artifacts)
+        (run_status, next_idx)
     """
-    will_continue = step_order < len(plan_titles)
+    will_continue = step_order < plan_struct.step_count
 
     # 更新计划栏状态
-    if 0 <= step_order - 1 < len(plan_items):
-        plan_items[step_order - 1]["status"] = "failed"
-        yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[step_order - 1])
+    plan_struct.set_step_status(step_order - 1, "failed")
+    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[step_order - 1])
 
     yield sse_json({"delta": f"{STREAM_TAG_FAIL} {allow_err or 'action.type 不在 allow 内'}\n"})
 
@@ -329,10 +293,7 @@ def handle_allow_failure(
     # 持久化状态
     persist_loop_state(
         run_id=run_id,
-        plan_titles=plan_titles,
-        plan_items=plan_items,
-        plan_allows=plan_allows,
-        plan_artifacts=plan_artifacts,
+        plan_struct=plan_struct,
         agent_state=agent_state,
         step_order=step_order + 1,
         observations=observations,
@@ -345,14 +306,14 @@ def handle_allow_failure(
     )
 
     if will_continue:
-        return "", idx + 1, plan_titles, plan_items, plan_allows, plan_artifacts
+        return "", idx + 1
 
     # 尝试 replan
     replan_ctx = prepare_replan_context(
         step_order=step_order,
         agent_state=agent_state,
         max_steps_limit=max_steps_limit,
-        plan_titles=plan_titles,
+        plan_titles=plan_struct.get_titles(),
     )
 
     if replan_ctx.can_replan:
@@ -368,10 +329,7 @@ def handle_allow_failure(
             skills_hint=skills_hint,
             memories_hint=memories_hint,
             graph_hint=graph_hint,
-            plan_titles=plan_titles,
-            plan_items=plan_items,
-            plan_allows=plan_allows,
-            plan_artifacts=plan_artifacts,
+            plan_struct=plan_struct,
             agent_state=agent_state,
             observations=observations,
             done_count=replan_ctx.done_count,
@@ -382,9 +340,10 @@ def handle_allow_failure(
         )
 
         if replan_result:
-            return "", replan_ctx.done_count, replan_result.plan_titles, replan_result.plan_items, replan_result.plan_allows, replan_result.plan_artifacts
+            plan_struct.replace_from(replan_result.plan_struct)
+            return "", replan_ctx.done_count
 
-    return RUN_STATUS_FAILED, None, plan_titles, plan_items, plan_allows, plan_artifacts
+    return RUN_STATUS_FAILED, None
 
 
 def handle_step_failure(
@@ -405,10 +364,7 @@ def handle_step_failure(
     graph_hint: str,
     action_type: str,
     step_error: str,
-    plan_titles: List[str],
-    plan_items: List[dict],
-    plan_allows: List[List[str]],
-    plan_artifacts: List[str],
+    plan_struct: PlanStructure,
     agent_state: Dict,
     context: Dict,
     observations: List[str],
@@ -417,14 +373,14 @@ def handle_step_failure(
     safe_write_debug: Callable,
     mark_task_step_failed: Callable,
     finished_at: str,
-) -> Generator[str, None, Tuple[str, Optional[int], List[str], List[dict], List[List[str]], List[str]]]:
+) -> Generator[str, None, Tuple[str, Optional[int]]]:
     """
     处理步骤执行失败的情况。
 
     Returns:
-        (run_status, next_idx, plan_titles, plan_items, plan_allows, plan_artifacts)
+        (run_status, next_idx)
     """
-    will_continue = step_order < len(plan_titles)
+    will_continue = step_order < plan_struct.step_count
 
     safe_write_debug(
         task_id=int(task_id),
@@ -449,19 +405,18 @@ def handle_step_failure(
 
     yield sse_json({"delta": f"{STREAM_TAG_FAIL} {title}（{step_error}）\n"})
 
-    if 0 <= idx < len(plan_items):
-        plan_items[idx]["status"] = "failed"
-        yield sse_plan_delta(task_id=task_id, plan_items=plan_items, indices=[idx])
+    plan_struct.set_step_status(idx, "failed")
+    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
     observations.append(f"{title}: FAIL {step_error}")
+    # 失败后清空"最近可解析源"，避免后续 json_parse 继续消费陈旧结果。
+    if isinstance(context, dict):
+        context.pop("latest_parse_input_text", None)
 
     # 持久化失败状态
     persist_loop_state(
         run_id=run_id,
-        plan_titles=plan_titles,
-        plan_items=plan_items,
-        plan_allows=plan_allows,
-        plan_artifacts=plan_artifacts,
+        plan_struct=plan_struct,
         agent_state=agent_state,
         step_order=step_order + 1,
         observations=observations,
@@ -479,7 +434,7 @@ def handle_step_failure(
             step_order=step_order,
             agent_state=agent_state,
             max_steps_limit=max_steps_limit,
-            plan_titles=plan_titles,
+            plan_titles=plan_struct.get_titles(),
         )
 
         if replan_ctx.can_replan:
@@ -495,10 +450,7 @@ def handle_step_failure(
                 skills_hint=skills_hint,
                 memories_hint=memories_hint,
                 graph_hint=graph_hint,
-                plan_titles=plan_titles,
-                plan_items=plan_items,
-                plan_allows=plan_allows,
-                plan_artifacts=plan_artifacts,
+                plan_struct=plan_struct,
                 agent_state=agent_state,
                 observations=observations,
                 done_count=replan_ctx.done_count,
@@ -509,26 +461,27 @@ def handle_step_failure(
             )
 
             if replan_result:
-                return "", replan_ctx.done_count, replan_result.plan_titles, replan_result.plan_items, replan_result.plan_allows, replan_result.plan_artifacts
+                plan_struct.replace_from(replan_result.plan_struct)
+                return "", replan_ctx.done_count
 
         # replan 失败或不可用，继续下一步
-        return "", idx + 1, plan_titles, plan_items, plan_allows, plan_artifacts
+        return "", idx + 1
 
     # 计划耗尽，尝试最后的 replan
     replan_ctx = prepare_replan_context(
         step_order=step_order,
         agent_state=agent_state,
         max_steps_limit=max_steps_limit,
-        plan_titles=plan_titles,
+        plan_titles=plan_struct.get_titles(),
     )
 
     if replan_ctx.remaining_limit is not None and replan_ctx.remaining_limit <= 0:
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} 计划已耗尽且剩余步数不足以继续（max_steps={max_steps_limit}）。\n"})
-        return RUN_STATUS_FAILED, None, plan_titles, plan_items, plan_allows, plan_artifacts
+        return RUN_STATUS_FAILED, None
 
     if not replan_ctx.can_replan:
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} 计划已耗尽且重新规划次数已达上限。\n"})
-        return RUN_STATUS_FAILED, None, plan_titles, plan_items, plan_allows, plan_artifacts
+        return RUN_STATUS_FAILED, None
 
     replan_result = yield from run_replan_and_merge(
         task_id=int(task_id),
@@ -542,10 +495,7 @@ def handle_step_failure(
         skills_hint=skills_hint,
         memories_hint=memories_hint,
         graph_hint=graph_hint,
-        plan_titles=plan_titles,
-        plan_items=plan_items,
-        plan_allows=plan_allows,
-        plan_artifacts=plan_artifacts,
+        plan_struct=plan_struct,
         agent_state=agent_state,
         observations=observations,
         done_count=replan_ctx.done_count,
@@ -556,6 +506,7 @@ def handle_step_failure(
     )
 
     if replan_result:
-        return "", replan_ctx.done_count, replan_result.plan_titles, replan_result.plan_items, replan_result.plan_allows, replan_result.plan_artifacts
+        plan_struct.replace_from(replan_result.plan_struct)
+        return "", replan_ctx.done_count
 
-    return RUN_STATUS_FAILED, None, plan_titles, plan_items, plan_allows, plan_artifacts
+    return RUN_STATUS_FAILED, None

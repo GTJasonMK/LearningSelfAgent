@@ -1,7 +1,7 @@
 import logging
 import json
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from backend.src.common.utils import extract_json_object, now_iso, parse_json_list, truncate_text
 from backend.src.constants import (
@@ -69,6 +69,101 @@ def _json_preview(value, max_chars: int) -> str:
         return truncate_text(json.dumps(value, ensure_ascii=False), max_chars)
     except Exception:
         return truncate_text(str(value), max_chars)
+
+def _is_selftest_title(title: str) -> bool:
+    """
+    判断 step.title 是否为“自测/验证”类步骤。
+
+    说明：
+    - 用于评估阶段识别“工具/脚本的最小可用性验证”；
+    - 不能仅凭“出现过一次失败”就判定任务不可交付：常见流程是先失败，再修复，再通过。
+    """
+    text = str(title or "")
+    lowered = text.lower()
+    return (
+        "自测" in text
+        or "selftest" in lowered
+        or "self-test" in lowered
+        or "verify" in lowered
+        or "smoke" in lowered
+    )
+
+
+def _extract_tool_name_from_tool_call_step(title: str, payload_preview: object) -> str:
+    """
+    从 tool_call 步骤中提取 tool_name。
+
+    优先级：
+    1) detail.payload.tool_name
+    2) title 前缀：tool_call:<tool_name> ...
+    """
+    try:
+        if isinstance(payload_preview, dict):
+            name = str(payload_preview.get("tool_name") or "").strip()
+            if name:
+                return name
+    except Exception:
+        pass
+
+    raw = str(title or "").strip()
+    if not raw:
+        return ""
+
+    lowered = raw.lower()
+    for sep in (":", "："):
+        prefix = f"tool_call{sep}"
+        if lowered.startswith(prefix):
+            rest = raw[len(prefix) :].strip()
+            if not rest:
+                return ""
+            token = rest.split()[0].strip()
+            if len(token) >= 2 and ((token[0] == token[-1] == '"') or (token[0] == token[-1] == "'")):
+                token = token[1:-1].strip()
+            return token
+
+    return ""
+
+
+
+def _find_unverified_text_output(output_rows: List[dict]) -> Optional[dict]:
+    """
+    检测是否存在“未验证草稿”文本输出。
+
+    返回：
+    - None：未命中
+    - dict: {"output_id": int|None, "content_preview": str}
+    """
+    markers = (
+        "【未验证草稿】",
+        "[证据引用]\n- 无",
+        "无（建议补齐 step/tool/artifact 证据",
+    )
+
+    for row in output_rows or []:
+        if not row:
+            continue
+        output_type = str(row["output_type"] or "").strip().lower() if "output_type" in row.keys() else ""
+        if output_type != "text":
+            continue
+        content = str(row["content"] or "") if "content" in row.keys() else ""
+        if not content:
+            continue
+        if not any(marker in content for marker in markers):
+            continue
+
+        output_id = None
+        try:
+            if row["id"] is not None:
+                output_id = int(row["id"])
+        except Exception:
+            output_id = None
+
+        return {
+            "output_id": output_id,
+            "content_preview": truncate_text(content, 260),
+        }
+
+    return None
 
 
 def _safe_write_debug(
@@ -191,8 +286,12 @@ def ensure_agent_review_record(
 
     steps_compact: List[dict] = []
     failed_steps: List[dict] = []
-    failed_selftest = False
-    failed_exec_step = False
+    # 自测/验证步骤的失败不应“一票否决”：常见场景是先失败，再修复，再通过。
+    # 这里仅在“最后一次自测失败且后续无任何成功 tool_call”时，才作为硬性 needs_changes 依据。
+    last_tool_success_pos: Dict[str, Tuple[int, int]] = {}
+    last_failed_selftest_pos: Dict[str, Tuple[int, int]] = {}
+    last_failed_selftest_step: Dict[str, dict] = {}
+
     for row in step_rows:
         action_type = None
         payload_preview = None
@@ -206,6 +305,30 @@ def ensure_agent_review_record(
             payload_preview = None
         status_value = str(row["status"] or "").strip()
         title_value = str(row["title"] or "").strip()
+
+        step_id_value = None
+        try:
+            if row["id"] is not None:
+                step_id_value = int(row["id"])
+        except Exception:
+            step_id_value = None
+        step_order_value = None
+        try:
+            if row["step_order"] is not None:
+                step_order_value = int(row["step_order"])
+        except Exception:
+            step_order_value = None
+        pos = (
+            int(step_order_value) if step_order_value is not None else 10**9,
+            int(step_id_value) if step_id_value is not None else 10**9,
+        )
+
+        tool_name = ""
+        if action_type == ACTION_TYPE_TOOL_CALL:
+            tool_name = _extract_tool_name_from_tool_call_step(title_value, payload_preview)
+            if status_value == "done" and tool_name:
+                last_tool_success_pos[tool_name] = pos
+
         if status_value == "failed":
             failed_steps.append(
                 {
@@ -215,10 +338,15 @@ def ensure_agent_review_record(
                     "error": truncate_text(str(row["error"] or ""), 260),
                 }
             )
-            if "自测" in title_value or "selftest" in title_value.lower() or "self-test" in title_value.lower():
-                failed_selftest = True
-            if action_type in {ACTION_TYPE_TOOL_CALL, ACTION_TYPE_SHELL_COMMAND, ACTION_TYPE_FILE_WRITE}:
-                failed_exec_step = True
+            if action_type == ACTION_TYPE_TOOL_CALL and tool_name and _is_selftest_title(title_value):
+                last_failed_selftest_pos[tool_name] = pos
+                last_failed_selftest_step[tool_name] = {
+                    "step_order": row["step_order"],
+                    "title": title_value,
+                    "action_type": action_type,
+                    "tool_name": tool_name,
+                    "error": truncate_text(str(row["error"] or ""), 260),
+                }
         steps_compact.append(
             {
                 "step_id": row["id"],
@@ -273,29 +401,25 @@ def ensure_agent_review_record(
     auto_issues: List[dict] = []
     auto_next_actions: List[dict] = []
 
-    if failed_selftest:
+    unresolved_selftest_steps: List[dict] = []
+    for tool_name, failed_pos in (last_failed_selftest_pos or {}).items():
+        success_pos = last_tool_success_pos.get(tool_name)
+        # 仅当“失败之后未出现任何成功 tool_call”时，才认为自测失败未修复。
+        if not success_pos or success_pos <= failed_pos:
+            step_obj = last_failed_selftest_step.get(tool_name)
+            if isinstance(step_obj, dict):
+                unresolved_selftest_steps.append(step_obj)
+
+    if unresolved_selftest_steps:
         auto_status = "needs_changes"
-        auto_summary = "存在工具自测失败步骤，需修复后再完成任务。"
+        auto_summary = "存在未修复的工具自测失败步骤，需修复后再完成任务。"
         auto_issues.append(
             {
                 "title": "工具自测失败",
                 "severity": "high",
                 "details": "新工具未通过最小输入自测，但任务仍继续执行，可能导致结果不可信。",
-                "evidence": truncate_text(json.dumps(failed_steps, ensure_ascii=False), 320),
+                "evidence": truncate_text(json.dumps(unresolved_selftest_steps, ensure_ascii=False), 320),
                 "suggestion": "补齐/修复工具执行命令并重新自测，确认输出非空且与目标相关。",
-            }
-        )
-
-    if failed_exec_step and not auto_status:
-        auto_status = "needs_changes"
-        auto_summary = "存在关键执行步骤失败记录，需修复后再继续。"
-        auto_issues.append(
-            {
-                "title": "关键执行步骤失败",
-                "severity": "high",
-                "details": "tool_call/shell_command/file_write 等关键步骤失败，最终输出缺乏可信执行证据。",
-                "evidence": truncate_text(json.dumps(failed_steps, ensure_ascii=False), 320),
-                "suggestion": "根据失败原因修复执行步骤（路径/依赖/命令），必要时插入重试步骤。",
             }
         )
 
@@ -564,6 +688,32 @@ def ensure_agent_review_record(
                 status = "needs_changes"
                 if not summary:
                     summary = "评分未达标：需补齐验证与修复后再交付。"
+
+            # 结果质量提示：若最终文本缺少可验证证据，追加高优先级问题，但不硬性否决评估结果。
+            unverified_output = _find_unverified_text_output(output_rows)
+            if isinstance(unverified_output, dict):
+                gate_note = "最终输出缺少可验证证据：建议补齐 step/tool/artifact 证据后再交付。"
+                if summary and gate_note not in summary:
+                    summary = f"{summary}（{gate_note}）"
+                elif not summary:
+                    summary = gate_note
+
+                evidence_refs = []
+                output_id = unverified_output.get("output_id")
+                if output_id is not None:
+                    evidence_refs.append({"kind": "output", "output_id": int(output_id)})
+
+                issue_payload = {
+                    "title": "最终输出缺少可验证证据",
+                    "severity": "high",
+                    "details": "最终输出缺少可定位的 step/tool/artifact 证据链，可能导致结果与实际执行不一致。",
+                    "evidence_refs": evidence_refs,
+                    "evidence_quote": str(unverified_output.get("content_preview") or ""),
+                    "suggestion": "在输出最终结论前，先执行可验证步骤并附上证据引用。",
+                }
+                existing_issues = issues if isinstance(issues, list) else []
+                issues = [issue_payload]
+                issues.extend(existing_issues)
 
             # 证据引用清洗：防止 LLM 胡编不存在的 id
             valid_step_ids = set()

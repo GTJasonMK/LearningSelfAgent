@@ -34,6 +34,7 @@ class TestTaskPostprocessApprovesDraftSkills(unittest.TestCase):
 
         created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+        step_id = None
         with get_connection() as conn:
             cursor = conn.execute(
                 "INSERT INTO tasks (title, status, created_at, expectation_id, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -56,6 +57,26 @@ class TestTaskPostprocessApprovesDraftSkills(unittest.TestCase):
                 ),
             )
             run_id = int(cursor.lastrowid)
+            cursor = conn.execute(
+                "INSERT INTO task_steps (task_id, run_id, title, status, detail, result, error, attempts, started_at, finished_at, step_order, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    run_id,
+                    "task_output:输出结果",
+                    "done",
+                    json.dumps({"type": "task_output", "payload": {"output_type": "text", "content": "最终结果：ok"}}, ensure_ascii=False),
+                    json.dumps({"content": "最终结果：ok"}, ensure_ascii=False),
+                    None,
+                    1,
+                    created_at,
+                    created_at,
+                    1,
+                    created_at,
+                    created_at,
+                ),
+            )
+            step_id = int(cursor.lastrowid)
             cursor = conn.execute(
                 "INSERT INTO task_outputs (task_id, run_id, output_type, content, created_at) VALUES (?, ?, ?, ?, ?)",
                 (task_id, run_id, "text", "最终结果：ok", created_at),
@@ -87,7 +108,10 @@ class TestTaskPostprocessApprovesDraftSkills(unittest.TestCase):
                     "score": 95,
                     "threshold": 90,
                     "reason": "可沉淀",
-                    "evidence_refs": [{"kind": "output", "output_id": int(output_id)}],
+                    "evidence_refs": [
+                        {"kind": "step", "step_id": int(step_id), "step_order": 1},
+                        {"kind": "output", "output_id": int(output_id)},
+                    ],
                 },
                 "issues": [],
                 "next_actions": [],

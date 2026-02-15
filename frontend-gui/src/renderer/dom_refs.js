@@ -53,6 +53,7 @@ export function getPanelDomRefs() {
   const worldResultEl = document.getElementById("world-result");
   const worldChatEl = document.getElementById("world-chat");
   const worldThoughtsEl = document.getElementById("world-thoughts");
+  const worldChoicesEl = document.getElementById("world-choices");
   const worldUploadBtn = document.getElementById("world-upload");
   const worldInputEl = document.getElementById("world-input");
   const worldSendBtn = document.getElementById("world-send");
@@ -72,6 +73,7 @@ export function getPanelDomRefs() {
     worldResultEl,
     worldChatEl,
     worldThoughtsEl,
+    worldChoicesEl,
     worldUploadBtn,
     worldInputEl,
     worldSendBtn

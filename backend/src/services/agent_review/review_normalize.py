@@ -220,5 +220,15 @@ def apply_distill_gate(
         ds = AGENT_REVIEW_DISTILL_STATUS_MANUAL
         notes = _append_note(notes, "distill 缺少可定位 evidence_refs：默认不自动沉淀")
 
-    return ds, float(score_value), notes
+    # allow 的证据不能只引用 output（避免“自我引用输出”导致错误知识长期污染）
+    if ds == AGENT_REVIEW_DISTILL_STATUS_ALLOW:
+        non_output = [
+            r
+            for r in (distill_evidence_refs or [])
+            if isinstance(r, dict) and str(r.get("kind") or "").strip().lower() in {"step", "tool_call", "artifact"}
+        ]
+        if not non_output:
+            ds = AGENT_REVIEW_DISTILL_STATUS_MANUAL
+            notes = _append_note(notes, "distill 证据仅引用 output：默认不自动沉淀")
 
+    return ds, float(score_value), notes

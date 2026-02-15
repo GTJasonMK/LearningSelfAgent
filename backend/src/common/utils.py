@@ -151,22 +151,157 @@ def extract_json_object(text: str) -> Optional[dict]:
 
     设计目标：
     - 允许模型输出前后夹带少量文字（尽量容错）；
+    - 允许 ```json ...``` 代码块；
+    - 避免“多个 JSON 对象/包含大段代码”时用 first{..}last} 误切片；
     - 仅返回 dict；失败返回 None。
     """
     if not text:
         return None
+
+    raw = str(text)
+
+    def _extract_first_balanced_object(candidate: str) -> Optional[str]:
+        start = candidate.find("{")
+        if start == -1:
+            return None
+
+        in_str = False
+        escape = False
+        depth = 0
+        for i in range(start, len(candidate)):
+            ch = candidate[i]
+            if in_str:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == "\"":
+                    in_str = False
+                continue
+
+            if ch == "\"":
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return candidate[start : i + 1]
+                continue
+        return None
+
+    # 1) 直接解析（最快路径）
     try:
-        out = json.loads(text)
+        out = json.loads(raw)
         return out if isinstance(out, dict) else None
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                out = json.loads(text[start : end + 1])
-                return out if isinstance(out, dict) else None
-            except json.JSONDecodeError:
-                return None
+        pass
+
+    # 2) 生成候选文本（含 code fence）
+    candidates: List[str] = []
+    stripped = raw.strip()
+    if stripped:
+        candidates.append(stripped)
+
+    if "```" in raw:
+        parts = raw.split("```")
+        for i in range(1, len(parts), 2):
+            block = str(parts[i] or "")
+            lines = block.splitlines()
+            if lines:
+                first = str(lines[0] or "").strip().lower()
+                if first in {"json", "json5", "javascript", "js"}:
+                    block = "\n".join(lines[1:])
+            block = block.strip()
+            if block:
+                candidates.append(block)
+
+    # 3) 尝试从候选中解析，必要时抽取第一个“括号平衡”的对象片段
+    for cand in candidates:
+        try:
+            out = json.loads(cand)
+            if isinstance(out, dict):
+                return out
+        except json.JSONDecodeError:
+            pass
+
+        sliced = _extract_first_balanced_object(cand)
+        if not sliced:
+            continue
+        try:
+            out = json.loads(sliced)
+            if isinstance(out, dict):
+                return out
+        except json.JSONDecodeError:
+            continue
+
+    # 4) 最后兜底：旧逻辑（first{..}last}）
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            out = json.loads(raw[start : end + 1])
+            return out if isinstance(out, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+    return None
+
+
+def extract_json_value(text: str) -> Optional[Any]:
+    """
+    从文本中尽量提取 JSON 值（dict/list/primitive）。
+
+    设计目标：
+    - 允许模型输出前后夹带少量文字（尽量容错）；
+    - 允许 ```json ...``` 代码块；
+    - 失败返回 None。
+    """
+    if not text:
+        return None
+
+    raw = str(text)
+    candidates: List[str] = []
+
+    stripped = raw.strip()
+    if stripped:
+        candidates.append(stripped)
+
+    # 代码块：```json ...``` 或 ``` ... ```
+    if "```" in raw:
+        parts = raw.split("```")
+        for i in range(1, len(parts), 2):
+            block = str(parts[i] or "")
+            lines = block.splitlines()
+            if lines:
+                first = str(lines[0] or "").strip().lower()
+                if first in {"json", "json5", "javascript", "js"}:
+                    block = "\n".join(lines[1:])
+            block = block.strip()
+            if block:
+                candidates.append(block)
+
+    def _append_bracket_slice(open_ch: str, close_ch: str) -> None:
+        start = raw.find(open_ch)
+        end = raw.rfind(close_ch)
+        if start == -1 or end == -1 or end <= start:
+            return
+        sliced = raw[start : end + 1].strip()
+        if sliced and sliced not in candidates:
+            candidates.append(sliced)
+
+    _append_bracket_slice("{", "}")
+    _append_bracket_slice("[", "]")
+
+    for cand in candidates:
+        try:
+            return json.loads(cand)
+        except Exception:
+            continue
     return None
 
 

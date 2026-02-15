@@ -13,7 +13,7 @@ T = TypeVar("T")
 def _normalize_interval_seconds(value: object) -> float:
     try:
         v = float(value)  # type: ignore[arg-type]
-    except Exception:
+    except (TypeError, ValueError):
         return 0.0
     return v if v > 0 else 0.0
 
@@ -42,7 +42,7 @@ def _sse_json_type(msg: str) -> str:
         return ""
     try:
         obj = json.loads(data_str)
-    except Exception:
+    except (TypeError, ValueError, json.JSONDecodeError):
         return ""
     if isinstance(obj, dict) and isinstance(obj.get("type"), str):
         return str(obj.get("type") or "")
@@ -59,7 +59,7 @@ def _try_parse_sse_data_json(msg: str) -> dict | None:
         return None
     try:
         obj = json.loads(data_str)
-    except Exception:
+    except (TypeError, ValueError, json.JSONDecodeError):
         return None
     return obj if isinstance(obj, dict) else None
 
@@ -98,7 +98,7 @@ async def pump_sync_generator(
     def _enqueue(kind: str, payload: object) -> None:
         try:
             q.put_nowait((kind, payload))
-        except Exception as exc:
+        except RuntimeError as exc:
             pump_error["queue_put_error"] = f"{type(exc).__name__}: {exc}"
             pump_error["queue_put_trace"] = traceback.format_exc()
 
@@ -108,7 +108,7 @@ async def pump_sync_generator(
         try:
             loop.call_soon_threadsafe(_enqueue, kind, payload)
             return True
-        except Exception as exc:
+        except RuntimeError as exc:
             pump_error["call_soon_error"] = f"{type(exc).__name__}: {exc}"
             pump_error["call_soon_trace"] = traceback.format_exc()
             return False
@@ -122,7 +122,7 @@ async def pump_sync_generator(
                     pump_error["phase"] = "cancelled"
                     try:
                         inner.close()
-                    except Exception as exc:
+                    except (AttributeError, RuntimeError) as exc:
                         pump_error["close_error"] = f"{type(exc).__name__}: {exc}"
                         pump_error["close_trace"] = traceback.format_exc()
                     return
@@ -141,7 +141,7 @@ async def pump_sync_generator(
                     pump_error["phase"] = "cancelled"
                     try:
                         inner.close()
-                    except Exception as exc:
+                    except (AttributeError, RuntimeError) as exc:
                         pump_error["close_error"] = f"{type(exc).__name__}: {exc}"
                         pump_error["close_trace"] = traceback.format_exc()
                     return
@@ -161,9 +161,13 @@ async def pump_sync_generator(
     # - 在 pump 层统一合并短时间内密集的 plan 事件（只保留最后一次），降低 JSON 洪泛；
     # - need_input/done/error 等关键事件前会强制 flush，避免 UI 丢失最终状态。
     plan_min_interval = _normalize_interval_seconds(AGENT_SSE_PLAN_MIN_INTERVAL_SECONDS)
-    last_plan_emit_at = 0.0
+    # 首条 plan/plan_delta 应始终允许立即发出：
+    # - 不能依赖 monotonic 起始值（进程启动早晚会影响 now-0 与 interval 的关系）；
+    # - 否则在大节流窗口下可能把“首个 running 状态”也吞掉，导致 UI 只看到 waiting/最终态。
+    now_boot = time.monotonic()
+    last_plan_emit_at = now_boot - plan_min_interval if plan_min_interval > 0 else 0.0
     pending_plan_msg: str | None = None
-    last_plan_delta_emit_at = 0.0
+    last_plan_delta_emit_at = now_boot - plan_min_interval if plan_min_interval > 0 else 0.0
     pending_plan_delta_meta: dict | None = None
     pending_plan_delta_changes: dict[int, dict] = {}
 
@@ -179,7 +183,7 @@ async def pump_sync_generator(
         changes = list(pending_plan_delta_changes.values())
         try:
             changes = sorted(changes, key=lambda it: int(it.get("step_order") or 0))
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
             pass
         meta["changes"] = changes
         pending_plan_delta_meta = None
@@ -264,14 +268,14 @@ async def pump_sync_generator(
                             key = None
                             try:
                                 cid = int(ch.get("id") or 0)
-                            except Exception:
+                            except (TypeError, ValueError):
                                 cid = 0
                             if cid > 0:
                                 key = cid
                             else:
                                 try:
                                     order = int(ch.get("step_order") or 0)
-                                except Exception:
+                                except (TypeError, ValueError):
                                     order = 0
                                 if order > 0:
                                     key = order

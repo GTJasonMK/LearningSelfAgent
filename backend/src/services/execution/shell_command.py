@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -60,6 +61,87 @@ _WINDOWS_CMD_BUILTINS = {
     "verify",
     "vol",
 }
+
+
+def _can_compile_python_source(code: str) -> bool:
+    source = str(code or "").strip()
+    if not source:
+        return False
+    try:
+        compile(source, "<shell_python_c>", "exec")
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_python_c_source(code: str) -> str:
+    """
+    规范化 python -c 的单行复杂语句，降低落盘脚本 SyntaxError 概率。
+    """
+    source = str(code or "").strip()
+    if not source:
+        return source
+    if _can_compile_python_source(source):
+        return source
+
+    rewritten = re.sub(
+        r";\s*(?=(with|for|if|try|while|def|class|async\s+def|elif|else|except|finally)\b)",
+        "\n",
+        source,
+    )
+    rewritten = re.sub(r":\s*(?=(with|for|if|try|while|def|class|async\s+def)\b)", ":\n    ", rewritten)
+    rewritten = re.sub(r"\n[ \t]+(?=(elif|else|except|finally)\b)", "\n", rewritten)
+    return rewritten
+
+
+def _has_risky_inline_control_flow(code: str) -> bool:
+    text = str(code or "").strip()
+    if not text:
+        return False
+    if ";" not in text:
+        return False
+    if "\n" in text:
+        return False
+
+    block_headers = re.findall(r"\b(if|for|while|with|try|except|finally|elif|else)\b[^:]*:", text)
+    if len(block_headers) >= 2:
+        return True
+    if re.search(
+        r"\b(for|while)\b[^:]*:\s*[^;]+;\s*(if|for|while|with|try|except|finally|elif|else)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def _normalize_windows_builtin_command_line(raw_command: str, args: list[str]) -> str:
+    """
+    Windows 内建命令（dir/copy/...）统一路径分隔符，避免 `backend/.agent/...` 被 cmd 误判。
+    """
+    if not raw_command:
+        return ""
+    if not args:
+        return raw_command
+
+    normalized_tokens: list[str] = []
+    for idx, token in enumerate(args):
+        current = str(token or "")
+        if idx > 0:
+            lowered = current.lower()
+            is_url = lowered.startswith("http://") or lowered.startswith("https://")
+            is_option = current.startswith("/") and len(current) >= 2 and current[1].isalpha() and not re.match(
+                r"^/[A-Za-z]:", current
+            )
+            if not is_url and not is_option and "/" in current:
+                current = current.replace("/", "\\")
+        normalized_tokens.append(current)
+
+    try:
+        return subprocess.list2cmdline(normalized_tokens)
+    except Exception:
+        return raw_command
+
 
 
 def run_shell_command(payload: dict) -> Tuple[Optional[dict], Optional[str]]:
@@ -151,7 +233,8 @@ def run_shell_command(payload: dict) -> Tuple[Optional[dict], Optional[str]]:
         try:
             head = str(args[0] or "").strip().lower()
             if head in _WINDOWS_CMD_BUILTINS:
-                args = ["cmd.exe", "/c", raw_command_str]
+                builtin_command = _normalize_windows_builtin_command_line(str(raw_command_str), args)
+                args = ["cmd.exe", "/c", builtin_command]
         except Exception:
             pass
 
@@ -168,6 +251,14 @@ def run_shell_command(payload: dict) -> Tuple[Optional[dict], Optional[str]]:
             if is_python and len(args) >= 3 and str(args[1]).strip() == "-c":
                 code = str(args[2] or "").strip()
                 if code:
+                    if _has_risky_inline_control_flow(code):
+                        return {
+                            "stdout": "",
+                            "stderr": "complex python -c requires file_write script",
+                            "returncode": 1,
+                            "ok": False,
+                        }, None
+                    code = _normalize_python_c_source(code)
                     script_dir = os.path.join(workdir, AGENT_EXPERIMENT_DIR_REL)
                     os.makedirs(script_dir, exist_ok=True)
                     script_path = os.path.join(script_dir, f"python_c_{uuid.uuid4().hex}.py")

@@ -15,6 +15,7 @@ from backend.src.agent.plan_utils import (
     _normalize_plan_titles,
     drop_non_artifact_file_write_steps,
     extract_file_write_target_path,
+    reorder_script_file_writes_before_exec_steps,
     repair_plan_artifacts_with_file_write_steps,
 )
 from backend.src.agent.support import _truncate_observation
@@ -207,6 +208,22 @@ def _safe_write_debug(
         logger.exception("write_task_debug_output failed: %s", message)
 
 
+def _is_plain_json_object_text(text: str) -> bool:
+    """
+    判断 LLM 输出是否为“纯 JSON 对象文本”。
+
+    目的：
+    - 降低“代码块包裹/前后附加解释”导致解析歧义；
+    - 规划阶段优先要求可稳定解析的最小输出格式。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if "```" in raw:
+        return False
+    return raw.startswith("{") and raw.endswith("}")
+
+
 class PlanPhaseFailure(RuntimeError):
     """
     规划阶段失败：由上层负责收敛 task/run 状态并向前端输出 error event。
@@ -287,7 +304,37 @@ def run_replan_phase(
             public_message=f"{ERROR_MESSAGE_LLM_CALL_FAILED}:{err or 'empty_response'}",
         )
 
-    plan = _extract_json_object(text)
+    plan_text = str(text or "")
+    if not _is_plain_json_object_text(plan_text):
+        _safe_write_debug(
+            int(task_id),
+            int(run_id),
+            message="agent.replan.non_plain_json_response",
+            data={"llm_id": llm_id, "head": plan_text[:240]},
+            level="warning",
+        )
+        reprompt = (
+            replan_prompt
+            + "\n\n补充约束：你上一轮输出不是纯 JSON 对象（可能包含代码块或说明文字）。"
+            "请只输出一个 JSON 对象，不要 markdown 代码块、不要额外解释。"
+        )
+        retry_params = dict(parameters or {})
+        retry_params["temperature"] = 0
+        retry_text, retry_err, retry_llm_id = call_llm_for_text_with_id(
+            create_llm_call,
+            prompt=reprompt,
+            task_id=int(task_id),
+            run_id=int(run_id),
+            model=model,
+            parameters=retry_params,
+            variables={"source": "agent_replan_plain_json_retry"},
+        )
+        if not retry_err and retry_text:
+            plan_text = str(retry_text)
+            if retry_llm_id is not None:
+                llm_id = retry_llm_id
+
+    plan = _extract_json_object(plan_text)
     if not plan:
         raise PlanPhaseFailure(reason="replan_invalid_json", public_message="重新规划输出不是有效 JSON")
 
@@ -393,6 +440,26 @@ def run_replan_phase(
                 int(run_id),
                 message="agent.replan.drop_non_artifact_file_write",
                 data={"removed_count": int(removed_count)},
+                level="info",
+            )
+
+        (
+            plan_titles_new,
+            plan_briefs,
+            plan_allows,
+            moved_count,
+        ) = reorder_script_file_writes_before_exec_steps(
+            titles=plan_titles_new,
+            briefs=plan_briefs,
+            allows=plan_allows,
+        )
+        if moved_count:
+            yield sse_json({"delta": f"{STREAM_TAG_PLAN} 自动修复：前置 {moved_count} 个脚本写入步骤（避免先执行后写文件）\n"})
+            _safe_write_debug(
+                int(task_id),
+                int(run_id),
+                message="agent.replan.reorder_script_file_write",
+                data={"moved_count": int(moved_count or 0)},
                 level="info",
             )
 
@@ -520,7 +587,37 @@ def run_planning_phase(
             public_message=f"{ERROR_MESSAGE_LLM_CALL_FAILED}:{error_message or 'empty_response'}",
         )
 
-    plan = _extract_json_object(plan_text)
+    plan_text_value = str(plan_text or "")
+    if not _is_plain_json_object_text(plan_text_value):
+        _safe_write_debug(
+            int(task_id),
+            int(run_id),
+            message="agent.plan.non_plain_json_response",
+            data={"llm_id": plan_llm_id, "head": plan_text_value[:240]},
+            level="warning",
+        )
+        reprompt = (
+            plan_prompt
+            + "\n\n补充约束：你上一轮输出不是纯 JSON 对象（可能包含代码块或说明文字）。"
+            "请只输出一个 JSON 对象，不要 markdown 代码块、不要额外解释。"
+        )
+        retry_params = dict(parameters or {})
+        retry_params["temperature"] = 0
+        retry_text, retry_err, retry_llm_id = call_llm_for_text_with_id(
+            create_llm_call,
+            prompt=reprompt,
+            task_id=int(task_id),
+            run_id=int(run_id),
+            model=model,
+            parameters=retry_params,
+            variables={"source": "agent_plan_plain_json_retry"},
+        )
+        if not retry_err and retry_text:
+            plan_text_value = str(retry_text)
+            if retry_llm_id is not None:
+                plan_llm_id = retry_llm_id
+
+    plan = _extract_json_object(plan_text_value)
     if not plan:
         raise PlanPhaseFailure(reason="plan_invalid_json", public_message="规划输出不是有效 JSON")
 
@@ -732,6 +829,26 @@ def run_planning_phase(
                     int(run_id),
                     message="agent.plan.drop_non_artifact_file_write",
                     data={"removed_count": int(removed_count)},
+                    level="info",
+                )
+
+            (
+                plan_titles,
+                plan_briefs,
+                plan_allows,
+                moved_count,
+            ) = reorder_script_file_writes_before_exec_steps(
+                titles=plan_titles,
+                briefs=plan_briefs,
+                allows=plan_allows,
+            )
+            if moved_count:
+                yield sse_json({"delta": f"{STREAM_TAG_PLAN} 自动修复：前置 {moved_count} 个脚本写入步骤（避免先执行后写文件）\n"})
+                _safe_write_debug(
+                    int(task_id),
+                    int(run_id),
+                    message="agent.plan.reorder_script_file_write",
+                    data={"moved_count": int(moved_count or 0)},
                     level="info",
                 )
 
