@@ -6,7 +6,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional, Dict
+from typing import Any, Dict, List, Optional, Sequence
 
 
 def now_iso() -> str:
@@ -79,6 +79,13 @@ def parse_json_list(value: Optional[str]) -> List[Any]:
     return out if isinstance(out, list) else []
 
 
+def dump_json_list(value: Optional[Sequence[Any]], *, ensure_ascii: bool = False) -> str:
+    """
+    将序列统一序列化为 JSON 列表字符串。
+    """
+    return json.dumps(list(value or []), ensure_ascii=ensure_ascii)
+
+
 def parse_json_value(value: Optional[str]) -> Any:
     """
     解析任意 JSON 值；失败/为空返回 None。
@@ -89,6 +96,99 @@ def parse_json_value(value: Optional[str]) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return None
+
+
+def parse_json_dict(value: Any) -> Optional[Dict[str, Any]]:
+    """
+    解析 JSON 对象（dict）；失败或非对象返回 None。
+
+    支持：
+    - 直接传入 dict（原样返回）；
+    - 传入 JSON 字符串（调用 parse_json_value 解析）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = parse_json_value(value)
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def tool_approval_status(
+    metadata: Any,
+    *,
+    default: str = "",
+    approval_key: str = "approval",
+) -> str:
+    """
+    从工具 metadata 中读取审批状态（approval.status）。
+
+    说明：
+    - metadata 可为 dict 或 JSON 字符串；
+    - 缺失/无效时返回 default；
+    - 返回值统一为小写字符串。
+    """
+    meta = parse_json_dict(metadata)
+    if not meta:
+        return str(default or "").strip().lower()
+    approval = meta.get(str(approval_key or "approval"))
+    if not isinstance(approval, dict):
+        return str(default or "").strip().lower()
+    status = str(approval.get("status") or "").strip().lower()
+    return status or str(default or "").strip().lower()
+
+
+def tool_is_draft(metadata: Any, *, approval_key: str = "approval") -> bool:
+    """
+    判断工具 metadata 是否为 draft 审批状态。
+    """
+    return tool_approval_status(metadata, approval_key=approval_key) == "draft"
+
+
+def bump_semver_patch(version: Optional[str], *, default_version: str) -> str:
+    """
+    语义化版本号 x.y.z 的 patch + 1；不符合格式时返回 default_version。
+    """
+    value = str(version or "").strip()
+    parts = value.split(".")
+    if len(parts) != 3 or any((not p.isdigit()) for p in parts):
+        return str(default_version or "0.1.0")
+    major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def dedupe_keep_order(items: List[Any]) -> List[Any]:
+    """
+    对任意列表去重并保留原顺序（支持 str/dict/list 等混合元素）。
+    """
+    seen = set()
+    out: List[Any] = []
+    for item in list(items or []):
+        try:
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def action_type_from_step_detail(detail: Any) -> Optional[str]:
+    """
+    从 step.detail 中提取 action.type（兼容 {"type": "..."} 与 {"action": {"type": "..."}}）。
+    """
+    obj = parse_json_dict(detail)
+    if not obj:
+        return None
+    nested = obj.get("action")
+    nested_type = nested.get("type") if isinstance(nested, dict) else None
+    raw = obj.get("type") or nested_type
+    text = str(raw or "").strip()
+    return text or None
 
 
 def coerce_str_list(value: Any, max_items: int = 64) -> List[str]:
@@ -115,6 +215,43 @@ def coerce_str_list(value: Any, max_items: int = 64) -> List[str]:
 
     text = str(value).strip()
     return [text] if text else []
+
+
+def parse_positive_int(value: Any, *, default: Optional[int] = None) -> Optional[int]:
+    """
+    尝试将 value 解析为正整数；失败或非正数时返回 default。
+    """
+    try:
+        if value is None:
+            return default
+        parsed = int(value)
+    except Exception:
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
+def parse_optional_int(value: Any, *, default: Optional[int] = None) -> Optional[int]:
+    """
+    尝试将 value 解析为整数；失败时返回 default。
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def coerce_int(value: Any, *, default: int = 0) -> int:
+    """
+    尝试将 value 转为 int；失败时回退 default。
+    """
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
 
 
 def dump_model(obj: Any) -> Dict[str, Any]:
@@ -331,6 +468,20 @@ def truncate_text(
     return value[:keep].rstrip() + suffix
 
 
+def json_preview(value: Any, max_chars: int) -> str:
+    """
+    将任意值压缩为短文本预览（优先 JSON 序列化），用于日志与提示词上下文控长。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return truncate_text(value, max_chars)
+    try:
+        return truncate_text(json.dumps(value, ensure_ascii=False), max_chars)
+    except Exception:
+        return truncate_text(str(value), max_chars)
+
+
 def render_prompt(template: str, variables: Optional[dict]) -> Optional[str]:
     """
     渲染提示词模板：template.format_map(variables)；缺变量返回 None。
@@ -341,6 +492,46 @@ def render_prompt(template: str, variables: Optional[dict]) -> Optional[str]:
         return template.format_map(variables)
     except KeyError:
         return None
+
+
+def build_json_frontmatter_markdown(
+    meta: Dict[str, Any],
+    body: Optional[str] = None,
+    *,
+    delimiter: str = "---",
+) -> str:
+    """
+    统一构建 JSON frontmatter Markdown 文本。
+    """
+    fm_text = json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True).strip()
+    body_text = str(body or "").rstrip()
+    return "\n".join([delimiter, fm_text, delimiter, "", body_text, ""])
+
+
+def discover_markdown_files(
+    base_dir: "str | Path",
+    *,
+    skip_readme: bool = True,
+    skip_hidden: bool = True,
+) -> List[Path]:
+    """
+    统一发现目录下可同步的 Markdown 文件（默认跳过 readme 与隐藏路径）。
+    """
+    root = Path(base_dir)
+    if not root.exists():
+        return []
+
+    files: List[Path] = []
+    for path in root.rglob("*.md"):
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if skip_readme and name in {"readme.md", "_readme.md"}:
+            continue
+        if skip_hidden and any(part.startswith(".") for part in path.parts):
+            continue
+        files.append(path)
+    return sorted(files)
 
 
 def atomic_write_text(path: "str | Path", text: str, *, encoding: str = "utf-8") -> None:

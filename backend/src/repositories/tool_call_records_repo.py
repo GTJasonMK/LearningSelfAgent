@@ -4,6 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from backend.src.common.sql import in_clause_placeholders
 from backend.src.common.utils import now_iso
 from backend.src.repositories.repo_conn import provide_connection
 
@@ -24,6 +25,38 @@ class ToolCallRecordCreateParams:
     input: str
     output: str
     created_at: Optional[str] = None
+
+
+def _build_tool_call_filters(
+    *,
+    task_id: Optional[int],
+    run_id: Optional[int],
+    tool_id: Optional[int],
+    reuse_status: Optional[str],
+    unknown_status_value: Optional[str] = None,
+) -> Tuple[List[str], List]:
+    """
+    统一构造 tool_call_records 过滤条件与参数。
+    """
+    conditions: List[str] = []
+    params: List = []
+    if task_id is not None:
+        conditions.append("task_id = ?")
+        params.append(int(task_id))
+    if run_id is not None:
+        conditions.append("run_id = ?")
+        params.append(int(run_id))
+    if tool_id is not None:
+        conditions.append("tool_id = ?")
+        params.append(int(tool_id))
+    if reuse_status is not None:
+        if unknown_status_value is not None and reuse_status == unknown_status_value:
+            conditions.append("(reuse_status = ? OR reuse_status IS NULL)")
+            params.append(str(unknown_status_value))
+        else:
+            conditions.append("reuse_status = ?")
+            params.append(reuse_status)
+    return conditions, params
 
 
 def get_tool_reuse_stats(
@@ -86,7 +119,9 @@ def get_tool_reuse_stats_map(
     if not ids:
         return {}
 
-    placeholders = ",".join(["?"] * len(ids))
+    placeholders = in_clause_placeholders(ids)
+    if not placeholders:
+        return {}
     sql = (
         "SELECT tool_id, COUNT(*) AS calls, COALESCE(SUM(reuse), 0) AS reuse_calls "
         f"FROM tool_call_records WHERE tool_id IN ({placeholders}) GROUP BY tool_id"
@@ -99,6 +134,59 @@ def get_tool_reuse_stats_map(
         out[int(row["tool_id"])] = {
             "calls": int(row["calls"]) if row["calls"] is not None else 0,
             "reuse_calls": int(row["reuse_calls"]) if row["reuse_calls"] is not None else 0,
+        }
+    return out
+
+
+def _reuse_quality_map_by_entity(
+    *,
+    ids: Sequence[int],
+    id_column: str,
+    require_not_null: bool,
+    since: Optional[str],
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[int, Dict[str, int]]:
+    """
+    通用质量聚合：
+    - 按指定维度（tool_id/skill_id）统计 calls/reuse/pass/fail/unknown。
+    """
+    parsed_ids = [int(i) for i in ids if i is not None]
+    if not parsed_ids:
+        return {}
+
+    placeholders = in_clause_placeholders(parsed_ids)
+    if not placeholders:
+        return {}
+    where = [f"{id_column} IN ({placeholders})"]
+    if require_not_null:
+        where.insert(0, f"{id_column} IS NOT NULL")
+    params: List = list(parsed_ids)
+    if since:
+        where.append("created_at >= ?")
+        params.append(str(since))
+    where_clause = " AND ".join(where)
+
+    sql = (
+        f"SELECT {id_column} AS entity_id, "
+        "COUNT(*) AS calls, "
+        "COALESCE(SUM(reuse), 0) AS reuse_calls, "
+        "COALESCE(SUM(CASE WHEN reuse_status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_calls, "
+        "COALESCE(SUM(CASE WHEN reuse_status = 'fail' THEN 1 ELSE 0 END), 0) AS fail_calls, "
+        "COALESCE(SUM(CASE WHEN reuse_status IS NULL OR reuse_status = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_calls "
+        f"FROM tool_call_records WHERE {where_clause} "
+        f"GROUP BY {id_column}"
+    )
+    with provide_connection(conn) as inner:
+        rows = inner.execute(sql, params).fetchall()
+
+    out: Dict[int, Dict[str, int]] = {}
+    for row in rows:
+        out[int(row["entity_id"])] = {
+            "calls": int(row["calls"]) if row["calls"] is not None else 0,
+            "reuse_calls": int(row["reuse_calls"]) if row["reuse_calls"] is not None else 0,
+            "pass_calls": int(row["pass_calls"]) if row["pass_calls"] is not None else 0,
+            "fail_calls": int(row["fail_calls"]) if row["fail_calls"] is not None else 0,
+            "unknown_calls": int(row["unknown_calls"]) if row["unknown_calls"] is not None else 0,
         }
     return out
 
@@ -117,41 +205,13 @@ def get_tool_reuse_quality_map(
     说明：
     - since 非空时，仅统计 created_at >= since 的记录（用于“最近成功率”）。
     """
-    ids = [int(i) for i in tool_ids if i is not None]
-    if not ids:
-        return {}
-
-    placeholders = ",".join(["?"] * len(ids))
-    where = [f"tool_id IN ({placeholders})"]
-    params: List = list(ids)
-    if since:
-        where.append("created_at >= ?")
-        params.append(str(since))
-    where_clause = " AND ".join(where)
-
-    sql = (
-        "SELECT tool_id, "
-        "COUNT(*) AS calls, "
-        "COALESCE(SUM(reuse), 0) AS reuse_calls, "
-        "COALESCE(SUM(CASE WHEN reuse_status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_calls, "
-        "COALESCE(SUM(CASE WHEN reuse_status = 'fail' THEN 1 ELSE 0 END), 0) AS fail_calls, "
-        "COALESCE(SUM(CASE WHEN reuse_status IS NULL OR reuse_status = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_calls "
-        f"FROM tool_call_records WHERE {where_clause} "
-        "GROUP BY tool_id"
+    return _reuse_quality_map_by_entity(
+        ids=tool_ids,
+        id_column="tool_id",
+        require_not_null=False,
+        since=since,
+        conn=conn,
     )
-    with provide_connection(conn) as inner:
-        rows = inner.execute(sql, params).fetchall()
-
-    out: Dict[int, Dict[str, int]] = {}
-    for row in rows:
-        out[int(row["tool_id"])] = {
-            "calls": int(row["calls"]) if row["calls"] is not None else 0,
-            "reuse_calls": int(row["reuse_calls"]) if row["reuse_calls"] is not None else 0,
-            "pass_calls": int(row["pass_calls"]) if row["pass_calls"] is not None else 0,
-            "fail_calls": int(row["fail_calls"]) if row["fail_calls"] is not None else 0,
-            "unknown_calls": int(row["unknown_calls"]) if row["unknown_calls"] is not None else 0,
-        }
-    return out
 
 
 def get_skill_reuse_quality_map(
@@ -167,41 +227,13 @@ def get_skill_reuse_quality_map(
     - 只统计 skill_id IS NOT NULL 的记录；
     - since 非空时，仅统计 created_at >= since 的记录（用于“最近成功率”）。
     """
-    ids = [int(i) for i in skill_ids if i is not None]
-    if not ids:
-        return {}
-
-    placeholders = ",".join(["?"] * len(ids))
-    where = ["skill_id IS NOT NULL", f"skill_id IN ({placeholders})"]
-    params: List = list(ids)
-    if since:
-        where.append("created_at >= ?")
-        params.append(str(since))
-    where_clause = " AND ".join(where)
-
-    sql = (
-        "SELECT skill_id, "
-        "COUNT(*) AS calls, "
-        "COALESCE(SUM(reuse), 0) AS reuse_calls, "
-        "COALESCE(SUM(CASE WHEN reuse_status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_calls, "
-        "COALESCE(SUM(CASE WHEN reuse_status = 'fail' THEN 1 ELSE 0 END), 0) AS fail_calls, "
-        "COALESCE(SUM(CASE WHEN reuse_status IS NULL OR reuse_status = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_calls "
-        f"FROM tool_call_records WHERE {where_clause} "
-        "GROUP BY skill_id"
+    return _reuse_quality_map_by_entity(
+        ids=skill_ids,
+        id_column="skill_id",
+        require_not_null=True,
+        since=since,
+        conn=conn,
     )
-    with provide_connection(conn) as inner:
-        rows = inner.execute(sql, params).fetchall()
-
-    out: Dict[int, Dict[str, int]] = {}
-    for row in rows:
-        out[int(row["skill_id"])] = {
-            "calls": int(row["calls"]) if row["calls"] is not None else 0,
-            "reuse_calls": int(row["reuse_calls"]) if row["reuse_calls"] is not None else 0,
-            "pass_calls": int(row["pass_calls"]) if row["pass_calls"] is not None else 0,
-            "fail_calls": int(row["fail_calls"]) if row["fail_calls"] is not None else 0,
-            "unknown_calls": int(row["unknown_calls"]) if row["unknown_calls"] is not None else 0,
-        }
-    return out
 
 
 def list_tool_call_records(
@@ -214,21 +246,12 @@ def list_tool_call_records(
     limit: int,
     conn: Optional[sqlite3.Connection] = None,
 ) -> List[sqlite3.Row]:
-    conditions: List[str] = []
-    params: List = []
-    if task_id is not None:
-        conditions.append("task_id = ?")
-        params.append(int(task_id))
-    if run_id is not None:
-        conditions.append("run_id = ?")
-        params.append(int(run_id))
-    if tool_id is not None:
-        conditions.append("tool_id = ?")
-        params.append(int(tool_id))
-    if reuse_status is not None:
-        conditions.append("reuse_status = ?")
-        params.append(reuse_status)
-
+    conditions, params = _build_tool_call_filters(
+        task_id=task_id,
+        run_id=run_id,
+        tool_id=tool_id,
+        reuse_status=reuse_status,
+    )
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     params.extend([int(limit), int(offset)])
     sql = f"SELECT * FROM tool_call_records {where_clause} ORDER BY id ASC LIMIT ? OFFSET ?"
@@ -263,24 +286,13 @@ def summarize_tool_reuse(
     返回：(summary_row, status_rows, tool_rows, tool_status_rows)
     """
     with provide_connection(conn) as inner:
-        conditions = []
-        params: List = []
-        if task_id is not None:
-            conditions.append("task_id = ?")
-            params.append(int(task_id))
-        if run_id is not None:
-            conditions.append("run_id = ?")
-            params.append(int(run_id))
-        if tool_id is not None:
-            conditions.append("tool_id = ?")
-            params.append(int(tool_id))
-        if reuse_status is not None:
-            if reuse_status == unknown_status_value:
-                conditions.append("(reuse_status = ? OR reuse_status IS NULL)")
-                params.append(unknown_status_value)
-            else:
-                conditions.append("reuse_status = ?")
-                params.append(reuse_status)
+        conditions, params = _build_tool_call_filters(
+            task_id=task_id,
+            run_id=run_id,
+            tool_id=tool_id,
+            reuse_status=reuse_status,
+            unknown_status_value=unknown_status_value,
+        )
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
         status_conditions = list(conditions)
@@ -332,20 +344,13 @@ def summarize_skill_reuse(
     返回：(total_row, rows)
     """
     with provide_connection(conn) as inner:
-        conditions = ["skill_id IS NOT NULL"]
-        params: List = []
-        if task_id is not None:
-            conditions.append("task_id = ?")
-            params.append(int(task_id))
-        if run_id is not None:
-            conditions.append("run_id = ?")
-            params.append(int(run_id))
-        if tool_id is not None:
-            conditions.append("tool_id = ?")
-            params.append(int(tool_id))
-        if reuse_status is not None:
-            conditions.append("reuse_status = ?")
-            params.append(reuse_status)
+        conditions, params = _build_tool_call_filters(
+            task_id=task_id,
+            run_id=run_id,
+            tool_id=tool_id,
+            reuse_status=reuse_status,
+        )
+        conditions.insert(0, "skill_id IS NOT NULL")
         where_clause = f"WHERE {' AND '.join(conditions)}"
 
         total_row = inner.execute(

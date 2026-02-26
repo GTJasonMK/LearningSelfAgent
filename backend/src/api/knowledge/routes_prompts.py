@@ -13,9 +13,12 @@ from backend.src.api.schemas import (
 )
 from backend.src.common.serializers import prompt_template_from_row
 from backend.src.api.utils import (
-    ensure_write_permission,
+    app_error_response,
+    clamp_non_negative_int,
+    clamp_page_limit,
     error_response,
     now_iso,
+    require_write_permission,
 )
 from backend.src.common.errors import AppError
 from backend.src.constants import (
@@ -31,7 +34,7 @@ from backend.src.constants import (
     HTTP_STATUS_BAD_REQUEST,
     HTTP_STATUS_NOT_FOUND,
 )
-from backend.src.repositories.prompt_templates_repo import (
+from backend.src.services.knowledge.knowledge_query import (
     create_prompt_template as create_prompt_template_repo,
     delete_prompt_template as delete_prompt_template_repo,
     get_prompt_template as get_prompt_template_repo,
@@ -44,11 +47,17 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _prompt_not_found_response():
+    return error_response(
+        ERROR_CODE_NOT_FOUND,
+        ERROR_MESSAGE_PROMPT_NOT_FOUND,
+        HTTP_STATUS_NOT_FOUND,
+    )
+
+
 @router.post("/prompts")
+@require_write_permission
 def create_prompt_template(payload: PromptTemplateCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     created_at = now_iso()
     updated_at = created_at
     template_id = create_prompt_template_repo(
@@ -66,6 +75,8 @@ def create_prompt_template(payload: PromptTemplateCreate) -> dict:
 def list_prompt_templates(
     offset: int = DEFAULT_PAGE_OFFSET, limit: int = DEFAULT_PAGE_LIMIT
 ) -> dict:
+    offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
     rows = list_prompt_templates_repo(offset=offset, limit=limit)
     return {"items": [prompt_template_from_row(row) for row in rows]}
 
@@ -74,19 +85,13 @@ def list_prompt_templates(
 def get_prompt_template(template_id: int):
     row = get_prompt_template_repo(template_id=template_id)
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_PROMPT_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return _prompt_not_found_response()
     return {"prompt": prompt_template_from_row(row)}
 
 
 @router.patch("/prompts/{template_id}")
+@require_write_permission
 def update_prompt_template(template_id: int, payload: PromptTemplateUpdate):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     updated_at = now_iso()
     row = update_prompt_template_repo(
         template_id=template_id,
@@ -96,34 +101,22 @@ def update_prompt_template(template_id: int, payload: PromptTemplateUpdate):
         updated_at=updated_at,
     )
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_PROMPT_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return _prompt_not_found_response()
     return {"prompt": prompt_template_from_row(row)}
 
 
 @router.delete("/prompts/{template_id}")
+@require_write_permission
 def delete_prompt_template(template_id: int):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     row = delete_prompt_template_repo(template_id=template_id)
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_PROMPT_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return _prompt_not_found_response()
     return {"deleted": True, "prompt": prompt_template_from_row(row)}
 
 
 @router.post("/llm/calls")
+@require_write_permission
 def create_llm_call(payload: LLMCallCreate):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     return create_llm_call_service(payload)
 
 
@@ -172,7 +165,7 @@ async def stream_llm_chat(payload: LLMChatStreamRequest):
     try:
         llm = await asyncio.to_thread(LLMClient, provider=payload.provider)
     except AppError as exc:
-        return error_response(exc.code, exc.message, exc.status_code)
+        return app_error_response(exc)
 
     async def gen():
         cancelled = False

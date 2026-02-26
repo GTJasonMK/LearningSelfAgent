@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 
 _WIN_DRIVE_ABS_RE = re.compile(r"^(?P<drive>[A-Za-z]):[\\/](?P<rest>.*)$")
 
@@ -51,3 +52,13 @@ def normalize_windows_abs_path_on_posix(path: str) -> str:
     if rest:
         return f"/mnt/{drive}/{rest}"
     return f"/mnt/{drive}"
+
+
+def is_path_within_root(path: "str | Path", root: "str | Path") -> bool:
+    """
+    判断 path 是否位于 root 目录内（含 root 自身）。
+    """
+    try:
+        return Path(path).resolve().is_relative_to(Path(root).resolve())
+    except Exception:
+        return False

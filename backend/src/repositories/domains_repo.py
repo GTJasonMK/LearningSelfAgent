@@ -14,6 +14,12 @@ from backend.src.common.utils import now_iso
 from backend.src.repositories.repo_conn import provide_connection
 
 
+def _dump_keywords_json(keywords: Optional[List[str]]) -> Optional[str]:
+    if keywords is None:
+        return None
+    return json.dumps(keywords, ensure_ascii=False)
+
+
 @dataclass(frozen=True)
 class DomainCreateParams:
     """domains 创建参数。"""
@@ -46,7 +52,7 @@ def count_domains(*, conn: Optional[sqlite3.Connection] = None) -> int:
 def create_domain(params: DomainCreateParams, *, conn: Optional[sqlite3.Connection] = None) -> int:
     """创建领域，返回 id。"""
     now = now_iso()
-    keywords_json = json.dumps(params.keywords, ensure_ascii=False) if params.keywords else None
+    keywords_json = _dump_keywords_json(params.keywords)
     sql = """
         INSERT INTO domains (domain_id, name, parent_id, description, keywords, skill_count, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, 0, 'active', ?, ?)
@@ -123,18 +129,20 @@ def update_domain(
     updates = []
     sql_params = []
 
-    if params.name is not None:
-        updates.append("name = ?")
-        sql_params.append(params.name)
-    if params.description is not None:
-        updates.append("description = ?")
-        sql_params.append(params.description)
+    plain_updates = [
+        ("name", params.name),
+        ("description", params.description),
+        ("status", params.status),
+    ]
+    for column, value in plain_updates:
+        if value is None:
+            continue
+        updates.append(f"{column} = ?")
+        sql_params.append(value)
+
     if params.keywords is not None:
         updates.append("keywords = ?")
-        sql_params.append(json.dumps(params.keywords, ensure_ascii=False))
-    if params.status is not None:
-        updates.append("status = ?")
-        sql_params.append(params.status)
+        sql_params.append(_dump_keywords_json(params.keywords))
 
     if not updates:
         return False
@@ -159,15 +167,21 @@ def delete_domain(*, domain_id: str, conn: Optional[sqlite3.Connection] = None) 
 
 def increment_skill_count(*, domain_id: str, conn: Optional[sqlite3.Connection] = None) -> bool:
     """增加领域的技能计数。"""
-    sql = "UPDATE domains SET skill_count = skill_count + 1, updated_at = ? WHERE domain_id = ?"
-    with provide_connection(conn) as inner:
-        cursor = inner.execute(sql, (now_iso(), domain_id))
-        return cursor.rowcount > 0
+    return _update_skill_count(domain_id=domain_id, expression="skill_count + 1", conn=conn)
 
 
 def decrement_skill_count(*, domain_id: str, conn: Optional[sqlite3.Connection] = None) -> bool:
     """减少领域的技能计数（不会小于 0）。"""
-    sql = "UPDATE domains SET skill_count = MAX(0, skill_count - 1), updated_at = ? WHERE domain_id = ?"
+    return _update_skill_count(domain_id=domain_id, expression="MAX(0, skill_count - 1)", conn=conn)
+
+
+def _update_skill_count(
+    *,
+    domain_id: str,
+    expression: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    sql = f"UPDATE domains SET skill_count = {expression}, updated_at = ? WHERE domain_id = ?"
     with provide_connection(conn) as inner:
         cursor = inner.execute(sql, (now_iso(), domain_id))
         return cursor.rowcount > 0

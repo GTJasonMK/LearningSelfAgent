@@ -18,6 +18,7 @@ from backend.src.constants import (
     THINK_MERGED_MAX_SOLUTIONS,
 )
 from backend.src.services.llm.llm_client import sse_json
+from backend.src.common.utils import parse_positive_int
 
 
 def _vote_rank(values_by_planner: List[List]) -> List:
@@ -50,17 +51,14 @@ def _merge_dicts_by_id(items_by_planner: List[List[dict]], *, max_items: int) ->
     for items in items_by_planner or []:
         ids: List[int] = []
         for item in items or []:
-            if not isinstance(item, dict) or item.get("id") is None:
+            if not isinstance(item, dict):
                 continue
-            try:
-                item_id = int(item.get("id"))
-            except (TypeError, ValueError):
+            item_id = parse_positive_int(item.get("id"), default=None)
+            if item_id is None:
                 continue
-            if item_id <= 0:
-                continue
-            ids.append(item_id)
-            if item_id not in by_id:
-                by_id[item_id] = item
+            ids.append(int(item_id))
+            if int(item_id) not in by_id:
+                by_id[int(item_id)] = item
         id_lists.append(ids)
 
     ranked_ids = _vote_rank(id_lists)
@@ -70,6 +68,68 @@ def _merge_dicts_by_id(items_by_planner: List[List[dict]], *, max_items: int) ->
         if item:
             selected.append(item)
     return selected
+
+
+def _extract_positive_id_list(items: List[dict], *, limit: int = 0) -> List[int]:
+    result: List[int] = []
+    max_items = int(limit or 0)
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = parse_positive_int(item.get("id"), default=None)
+        if item_id is None:
+            continue
+        result.append(int(item_id))
+        if max_items > 0 and len(result) >= max_items:
+            break
+    return result
+
+
+def _extract_positive_id_set(items: List[dict]) -> set[int]:
+    return set(_extract_positive_id_list(items, limit=0))
+
+
+async def _gather_planner_lists(
+    *,
+    planners: List[object],
+    tasks: List[asyncio.Future],
+    task_id: int,
+    run_id: int,
+    safe_write_debug: Callable[..., None],
+    failure_message: str,
+) -> List[List]:
+    """
+    执行并行 planner 任务，统一收敛为“与 planners 对齐的列表结果”：
+    - 成功：转换为 list；
+    - 失败：记录失败详情并返回空列表；
+    - CancelledError：立即向上抛出，保持取消语义。
+    """
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    values_by_planner: List[List] = []
+    failures: List[dict] = []
+    for index, result in enumerate(results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BaseException):
+            failures.append(
+                {
+                    "planner_id": str(getattr(planners[index], "planner_id", "")),
+                    "model": str(getattr(planners[index], "model", "")),
+                    "error": str(result),
+                }
+            )
+            values_by_planner.append([])
+            continue
+        values_by_planner.append(list(result or []))
+    if failures:
+        safe_write_debug(
+            int(task_id),
+            int(run_id),
+            message=str(failure_message or ""),
+            data={"failures": failures},
+            level="warning",
+        )
+    return values_by_planner
 
 
 @dataclass
@@ -128,31 +188,14 @@ async def iter_think_retrieval_merge_events(
             )
             for planner in planners
         ]
-        graph_results = await asyncio.gather(*graph_tasks, return_exceptions=True)
-        graph_by_planner: List[List[dict]] = []
-        graph_failures: List[dict] = []
-        for index, result in enumerate(graph_results):
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-            if isinstance(result, BaseException):
-                graph_failures.append(
-                    {
-                        "planner_id": str(getattr(planners[index], "planner_id", "")),
-                        "model": str(getattr(planners[index], "model", "")),
-                        "error": str(result),
-                    }
-                )
-                graph_by_planner.append([])
-                continue
-            graph_by_planner.append(list(result or []))
-        if graph_failures:
-            safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.think.retrieval.graph_failed",
-                data={"failures": graph_failures},
-                level="warning",
-            )
+        graph_by_planner = await _gather_planner_lists(
+            planners=planners,
+            tasks=graph_tasks,
+            task_id=task_id,
+            run_id=run_id,
+            safe_write_debug=safe_write_debug,
+            failure_message="agent.think.retrieval.graph_failed",
+        )
         merged_graph_nodes = _merge_dicts_by_id(
             graph_by_planner,
             max_items=int(getattr(think_config, "max_graph_nodes", 10) or 10),
@@ -182,19 +225,11 @@ async def iter_think_retrieval_merge_events(
                     {
                         "planner_id": planner.planner_id,
                         "model": planner.model,
-                        "node_ids": [
-                            int(node.get("id"))
-                            for node in (graph_by_planner[index] or [])
-                            if isinstance(node, dict) and node.get("id") is not None
-                        ][:12],
+                        "node_ids": _extract_positive_id_list(list(graph_by_planner[index] or []), limit=12),
                     }
                     for index, planner in enumerate(planners)
                 ],
-                "merged_node_ids": [
-                    int(node.get("id"))
-                    for node in (merged_graph_nodes or [])
-                    if isinstance(node, dict) and node.get("id") is not None
-                ],
+                "merged_node_ids": _extract_positive_id_list(list(merged_graph_nodes or []), limit=0),
             },
         )
 
@@ -214,31 +249,14 @@ async def iter_think_retrieval_merge_events(
             )
             for planner in planners
         ]
-        domain_results = await asyncio.gather(*domain_tasks, return_exceptions=True)
-        domain_by_planner: List[List[str]] = []
-        domain_failures: List[dict] = []
-        for index, result in enumerate(domain_results):
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-            if isinstance(result, BaseException):
-                domain_failures.append(
-                    {
-                        "planner_id": str(getattr(planners[index], "planner_id", "")),
-                        "model": str(getattr(planners[index], "model", "")),
-                        "error": str(result),
-                    }
-                )
-                domain_by_planner.append([])
-                continue
-            domain_by_planner.append(list(result or []))
-        if domain_failures:
-            safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.think.retrieval.domain_failed",
-                data={"failures": domain_failures},
-                level="warning",
-            )
+        domain_by_planner = await _gather_planner_lists(
+            planners=planners,
+            tasks=domain_tasks,
+            task_id=task_id,
+            run_id=run_id,
+            safe_write_debug=safe_write_debug,
+            failure_message="agent.think.retrieval.domain_failed",
+        )
         ranked_domains = [str(value).strip() for value in _vote_rank(domain_by_planner) if str(value).strip()]
         if any(value != "misc" for value in ranked_domains):
             ranked_domains = [value for value in ranked_domains if value != "misc"]
@@ -294,31 +312,14 @@ async def iter_think_retrieval_merge_events(
             )
             for planner in planners
         ]
-        skills_results = await asyncio.gather(*skills_tasks, return_exceptions=True)
-        skills_by_planner: List[List[dict]] = []
-        skills_failures: List[dict] = []
-        for index, result in enumerate(skills_results):
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-            if isinstance(result, BaseException):
-                skills_failures.append(
-                    {
-                        "planner_id": str(getattr(planners[index], "planner_id", "")),
-                        "model": str(getattr(planners[index], "model", "")),
-                        "error": str(result),
-                    }
-                )
-                skills_by_planner.append([])
-                continue
-            skills_by_planner.append(list(result or []))
-        if skills_failures:
-            safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.think.retrieval.skills_failed",
-                data={"failures": skills_failures},
-                level="warning",
-            )
+        skills_by_planner = await _gather_planner_lists(
+            planners=planners,
+            tasks=skills_tasks,
+            task_id=task_id,
+            run_id=run_id,
+            safe_write_debug=safe_write_debug,
+            failure_message="agent.think.retrieval.skills_failed",
+        )
         for index, planner in enumerate(planners):
             planner_skills[str(planner.planner_id)] = list(skills_by_planner[index] or [])
         merged_skills = _merge_dicts_by_id(
@@ -359,31 +360,14 @@ async def iter_think_retrieval_merge_events(
             )
             for planner in planners
         ]
-        solutions_results = await asyncio.gather(*solutions_tasks, return_exceptions=True)
-        solutions_by_planner: List[List[dict]] = []
-        solutions_failures: List[dict] = []
-        for index, result in enumerate(solutions_results):
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-            if isinstance(result, BaseException):
-                solutions_failures.append(
-                    {
-                        "planner_id": str(getattr(planners[index], "planner_id", "")),
-                        "model": str(getattr(planners[index], "model", "")),
-                        "error": str(result),
-                    }
-                )
-                solutions_by_planner.append([])
-                continue
-            solutions_by_planner.append(list(result or []))
-        if solutions_failures:
-            safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.think.retrieval.solutions_failed",
-                data={"failures": solutions_failures},
-                level="warning",
-            )
+        solutions_by_planner = await _gather_planner_lists(
+            planners=planners,
+            tasks=solutions_tasks,
+            task_id=task_id,
+            run_id=run_id,
+            safe_write_debug=safe_write_debug,
+            failure_message="agent.think.retrieval.solutions_failed",
+        )
         for index, planner in enumerate(planners):
             planner_solutions[str(planner.planner_id)] = list(solutions_by_planner[index] or [])
         merged_solutions = _merge_dicts_by_id(
@@ -402,11 +386,7 @@ async def iter_think_retrieval_merge_events(
             max_solutions=int(THINK_MERGED_MAX_SOLUTIONS or 5),
         )
 
-    before_skill_ids = {
-        int(value.get("id"))
-        for value in (merged_skills or [])
-        if isinstance(value, dict) and isinstance(value.get("id"), int) and int(value.get("id")) > 0
-    }
+    before_skill_ids = _extract_positive_id_set(list(merged_skills or []))
 
     tools_limit = int(getattr(think_config, "max_tools", 12) or 12)
     enriched = None
@@ -450,38 +430,29 @@ async def iter_think_retrieval_merge_events(
     skills_hint = str(enriched.get("skills_hint") or skills_hint or "(无)")
     solutions_for_prompt = list(enriched.get("solutions_for_prompt") or merged_solutions or [])
     merged_solutions = list(solutions_for_prompt or [])
-    draft_solution_id = enriched.get("draft_solution_id")
+    draft_solution_id_value = parse_positive_int(enriched.get("draft_solution_id"), default=None)
     solutions_hint = str(enriched.get("solutions_hint") or "(无)")
     tools_hint = str(enriched.get("tools_hint") or "(无)")
 
     need_user_prompt = bool(enriched.get("need_user_prompt"))
     user_prompt_question = str(enriched.get("user_prompt_question") or "").strip()
 
-    after_skill_ids = {
-        int(value.get("id"))
-        for value in (merged_skills or [])
-        if isinstance(value, dict) and isinstance(value.get("id"), int) and int(value.get("id")) > 0
-    }
+    after_skill_ids = _extract_positive_id_set(list(merged_skills or []))
     added_skill_ids = after_skill_ids - before_skill_ids
     if added_skill_ids and planners:
         for planner in planners:
             planner_id = str(planner.planner_id)
             item_list = list(planner_skills.get(planner_id) or [])
-            existing = {
-                int(value.get("id"))
-                for value in item_list
-                if isinstance(value, dict) and isinstance(value.get("id"), int) and int(value.get("id")) > 0
-            }
+            existing = _extract_positive_id_set(item_list)
             for skill in merged_skills or []:
                 if not isinstance(skill, dict) or skill.get("id") is None:
                     continue
-                try:
-                    skill_id = int(skill.get("id"))
-                except (TypeError, ValueError):
+                skill_id = parse_positive_int(skill.get("id"), default=None)
+                if skill_id is None:
                     continue
                 if skill_id in added_skill_ids and skill_id not in existing:
                     item_list.append(skill)
-                    existing.add(skill_id)
+                    existing.add(int(skill_id))
             planner_skills[planner_id] = item_list
 
     planner_hints: Dict[str, Dict[str, str]] = {}
@@ -495,8 +466,7 @@ async def iter_think_retrieval_merge_events(
                 limit=int(tools_limit),
             )
             if (
-                isinstance(draft_solution_id, int)
-                and int(draft_solution_id) > 0
+                draft_solution_id_value is not None
                 and not (planner_solutions.get(planner_id) or [])
             ):
                 per_solutions_hint = solutions_hint
@@ -535,7 +505,7 @@ async def iter_think_retrieval_merge_events(
             "solutions": list(merged_solutions or []),
             "solutions_hint": str(solutions_hint or "(无)"),
             "tools_hint": str(tools_hint or "(无)"),
-            "draft_solution_id": draft_solution_id,
+            "draft_solution_id": draft_solution_id_value,
             "planner_hints": dict(planner_hints or {}),
             "need_user_prompt": bool(need_user_prompt),
             "user_prompt_question": str(user_prompt_question or ""),

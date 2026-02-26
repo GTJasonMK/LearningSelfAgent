@@ -101,6 +101,42 @@ class TestActionValidatePayloadAlignment(unittest.TestCase):
         )
         self.assertIsNone(err)
 
+    def test_http_request_accepts_fallback_urls_and_strict_status_code(self):
+        from backend.src.actions.registry import validate_action_object
+
+        err = validate_action_object(
+            {
+                "action": {
+                    "type": "http_request",
+                    "payload": {
+                        "url": "https://example.com/data",
+                        "fallback_urls": [
+                            "https://example.net/data",
+                            "https://backup.example.org/data",
+                        ],
+                        "strict_status_code": True,
+                    },
+                }
+            }
+        )
+        self.assertIsNone(err)
+
+    def test_http_request_rejects_invalid_fallback_urls_type(self):
+        from backend.src.actions.registry import validate_action_object
+
+        err = validate_action_object(
+            {
+                "action": {
+                    "type": "http_request",
+                    "payload": {
+                        "url": "https://example.com/data",
+                        "fallback_urls": {"bad": "type"},
+                    },
+                }
+            }
+        )
+        self.assertEqual(err, "http_request.fallback_urls 必须是字符串或字符串数组")
+
 
 if __name__ == "__main__":
     unittest.main()

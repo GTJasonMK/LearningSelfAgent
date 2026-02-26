@@ -2,14 +2,26 @@ from typing import Optional
 
 from fastapi import APIRouter
 
-from backend.src.api.utils import error_response, parse_json_value
-from backend.src.constants import DEFAULT_PAGE_LIMIT, DEFAULT_PAGE_OFFSET, ERROR_CODE_INVALID_REQUEST, HTTP_STATUS_BAD_REQUEST
-from backend.src.repositories.agent_reviews_repo import (
-    get_agent_review as repo_get_agent_review,
-    list_agent_reviews as repo_list_agent_reviews,
+from backend.src.api.utils import (
+    clamp_non_negative_int,
+    clamp_page_limit,
+    error_response,
+    parse_json_value,
+    parse_positive_int,
 )
+from backend.src.constants import DEFAULT_PAGE_LIMIT, DEFAULT_PAGE_OFFSET, ERROR_CODE_INVALID_REQUEST, HTTP_STATUS_BAD_REQUEST
+from backend.src.services.agent_review.review_records import get_agent_review as repo_get_agent_review
+from backend.src.services.agent_review.review_records import list_agent_reviews as repo_list_agent_reviews
 
 router = APIRouter()
+
+
+def _invalid_review_id_response():
+    return error_response(
+        ERROR_CODE_INVALID_REQUEST,
+        "review_id 不合法",
+        HTTP_STATUS_BAD_REQUEST,
+    )
 
 
 @router.get("/agent/reviews")
@@ -22,12 +34,10 @@ def list_agent_reviews(
     """
     评估记录列表（Eval Agent 输出）。
     """
-    if offset < 0:
-        offset = 0
-    if limit <= 0:
-        limit = DEFAULT_PAGE_LIMIT
+    offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
 
-    rows = repo_list_agent_reviews(offset=int(offset), limit=int(limit), task_id=task_id, run_id=run_id)
+    rows = repo_list_agent_reviews(offset=offset, limit=limit, task_id=task_id, run_id=run_id)
     items = []
     for row in rows:
         items.append(
@@ -49,14 +59,11 @@ def get_agent_review(review_id: int):
     """
     评估记录详情。
     """
-    try:
-        rid = int(review_id)
-    except Exception:
-        rid = 0
-    if rid <= 0:
-        return error_response(ERROR_CODE_INVALID_REQUEST, "review_id 不合法", HTTP_STATUS_BAD_REQUEST)
+    rid = parse_positive_int(review_id)
+    if rid is None:
+        return _invalid_review_id_response()
 
-    row = repo_get_agent_review(review_id=int(rid))
+    row = repo_get_agent_review(review_id=rid)
     if not row:
         return error_response(ERROR_CODE_INVALID_REQUEST, "review 不存在", HTTP_STATUS_BAD_REQUEST)
 

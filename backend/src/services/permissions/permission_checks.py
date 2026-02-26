@@ -14,6 +14,14 @@ from backend.src.services.permissions.permissions_store import (
 )
 
 
+def _permission_denied_response():
+    return error_response(
+        ERROR_CODE_FORBIDDEN,
+        ERROR_MESSAGE_PERMISSION_DENIED,
+        HTTP_STATUS_FORBIDDEN,
+    )
+
+
 def ensure_write_permission():
     """
     权限兜底（写入）。
@@ -24,11 +32,7 @@ def ensure_write_permission():
     """
     if has_write_permission():
         return None
-    return error_response(
-        ERROR_CODE_FORBIDDEN,
-        ERROR_MESSAGE_PERMISSION_DENIED,
-        HTTP_STATUS_FORBIDDEN,
-    )
+    return _permission_denied_response()
 
 
 def ensure_exec_permission(workdir: Optional[str]):
@@ -37,9 +41,5 @@ def ensure_exec_permission(workdir: Optional[str]):
     """
     if has_exec_permission(workdir):
         return None
-    return error_response(
-        ERROR_CODE_FORBIDDEN,
-        ERROR_MESSAGE_PERMISSION_DENIED,
-        HTTP_STATUS_FORBIDDEN,
-    )
+    return _permission_denied_response()
 

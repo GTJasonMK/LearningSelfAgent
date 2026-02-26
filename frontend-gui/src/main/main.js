@@ -19,6 +19,12 @@ let petRecoveryTimer = null;
 let petWindowCreating = false;
 let quitting = false;
 const BACKEND_DEFAULT_PORT = 8123;
+const HIDE_PET_ON_PANEL_OPEN_ENV = "LSA_HIDE_PET_ON_PANEL_OPEN";
+
+function shouldHidePetOnPanelOpen() {
+  const raw = String(process.env[HIDE_PET_ON_PANEL_OPEN_ENV] || "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
 
 function parseBackendPort(raw) {
   const value = Number.parseInt(String(raw || "").trim(), 10);
@@ -462,13 +468,19 @@ ipcMain.on("toggle-panel", () => {
   }
 });
 
-// 桌宠窗口 -> 主面板窗口：转发 Agent 结构化事件（复用现有 SSE，不额外开新通道）
-ipcMain.on("agent-event", (_event, payload) => {
+// 窗口间 Agent 结构化事件转发（复用现有 SSE，不额外开新通道）
+ipcMain.on("agent-event", (event, payload) => {
   if (!payload) return;
-  if (!panelWindow || panelWindow.isDestroyed()) return;
-  try {
-    panelWindow.webContents.send("agent-event", payload);
-  } catch (e) {}
+  const senderId = Number(event?.sender?.id);
+  const targets = [panelWindow, petWindow];
+  for (const win of targets) {
+    if (!win || win.isDestroyed()) continue;
+    const targetId = Number(win.webContents?.id);
+    if (Number.isFinite(senderId) && Number.isFinite(targetId) && senderId === targetId) continue;
+    try {
+      win.webContents.send("agent-event", payload);
+    } catch (e) {}
+  }
 });
 
 ipcMain.on("panel-window-control", (event, payload) => {
@@ -584,8 +596,14 @@ function togglePanel() {
   } else {
     panelWindow.show();
     panelWindow.focus();
-    // 打开主面板时关闭桌宠“悬浮窗口形态”，改为仅在世界页右下角展示
-    hidePetWindow();
+    // 默认保留悬浮桌宠，避免“打开面板后桌宠形态消失”的体感回归。
+    // 如需旧行为（打开面板即隐藏悬浮桌宠），可设置环境变量：
+    // LSA_HIDE_PET_ON_PANEL_OPEN=1
+    if (shouldHidePetOnPanelOpen()) {
+      hidePetWindow();
+    } else {
+      restorePetWindow();
+    }
   }
 }
 

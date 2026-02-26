@@ -1,8 +1,21 @@
+import json
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from backend.src.agent.core.run_context import AgentRunContext
 from backend.src.agent.runner.run_startup import start_new_mode_run
+
+
+def _parse_sse_data_json(msg: str):
+    text = str(msg or "")
+    prefix = "data: "
+    if not text.startswith(prefix):
+        return None
+    line = text[len(prefix):].splitlines()[0]
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
 
 
 class TestRunStartup(unittest.IsolatedAsyncioTestCase):
@@ -35,10 +48,19 @@ class TestRunStartup(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started.task_id, 1)
         self.assertEqual(started.run_id, 2)
         self.assertEqual(started.run_ctx, run_ctx)
-        self.assertGreaterEqual(len(started.events), 3)
+        self.assertGreaterEqual(len(started.events), 4)
         self.assertEqual(started.events[0], "run-created-event")
-        self.assertEqual(started.events[1], "stage-event")
-        self.assertIn("启动", started.events[2])
+
+        run_status_event = _parse_sse_data_json(started.events[1])
+        self.assertIsNotNone(run_status_event)
+        self.assertEqual(run_status_event.get("type"), "run_status")
+        self.assertEqual(run_status_event.get("task_id"), 1)
+        self.assertEqual(run_status_event.get("run_id"), 2)
+        self.assertEqual(run_status_event.get("status"), "running")
+        self.assertEqual(run_status_event.get("stage"), "retrieval")
+
+        self.assertEqual(started.events[2], "stage-event")
+        self.assertIn("启动", started.events[3])
         safe_debug.assert_called_once_with(1, 2, message="agent.start", data={"x": 1})
         mock_boot.assert_awaited_once()
 
@@ -62,7 +84,16 @@ class TestRunStartup(unittest.IsolatedAsyncioTestCase):
                 workdir="/tmp",
                 stage_where_prefix="think_run",
             )
-        self.assertEqual(started.events, ["run-created-event"])
+
+        self.assertEqual(len(started.events), 2)
+        self.assertEqual(started.events[0], "run-created-event")
+        run_status_event = _parse_sse_data_json(started.events[1])
+        self.assertIsNotNone(run_status_event)
+        self.assertEqual(run_status_event.get("type"), "run_status")
+        self.assertEqual(run_status_event.get("task_id"), 3)
+        self.assertEqual(run_status_event.get("run_id"), 4)
+        self.assertEqual(run_status_event.get("status"), "running")
+        self.assertEqual(run_status_event.get("stage"), "retrieval")
 
 
 if __name__ == "__main__":

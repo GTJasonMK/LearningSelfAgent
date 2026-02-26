@@ -145,7 +145,7 @@ def _core_tables_ready(conn: sqlite3.Connection) -> bool:
     - “no such table” 往往来自：DB 路径漂移 / :memory: 新连接 / DB 被外部脚本重置；
     - 这里用 sqlite_master 做 O(1) 探测，缺失则触发 migrations 自愈。
     """
-    core = ("tasks", "task_runs", "task_steps", "config_store", "permissions_store")
+    core = ("tasks", "task_runs", "task_steps", "task_run_events", "config_store", "permissions_store")
     marks = ",".join(["?"] * len(core))
     try:
         rows = conn.execute(

@@ -1,5 +1,4 @@
 import json
-import logging
 import ntpath
 import os
 import queue
@@ -11,21 +10,22 @@ from typing import Generator, List, Optional
 
 from backend.src.agent.json_utils import _extract_json_object
 from backend.src.agent.plan_utils import (
-    _fallback_brief_from_title,
     _normalize_plan_titles,
     drop_non_artifact_file_write_steps,
     extract_file_write_target_path,
     reorder_script_file_writes_before_exec_steps,
     repair_plan_artifacts_with_file_write_steps,
+    sanitize_plan_brief,
 )
 from backend.src.agent.support import _truncate_observation
+from backend.src.agent.source_failure_summary import summarize_recent_source_failures_for_prompt
+from backend.src.agent.core.context_budget import apply_context_budgets
 from backend.src.actions.registry import action_types_line
 from backend.src.services.llm.llm_calls import create_llm_call
 from backend.src.constants import (
     ACTION_TYPE_FILE_WRITE,
     ACTION_TYPE_TASK_OUTPUT,
     AGENT_EXPERIMENT_DIR_REL,
-    AGENT_PLAN_BRIEF_MAX_CHARS,
     AGENT_PLAN_HEARTBEAT_INTERVAL_SECONDS,
     AGENT_PLAN_MAX_WAIT_SECONDS,
     AGENT_PLAN_PROMPT_TEMPLATE,
@@ -34,11 +34,9 @@ from backend.src.constants import (
     ERROR_MESSAGE_LLM_CALL_FAILED,
     STREAM_TAG_PLAN,
 )
-from backend.src.services.debug.debug_output import write_task_debug_output
+from backend.src.services.debug.safe_debug import safe_write_debug as _safe_write_debug
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.agent.runner.react_helpers import call_llm_for_text_with_id
-
-logger = logging.getLogger(__name__)
 
 # 仅在用户明确表达“保存到某目录/某路径下”时启用的输出目录提示抽取。
 # 目的：让 plan 阶段 deterministic 地把 file_write/artifacts 绑定到用户指定目录，避免落盘到错误位置。
@@ -185,29 +183,6 @@ def _apply_output_dir_hint_to_plan(
     return new_titles, new_artifacts, changed
 
 
-def _safe_write_debug(
-    task_id: int,
-    run_id: int,
-    *,
-    message: str,
-    data: Optional[dict] = None,
-    level: str = "debug",
-) -> None:
-    """
-    调试输出不应影响主链路：失败时降级为 logger.exception。
-    """
-    try:
-        write_task_debug_output(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            message=message,
-            data=data if isinstance(data, dict) else None,
-            level=level,
-        )
-    except Exception:
-        logger.exception("write_task_debug_output failed: %s", message)
-
-
 def _is_plain_json_object_text(text: str) -> bool:
     """
     判断 LLM 输出是否为“纯 JSON 对象文本”。
@@ -264,6 +239,7 @@ def run_replan_phase(
     done_steps: List[str],
     error: str,
     observations: List[str],
+    failure_signatures: Optional[dict] = None,
 ) -> Generator[str, None, PlanPhaseResult]:
     """
     重新规划（Replan）：
@@ -273,6 +249,22 @@ def run_replan_phase(
     yield sse_json({"delta": f"{STREAM_TAG_PLAN} 重新规划…\n"})
 
     obs_text = "\n".join(f"- {_truncate_observation(o)}" for o in observations[-5:]) or "(无)"
+    source_failure_summary = summarize_recent_source_failures_for_prompt(
+        observations=list(observations or []),
+        error=str(error or ""),
+        failure_signatures=failure_signatures if isinstance(failure_signatures, dict) else None,
+    )
+    sections = apply_context_budgets(
+        {
+            "observations": obs_text,
+            "recent_source_failures": source_failure_summary,
+            "tools": tools_hint,
+            "skills": skills_hint,
+            "solutions": solutions_hint,
+            "memories": memories_hint,
+            "graph": graph_hint,
+        }
+    )
     replan_prompt = AGENT_REPLAN_PROMPT_TEMPLATE.format(
         message=message,
         workdir=workdir,
@@ -280,12 +272,13 @@ def run_replan_phase(
         plan=json.dumps(plan_titles, ensure_ascii=False),
         done_steps=json.dumps(done_steps, ensure_ascii=False),
         error=str(error or ""),
-        observations=obs_text,
-        tools=tools_hint,
-        skills=skills_hint,
-        solutions=solutions_hint,
-        memories=memories_hint,
-        graph=graph_hint,
+        observations=str(sections.get("observations") or ""),
+        recent_source_failures=str(sections.get("recent_source_failures") or ""),
+        tools=str(sections.get("tools") or ""),
+        skills=str(sections.get("skills") or ""),
+        solutions=str(sections.get("solutions") or ""),
+        memories=str(sections.get("memories") or ""),
+        graph=str(sections.get("graph") or ""),
         action_types_line=action_types_line(),
     )
 
@@ -465,9 +458,10 @@ def run_replan_phase(
 
     plan_items = []
     for idx, brief in enumerate(plan_briefs or [], start=1):
-        text = str(brief or "").strip() or _fallback_brief_from_title(plan_titles_new[idx - 1])
-        if len(text) > int(AGENT_PLAN_BRIEF_MAX_CHARS or 0):
-            text = text[: int(AGENT_PLAN_BRIEF_MAX_CHARS or 0)]
+        text = sanitize_plan_brief(
+            str(brief or "").strip(),
+            fallback_title=plan_titles_new[idx - 1],
+        )
         plan_items.append({"id": idx, "brief": text, "status": "pending"})
 
     return PlanPhaseResult(
@@ -510,15 +504,24 @@ def run_planning_phase(
     yield sse_json({"delta": f"{STREAM_TAG_PLAN} 正在规划…\n"})
 
     output_dir_rel = _extract_output_dir_from_message(message=message, workdir=workdir)
+    sections = apply_context_budgets(
+        {
+            "tools": tools_hint,
+            "skills": skills_hint,
+            "solutions": solutions_hint,
+            "memories": memories_hint,
+            "graph": graph_hint,
+        }
+    )
     plan_prompt = AGENT_PLAN_PROMPT_TEMPLATE.format(
         message=message,
         max_steps=max_steps,
         agent_workspace=AGENT_EXPERIMENT_DIR_REL,
-        tools=tools_hint,
-        skills=skills_hint,
-        solutions=solutions_hint,
-        memories=memories_hint,
-        graph=graph_hint,
+        tools=str(sections.get("tools") or ""),
+        skills=str(sections.get("skills") or ""),
+        solutions=str(sections.get("solutions") or ""),
+        memories=str(sections.get("memories") or ""),
+        graph=str(sections.get("graph") or ""),
         action_types_line=action_types_line(),
     )
     if output_dir_rel:
@@ -855,14 +858,10 @@ def run_planning_phase(
     # 生成 UI plan items（用于桌宠左侧计划栏）
     plan_items: List[dict] = []
     for i, title in enumerate(plan_titles, start=1):
-        brief = ""
+        raw_brief = ""
         if isinstance(plan_briefs, list) and i - 1 < len(plan_briefs):
-            brief = str(plan_briefs[i - 1] or "").strip()
-        if not brief:
-            brief = _fallback_brief_from_title(title)
-        brief = brief.replace(" ", "").replace("：", "").replace(":", "")
-        if len(brief) > AGENT_PLAN_BRIEF_MAX_CHARS:
-            brief = brief[:AGENT_PLAN_BRIEF_MAX_CHARS]
+            raw_brief = str(plan_briefs[i - 1] or "").strip()
+        brief = sanitize_plan_brief(raw_brief, fallback_title=title)
         plan_items.append({"id": i, "brief": brief, "status": "pending"})
 
     yield sse_json({"type": "plan", "task_id": task_id, "items": plan_items})

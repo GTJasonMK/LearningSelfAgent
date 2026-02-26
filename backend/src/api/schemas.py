@@ -120,6 +120,8 @@ class AgentCommandResumeStreamRequest(BaseModel):
 
     run_id: int
     message: str
+    prompt_token: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 class AgentEvaluateStreamRequest(BaseModel):

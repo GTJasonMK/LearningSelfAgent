@@ -12,12 +12,22 @@ Agent 执行管道公共逻辑。
 """
 
 import asyncio
-import json
 import logging
 import sqlite3
 from typing import Any, AsyncGenerator, Callable, List, Optional
 
 from backend.src.constants import RUN_STATUS_FAILED, TASK_OUTPUT_TYPE_DEBUG, TASK_OUTPUT_TYPE_TEXT
+from backend.src.common.task_error_codes import format_task_error
+from backend.src.agent.runner.failed_output_helpers import (
+    build_failed_task_output_content as build_failed_task_output_content_shared,
+    extract_step_error_text as extract_step_error_text_shared,
+    read_row_value as read_row_value_shared,
+    safe_collect_failed_step_lines,
+    safe_collect_failure_debug_lines,
+    safe_has_text_output,
+    truncate_inline_text as truncate_inline_text_shared,
+)
+from backend.src.agent.runner.failed_output_injector import ensure_failed_task_output_shared
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.agent.runner.debug_utils import safe_write_debug
 from backend.src.agent.runner.pending_planning_flow import (
@@ -41,8 +51,11 @@ from backend.src.services.tasks.task_run_lifecycle import (
     enqueue_postprocess_thread,
     mark_run_failed,
 )
-from backend.src.repositories.task_outputs_repo import create_task_output, list_task_outputs_for_run
-from backend.src.repositories.task_steps_repo import list_task_steps_for_run
+from backend.src.services.tasks.task_queries import (
+    create_task_output,
+    list_task_outputs_for_run,
+    list_task_steps_for_run,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -171,146 +184,62 @@ def build_base_agent_state(
 # ==============================================================================
 
 def _truncate_inline_text(value: object, max_chars: int = 180) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    limit = max(1, int(max_chars))
-    if len(raw) <= limit:
-        return raw
-    return f"{raw[: max(0, limit - 1)]}…"
+    return truncate_inline_text_shared(value, max_chars=max_chars)
 
 
 def _read_row_value(step_row: object, key: str):
-    if isinstance(step_row, dict):
-        return step_row.get(key)
-    try:
-        return step_row[key]
-    except (TypeError, IndexError, KeyError):
-        return None
+    return read_row_value_shared(step_row, key)
 
 
 def _extract_step_error_text(step_row: object) -> str:
-    direct = _truncate_inline_text(_read_row_value(step_row, "error"), 180)
-    if direct:
-        return direct
-
-    result_raw = str(_read_row_value(step_row, "result") or "").strip()
-    if not result_raw:
-        return ""
-
-    try:
-        parsed = json.loads(result_raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return _truncate_inline_text(result_raw, 180)
-
-    if isinstance(parsed, dict):
-        for key in ("error", "stderr", "message"):
-            picked = _truncate_inline_text(parsed.get(key), 180)
-            if picked:
-                return picked
-
-    return _truncate_inline_text(result_raw, 180)
+    return extract_step_error_text_shared(step_row, read_value=_read_row_value)
 
 
 def _build_failed_step_lines(task_id: int, run_id: int, max_items: int = 6) -> List[str]:
-    try:
-        rows = list_task_steps_for_run(task_id=int(task_id), run_id=int(run_id))
-    except NON_FATAL_STORAGE_ERRORS:
-        return []
-
-    lines: List[str] = []
-    for row in rows or []:
-        status = str(_read_row_value(row, "status") or "").strip().lower()
-        if status != "failed":
-            continue
-
-        step_order = _read_row_value(row, "step_order")
-        order_text = str(step_order) if step_order is not None else "?"
-        title = str(_read_row_value(row, "title") or "").strip()
-        error_text = _extract_step_error_text(row) or "未记录错误详情"
-
-        lines.append(f"- step#{order_text} {title or '(未命名步骤)'} -> {error_text}")
-        if len(lines) >= int(max_items):
-            break
-    return lines
+    return safe_collect_failed_step_lines(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        list_steps_for_run=list_task_steps_for_run,
+        read_value=_read_row_value,
+        handled_errors=NON_FATAL_STORAGE_ERRORS,
+        max_items=max_items,
+    )
 
 
 def _build_failure_debug_lines(task_id: int, run_id: int, max_items: int = 3) -> List[str]:
-    try:
-        rows = list_task_outputs_for_run(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            order="DESC",
-            limit=30,
-        )
-    except NON_FATAL_STORAGE_ERRORS:
-        return []
-
-    matched: List[str] = []
-    for row in rows or []:
-        output_type = str(_read_row_value(row, "output_type") or "").strip().lower()
-        if output_type != str(TASK_OUTPUT_TYPE_DEBUG):
-            continue
-        content = _truncate_inline_text(_read_row_value(row, "content"), 180)
-        if not content:
-            continue
-        lowered = content.lower()
-        if not any(
-            key in lowered
-            for key in ("failed", "error", "exception", "missing", "warning", "失败", "错误", "异常", "缺失")
-        ):
-            continue
-        matched.append(f"- {content}")
-        if len(matched) >= int(max_items):
-            break
-    return list(reversed(matched))
+    return safe_collect_failure_debug_lines(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        list_outputs_for_run=list_task_outputs_for_run,
+        debug_output_type=str(TASK_OUTPUT_TYPE_DEBUG),
+        read_value=_read_row_value,
+        handled_errors=NON_FATAL_STORAGE_ERRORS,
+        max_items=max_items,
+        limit=30,
+    )
 
 
 def _has_text_task_output(task_id: int, run_id: int) -> bool:
-    try:
-        rows = list_task_outputs_for_run(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            order="DESC",
-            limit=20,
-        )
-    except NON_FATAL_STORAGE_ERRORS:
-        return False
-
-    for row in rows or []:
-        output_type = str(_read_row_value(row, "output_type") or "").strip().lower()
-        if output_type != str(TASK_OUTPUT_TYPE_TEXT):
-            continue
-        content = str(_read_row_value(row, "content") or "").strip()
-        if content:
-            return True
-    return False
+    return safe_has_text_output(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        list_outputs_for_run=list_task_outputs_for_run,
+        text_output_type=str(TASK_OUTPUT_TYPE_TEXT),
+        read_value=_read_row_value,
+        handled_errors=NON_FATAL_STORAGE_ERRORS,
+        limit=20,
+    )
 
 
 def _build_failed_task_output_content(task_id: int, run_id: int) -> str:
     failed_steps = _build_failed_step_lines(task_id=int(task_id), run_id=int(run_id))
     debug_lines = _build_failure_debug_lines(task_id=int(task_id), run_id=int(run_id))
-    if not failed_steps:
-        failed_steps = ["- 无（可能在规划阶段或执行初始化阶段失败）"]
-    if not debug_lines:
-        debug_lines = ["- 无（未捕获到额外 debug 证据）"]
-    lines = [
-        "【失败总结】",
-        f"- task_id: {int(task_id)}",
-        f"- run_id: {int(run_id)}",
-        "- 结论：本次执行未完成，状态为 failed。",
-        "",
-        "[失败步骤]",
-        *failed_steps,
-        "",
-        "[关键证据]",
-        *debug_lines,
-        "",
-        "[建议下一步]",
-        "- 优先修复首个失败步骤，再重试执行。",
-        "- 若失败来自外部依赖，请补齐输入并增加校验步骤。",
-    ]
-    return "\n".join(lines).strip()
+    return build_failed_task_output_content_shared(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        failed_steps=failed_steps,
+        debug_lines=debug_lines,
+    )
 
 
 async def ensure_failed_task_output(
@@ -324,41 +253,21 @@ async def ensure_failed_task_output(
 
     说明：保留在本模块，便于单测通过 patch `execution_pipeline.*` 注入行为。
     """
-    if str(run_status) != str(RUN_STATUS_FAILED):
-        return
-
-    if _has_text_task_output(task_id=int(task_id), run_id=int(run_id)):
-        return
-
-    content = _build_failed_task_output_content(task_id=int(task_id), run_id=int(run_id))
-
-    try:
-        await asyncio.to_thread(
-            create_task_output,
-            task_id=int(task_id),
-            run_id=int(run_id),
-            output_type=str(TASK_OUTPUT_TYPE_TEXT),
-            content=content,
-        )
-        safe_write_debug(
-            task_id,
-            run_id,
-            message="agent.failed_output.injected",
-            data={"bytes": len(content)},
-            level="info",
-        )
-        try:
-            yield_func(sse_json({"delta": "【失败总结】已写入结构化失败报告。\n"}))
-        except BaseException:
-            pass
-    except NON_FATAL_STORAGE_ERRORS as exc:
-        safe_write_debug(
-            task_id,
-            run_id,
-            message="agent.failed_output.inject_failed",
-            data={"error": str(exc)},
-            level="warning",
-        )
+    await ensure_failed_task_output_shared(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        run_status=str(run_status),
+        run_status_failed=str(RUN_STATUS_FAILED),
+        yield_func=yield_func,
+        has_text_task_output_func=_has_text_task_output,
+        build_failed_task_output_content_func=_build_failed_task_output_content,
+        create_task_output_func=create_task_output,
+        task_output_type_text=str(TASK_OUTPUT_TYPE_TEXT),
+        safe_write_debug_func=safe_write_debug,
+        to_thread_func=asyncio.to_thread,
+        sse_json_func=sse_json,
+        handled_errors=NON_FATAL_STORAGE_ERRORS,
+    )
 
 
 async def handle_execution_exception(
@@ -394,8 +303,23 @@ async def handle_execution_exception(
         )
 
     suffix = f"（task_id={task_id} run_id={run_id}）" if task_id else ""
+    error_code = "agent_unhandled_exception"
+    user_message = format_task_error(
+        code=error_code,
+        message=f"{mode_prefix} 执行失败:{exc}{suffix}",
+    )
     try:
-        yield_func(sse_json({"message": f"{mode_prefix} 执行失败:{exc}{suffix}"}, event="error"))
+        yield_func(
+            sse_json(
+                {
+                    "message": user_message,
+                    "code": error_code,
+                    "task_id": task_id,
+                    "run_id": run_id,
+                },
+                event="error",
+            )
+        )
     except BaseException:
         pass
 

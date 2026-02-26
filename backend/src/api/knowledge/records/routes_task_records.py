@@ -2,6 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter
 
+from backend.src.api.tasks.route_common import task_not_found_response
 from backend.src.common.serializers import (
     eval_criterion_from_row,
     eval_from_row,
@@ -12,42 +13,108 @@ from backend.src.common.serializers import (
     task_step_from_row,
     tool_call_from_row,
 )
-from backend.src.common.utils import error_response
 from backend.src.constants import (
     DEFAULT_RECORDS_EXPORT_LIMIT,
-    ERROR_CODE_NOT_FOUND,
-    ERROR_MESSAGE_TASK_NOT_FOUND,
-    HTTP_STATUS_NOT_FOUND,
 )
-from backend.src.repositories.eval_repo import list_eval_criteria_by_eval_ids, list_eval_records_by_task
-from backend.src.repositories.llm_records_repo import list_llm_records, list_llm_records_for_task
-from backend.src.repositories.task_outputs_repo import (
-    list_task_outputs_for_run,
-    list_task_outputs_for_task,
-)
-from backend.src.repositories.task_runs_repo import (
-    get_task_run,
-    list_task_runs_for_task,
-)
-from backend.src.repositories.task_steps_repo import list_task_steps_for_run, list_task_steps_for_task
-from backend.src.repositories.tasks_repo import get_task
-from backend.src.repositories.tool_call_records_repo import (
+from backend.src.services.knowledge.knowledge_query import (
+    list_eval_criteria_by_eval_ids,
+    list_eval_records_by_task,
+    list_llm_records,
+    list_llm_records_for_task,
     list_tool_call_records,
     list_tool_call_records_for_task,
+)
+from backend.src.services.tasks.task_queries import (
+    get_task,
+    get_task_run,
+    list_task_outputs_for_run,
+    list_task_outputs_for_task,
+    list_task_runs_for_task,
+    list_task_steps_for_run,
+    list_task_steps_for_task,
 )
 
 router = APIRouter()
 
 
-@router.get("/records/tasks/{task_id}")
-def get_task_record(task_id: int):
+def _load_task_or_error(task_id: int):
     task_row = get_task(task_id=int(task_id))
     if not task_row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
+        return None, task_not_found_response()
+    return task_row, None
+
+
+def _append_timeline_items(
+    timeline: list,
+    rows: list,
+    *,
+    item_type: str,
+    serializer,
+    timestamp_fields: tuple[str, ...],
+) -> None:
+    for row in rows:
+        timestamp = None
+        for field in timestamp_fields:
+            value = row[field]
+            if value:
+                timestamp = value
+                break
+        timeline.append(
+            {
+                "type": item_type,
+                "timestamp": timestamp,
+                "data": serializer(row),
+            }
         )
+
+
+def _load_timeline_rows(task_id: int, run_id: Optional[int] = None):
+    if run_id is not None:
+        run_row = get_task_run(run_id=int(run_id))
+        run_rows = [run_row] if run_row and int(run_row["task_id"]) == int(task_id) else []
+        step_rows = list_task_steps_for_run(task_id=int(task_id), run_id=int(run_id))
+        output_rows = list_task_outputs_for_run(task_id=int(task_id), run_id=int(run_id), order="ASC")
+        llm_rows = list_llm_records(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            offset=0,
+            limit=DEFAULT_RECORDS_EXPORT_LIMIT,
+        )
+        tool_rows = list_tool_call_records(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            tool_id=None,
+            reuse_status=None,
+            offset=0,
+            limit=DEFAULT_RECORDS_EXPORT_LIMIT,
+        )
+        return run_rows, step_rows, output_rows, llm_rows, tool_rows
+
+    run_rows = list_task_runs_for_task(task_id=int(task_id))
+    step_rows = list_task_steps_for_task(task_id=int(task_id))
+    output_rows = list_task_outputs_for_task(task_id=int(task_id))
+    llm_rows = list_llm_records(
+        task_id=int(task_id),
+        run_id=None,
+        offset=0,
+        limit=DEFAULT_RECORDS_EXPORT_LIMIT,
+    )
+    tool_rows = list_tool_call_records(
+        task_id=int(task_id),
+        run_id=None,
+        tool_id=None,
+        reuse_status=None,
+        offset=0,
+        limit=DEFAULT_RECORDS_EXPORT_LIMIT,
+    )
+    return run_rows, step_rows, output_rows, llm_rows, tool_rows
+
+
+@router.get("/records/tasks/{task_id}")
+def get_task_record(task_id: int):
+    task_row, error = _load_task_or_error(task_id=int(task_id))
+    if error:
+        return error
 
     eval_rows = list_eval_records_by_task(task_id=int(task_id))
     eval_ids = [row["id"] for row in (eval_rows or [])]
@@ -71,96 +138,49 @@ def get_task_record(task_id: int):
 
 @router.get("/records/tasks/{task_id}/timeline")
 def get_task_timeline(task_id: int, run_id: Optional[int] = None) -> dict:
-    task_row = get_task(task_id=int(task_id))
-    if not task_row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+    task_row, error = _load_task_or_error(task_id=int(task_id))
+    if error:
+        return error
 
-    run_rows = []
-    if run_id is not None:
-        run_row = get_task_run(run_id=int(run_id))
-        if run_row and int(run_row["task_id"]) == int(task_id):
-            run_rows = [run_row]
-    else:
-        run_rows = list_task_runs_for_task(task_id=int(task_id))
-
-    if run_id is not None:
-        step_rows = list_task_steps_for_run(task_id=int(task_id), run_id=int(run_id))
-        output_rows = list_task_outputs_for_run(task_id=int(task_id), run_id=int(run_id), order="ASC")
-        llm_rows = list_llm_records(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            offset=0,
-            limit=DEFAULT_RECORDS_EXPORT_LIMIT,
-        )
-        tool_rows = list_tool_call_records(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            tool_id=None,
-            reuse_status=None,
-            offset=0,
-            limit=DEFAULT_RECORDS_EXPORT_LIMIT,
-        )
-    else:
-        step_rows = list_task_steps_for_task(task_id=int(task_id))
-        output_rows = list_task_outputs_for_task(task_id=int(task_id))
-        llm_rows = list_llm_records(
-            task_id=int(task_id),
-            run_id=None,
-            offset=0,
-            limit=DEFAULT_RECORDS_EXPORT_LIMIT,
-        )
-        tool_rows = list_tool_call_records(
-            task_id=int(task_id),
-            run_id=None,
-            tool_id=None,
-            reuse_status=None,
-            offset=0,
-            limit=DEFAULT_RECORDS_EXPORT_LIMIT,
-        )
+    run_rows, step_rows, output_rows, llm_rows, tool_rows = _load_timeline_rows(
+        task_id=int(task_id),
+        run_id=run_id,
+    )
     timeline = []
-    for row in run_rows:
-        timeline.append(
-            {
-                "type": "run",
-                "timestamp": row["started_at"] or row["created_at"],
-                "data": task_run_from_row(row),
-            }
-        )
-    for row in step_rows:
-        timeline.append(
-            {
-                "type": "step",
-                "timestamp": row["started_at"] or row["created_at"],
-                "data": task_step_from_row(row),
-            }
-        )
-    for row in llm_rows:
-        timeline.append(
-            {
-                "type": "llm",
-                "timestamp": row["started_at"] or row["created_at"],
-                "data": llm_record_from_row(row),
-            }
-        )
-    for row in tool_rows:
-        timeline.append(
-            {
-                "type": "tool",
-                "timestamp": row["created_at"],
-                "data": tool_call_from_row(row),
-            }
-        )
-    for row in output_rows:
-        timeline.append(
-            {
-                "type": "output",
-                "timestamp": row["created_at"],
-                "data": task_output_from_row(row),
-            }
-        )
+    _append_timeline_items(
+        timeline,
+        run_rows,
+        item_type="run",
+        serializer=task_run_from_row,
+        timestamp_fields=("started_at", "created_at"),
+    )
+    _append_timeline_items(
+        timeline,
+        step_rows,
+        item_type="step",
+        serializer=task_step_from_row,
+        timestamp_fields=("started_at", "created_at"),
+    )
+    _append_timeline_items(
+        timeline,
+        llm_rows,
+        item_type="llm",
+        serializer=llm_record_from_row,
+        timestamp_fields=("started_at", "created_at"),
+    )
+    _append_timeline_items(
+        timeline,
+        tool_rows,
+        item_type="tool",
+        serializer=tool_call_from_row,
+        timestamp_fields=("created_at",),
+    )
+    _append_timeline_items(
+        timeline,
+        output_rows,
+        item_type="output",
+        serializer=task_output_from_row,
+        timestamp_fields=("created_at",),
+    )
     timeline.sort(key=lambda item: item["timestamp"] or "")
     return {"task": task_from_row(task_row), "items": timeline}

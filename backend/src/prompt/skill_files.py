@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.src.common.utils import parse_positive_int
 from backend.src.prompt.paths import skills_prompt_dir
 
 
@@ -170,16 +171,6 @@ def _as_json_list(value: Any) -> List[Any]:
     return [value]
 
 
-def _as_optional_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        iv = int(value)
-    except Exception:
-        return None
-    return iv if iv > 0 else None
-
-
 def _normalize_skill_type(value: Any) -> Optional[str]:
     t = str(value or "").strip().lower()
     if not t:
@@ -226,8 +217,8 @@ def normalize_skill_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     domain_id = str(meta.get("domain_id") or meta.get("domain") or "").strip() or None
     skill_type = _normalize_skill_type(meta.get("skill_type") or meta.get("type")) or "methodology"
     status = _normalize_skill_status(meta.get("status")) or "approved"
-    source_task_id = _as_optional_int(meta.get("source_task_id"))
-    source_run_id = _as_optional_int(meta.get("source_run_id"))
+    source_task_id = parse_positive_int(meta.get("source_task_id"), default=None)
+    source_run_id = parse_positive_int(meta.get("source_run_id"), default=None)
 
     return {
         "name": name,

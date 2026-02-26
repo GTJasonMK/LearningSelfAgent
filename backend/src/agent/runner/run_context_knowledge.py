@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from backend.src.agent.core.run_context import AgentRunContext
+from backend.src.common.utils import parse_positive_int
 
 
 def _extract_positive_int_ids(items: List[dict]) -> List[int]:
@@ -15,13 +16,9 @@ def _extract_positive_int_ids(items: List[dict]) -> List[int]:
     for item in items or []:
         if not isinstance(item, dict):
             continue
-        raw = item.get("id")
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            ids.append(int(value))
+        value = parse_positive_int(item.get("id"), default=None)
+        if value is not None:
+            ids.append(value)
     return ids
 
 
@@ -41,7 +38,5 @@ def apply_knowledge_identity_to_run_ctx(
     run_ctx.set_extra("solution_ids", _extract_positive_int_ids(list(solutions or [])))
     run_ctx.set_extra(
         "draft_solution_id",
-        int(draft_solution_id)
-        if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0
-        else None,
+        parse_positive_int(draft_solution_id, default=None),
     )

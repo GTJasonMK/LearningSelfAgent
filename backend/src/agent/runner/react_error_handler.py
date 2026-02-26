@@ -7,56 +7,75 @@ ReAct 循环错误处理模块。
 
 import json
 import logging
+import re
 from typing import Callable, Dict, Generator, List, Optional, Tuple
 
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.support import _truncate_observation
+from backend.src.agent.runner.react_error_policy import should_force_replan_on_action_error
 from backend.src.agent.runner.react_state_manager import (
     ReplanContext,
     prepare_replan_context,
     persist_loop_state,
+    resolve_executor,
 )
 from backend.src.agent.runner.plan_events import sse_plan, sse_plan_delta
 from backend.src.agent.runner.react_step_executor import record_invalid_action_step
 from backend.src.constants import (
+    AGENT_REACT_REPEAT_FAILURE_MAX,
     RUN_STATUS_FAILED,
     STREAM_TAG_EXEC,
     STREAM_TAG_FAIL,
 )
+from backend.src.common.utils import coerce_int
+from backend.src.common.task_error_codes import extract_task_error_code
 from backend.src.services.llm.llm_client import sse_json
 
 logger = logging.getLogger(__name__)
 
 
-def should_force_replan_on_action_error(error_text: str) -> bool:
-    """
-    判断是否应该因 action 错误强制触发 replan。
+def _normalize_failure_signature(*, action_type: str, step_error: str) -> str:
+    action = str(action_type or "").strip().lower() or "unknown_action"
+    error_text = str(step_error or "").strip()
+    error_code = extract_task_error_code(error_text)
+    if error_code:
+        return f"{action}|code:{error_code}"
 
-    Args:
-        error_text: 错误文本
+    head = error_text.splitlines()[0].strip() if error_text else "unknown_error"
+    lowered = head.lower()
+    # 归一化路径/日期/数字，减少“同类错误因动态文本不同”导致的签名漂移。
+    lowered = re.sub(r"[a-z]:\\\\[^\\s]+", "<path>", lowered)
+    lowered = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "<date>", lowered)
+    lowered = re.sub(r"\b\d+\b", "<n>", lowered)
+    lowered = " ".join(lowered.split())
+    if not lowered:
+        lowered = "unknown_error"
+    return f"{action}|msg:{lowered[:180]}"
 
-    Returns:
-        是否应该强制 replan
-    """
-    try:
-        return any(
-            key in error_text
-            for key in (
-                "tool_call.input 不能为空",
-                "action 输出不是有效 JSON",
-                "action.payload 不是对象",
-                "action.type 不能为空",
-                "LLM调用失败",
-                "Connection error",
-                "Read timed out",
-                "timeout",
-                "csv_artifact_quality_failed",
-                "高风险单行控制流 python -c",
-                "complex python -c requires file_write script",
-            )
-        )
-    except Exception:
-        return False
+
+def _record_failure_signature(*, agent_state: Dict, action_type: str, step_error: str) -> tuple[str, int]:
+    signature = _normalize_failure_signature(action_type=action_type, step_error=step_error)
+    stats = agent_state.get("failure_signatures") if isinstance(agent_state, dict) else None
+    if not isinstance(stats, dict):
+        stats = {}
+
+    existing = stats.get(signature)
+    if isinstance(existing, dict):
+        count = coerce_int(existing.get("count"), default=0) + 1
+    else:
+        count = 1
+
+    stats[signature] = {"count": coerce_int(count, default=1)}
+
+    # 防止状态无限膨胀：仅保留最近 20 个错误签名。
+    if len(stats) > 20:
+        removable = [k for k in stats.keys() if k != signature]
+        for key in removable[: max(0, len(stats) - 20)]:
+            stats.pop(key, None)
+
+    agent_state["failure_signatures"] = stats
+    return signature, coerce_int(count, default=1)
+
 
 
 def handle_action_invalid(
@@ -122,25 +141,7 @@ def handle_action_invalid(
     )
 
     # 记录失败步骤
-    executor_value = None
-    try:
-        assignments = agent_state.get("executor_assignments") if isinstance(agent_state, dict) else None
-        if isinstance(assignments, list):
-            for a in assignments:
-                if not isinstance(a, dict):
-                    continue
-                raw_order = a.get("step_order")
-                try:
-                    order_value = int(raw_order)
-                except Exception:
-                    continue
-                if order_value != int(step_order):
-                    continue
-                ev = str(a.get("executor") or "").strip()
-                executor_value = ev or None
-                break
-    except Exception:
-        executor_value = None
+    executor_value = resolve_executor(agent_state, step_order)
 
     record_invalid_action_step(
         task_id=task_id,
@@ -274,9 +275,9 @@ def handle_allow_failure(
     """
     will_continue = step_order < plan_struct.step_count
 
-    # 更新计划栏状态
-    plan_struct.set_step_status(step_order - 1, "failed")
-    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[step_order - 1])
+    # 更新计划栏状态（与 handle_action_invalid / handle_step_failure 保持一致：使用 idx 而非 step_order-1）
+    plan_struct.set_step_status(idx, "failed")
+    yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
 
     yield sse_json({"delta": f"{STREAM_TAG_FAIL} {allow_err or 'action.type 不在 allow 内'}\n"})
 
@@ -306,9 +307,46 @@ def handle_allow_failure(
     )
 
     if will_continue:
+        # 统一策略：优先尝试 replan 修复（与 handle_step_failure 保持一致），
+        # 避免 allow 失败后盲目跳下一步导致连锁失败。
+        replan_ctx = prepare_replan_context(
+            step_order=step_order,
+            agent_state=agent_state,
+            max_steps_limit=max_steps_limit,
+            plan_titles=plan_struct.get_titles(),
+        )
+
+        if replan_ctx.can_replan:
+            replan_result = yield from run_replan_and_merge(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message=message,
+                workdir=workdir,
+                model=model,
+                react_params=react_params,
+                max_steps_value=replan_ctx.max_steps_value,
+                tools_hint=tools_hint,
+                skills_hint=skills_hint,
+                memories_hint=memories_hint,
+                graph_hint=graph_hint,
+                plan_struct=plan_struct,
+                agent_state=agent_state,
+                observations=observations,
+                done_count=replan_ctx.done_count,
+                error=str(allow_err or "allow_failed"),
+                sse_notice=f"{STREAM_TAG_EXEC} allow 约束未满足，重新规划剩余步骤…",
+                replan_attempts=replan_ctx.replan_attempts,
+                safe_write_debug=safe_write_debug,
+            )
+
+            if replan_result:
+                plan_struct.replace_from(replan_result.plan_struct)
+                return "", replan_ctx.done_count
+
+        # replan 不可用或失败，降级跳下一步
         return "", idx + 1
 
-    # 尝试 replan
+    # 计划耗尽，尝试 replan
     replan_ctx = prepare_replan_context(
         step_order=step_order,
         agent_state=agent_state,
@@ -381,6 +419,20 @@ def handle_step_failure(
         (run_status, next_idx)
     """
     will_continue = step_order < plan_struct.step_count
+    failure_signature, failure_hit_count = _record_failure_signature(
+        agent_state=agent_state,
+        action_type=str(action_type or ""),
+        step_error=str(step_error or ""),
+    )
+    repeat_failure_limit = coerce_int(AGENT_REACT_REPEAT_FAILURE_MAX, default=0)
+    if repeat_failure_limit < 0:
+        repeat_failure_limit = 0
+    repeat_failure_exceeded = repeat_failure_limit > 0 and coerce_int(
+        failure_hit_count, default=0
+    ) >= repeat_failure_limit
+    if repeat_failure_exceeded:
+        agent_state["critical_failure"] = True
+        agent_state["critical_failure_reason"] = "repeat_failure_budget_exceeded"
 
     safe_write_debug(
         task_id=int(task_id),
@@ -393,6 +445,10 @@ def handle_step_failure(
             "action_type": action_type,
             "error": step_error,
             "will_continue": bool(will_continue),
+            "failure_signature": failure_signature,
+            "failure_hit_count": coerce_int(failure_hit_count, default=0),
+            "failure_budget": coerce_int(repeat_failure_limit, default=0),
+            "failure_budget_exceeded": bool(repeat_failure_exceeded),
         },
         level="warning",
     )
@@ -427,6 +483,30 @@ def handle_step_failure(
         # 步骤失败结算必须落盘：避免节流吞掉 failed 状态，影响可恢复性。
         force=True,
     )
+
+    if repeat_failure_exceeded:
+        safe_write_debug(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            message="agent.failure_budget.exceeded",
+            data={
+                "signature": failure_signature,
+                "count": int(failure_hit_count),
+                "budget": int(repeat_failure_limit),
+                "step_order": int(step_order),
+                "action_type": str(action_type or ""),
+            },
+            level="warning",
+        )
+        yield sse_json(
+            {
+                "delta": (
+                    f"{STREAM_TAG_FAIL} 同类失败已连续出现 {int(failure_hit_count)} 次，"
+                    "停止自动重试并终止本轮执行。\n"
+                )
+            }
+        )
+        return RUN_STATUS_FAILED, None
 
     # 失败后优先尝试 replan
     if will_continue:

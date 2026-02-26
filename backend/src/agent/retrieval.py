@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from backend.src.actions.registry import normalize_action_type
 from backend.src.agent.json_utils import _extract_json_object
+from backend.src.common.utils import coerce_int
 from backend.src.constants import (
     AGENT_DOMAIN_PICK_CANDIDATE_LIMIT,
     AGENT_DOMAIN_PICK_MAX_DOMAINS,
@@ -36,12 +37,46 @@ from backend.src.constants import (
     SKILL_COMPOSE_PROMPT_TEMPLATE,
     SKILL_DRAFT_PROMPT_TEMPLATE,
 )
-from backend.src.repositories import agent_retrieval_repo
+from backend.src.services.knowledge.query import retrieval as retrieval_query
 from backend.src.services.llm.llm_client import call_openai
 
 _RETRIEVAL_LLM_CACHE_LOCK = threading.Lock()
 # key -> (expires_at_monotonic, text, tokens)
 _RETRIEVAL_LLM_CACHE: Dict[str, Tuple[float, Optional[str], Optional[dict]]] = {}
+
+
+def _to_positive_int(value: Any) -> Optional[int]:
+    parsed = coerce_int(value, default=0)
+    return parsed if parsed > 0 else None
+
+
+def _collect_positive_ids(values: List[Any], *, limit: Optional[int] = None) -> List[int]:
+    out: List[int] = []
+    seen = set()
+    max_items = coerce_int(limit, default=0) if limit is not None else 0
+    for raw in values or []:
+        item_id = _to_positive_int(raw)
+        if item_id is None or item_id in seen:
+            continue
+        seen.add(item_id)
+        out.append(item_id)
+        if max_items > 0 and len(out) >= max_items:
+            break
+    return out
+
+
+def _collect_positive_ids_from_items(
+    items: List[dict],
+    *,
+    key: str = "id",
+    limit: Optional[int] = None,
+) -> List[int]:
+    values: List[Any] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        values.append(item.get(key))
+    return _collect_positive_ids(values, limit=limit)
 
 
 def _cached_call_openai(
@@ -59,14 +94,8 @@ def _cached_call_openai(
     - key 维度包含 DB 路径与 prompt_root，避免测试/多实例串扰
     - TTL/max_entries 由常量控制；<=0 时自动禁用
     """
-    try:
-        ttl = int(AGENT_RETRIEVAL_LLM_CACHE_TTL_SECONDS or 0)
-    except Exception:
-        ttl = 0
-    try:
-        max_entries = int(AGENT_RETRIEVAL_LLM_CACHE_MAX_ENTRIES or 0)
-    except Exception:
-        max_entries = 0
+    ttl = coerce_int(AGENT_RETRIEVAL_LLM_CACHE_TTL_SECONDS or 0, default=0)
+    max_entries = coerce_int(AGENT_RETRIEVAL_LLM_CACHE_MAX_ENTRIES or 0, default=0)
     if ttl <= 0 or max_entries <= 0:
         return call_openai(prompt, model, params)
 
@@ -122,7 +151,7 @@ def _list_tool_hints(limit: int = 8) -> str:
     提供给 LLM 的工具清单提示：鼓励优先使用 tool_call 而不是"纯 llm_call 瞎编"。
     """
     try:
-        items = agent_retrieval_repo.list_tool_hints(limit=limit)
+        items = retrieval_query.list_tool_hints(limit=limit)
         if not items:
             return "(无)"
         lines = []
@@ -138,7 +167,7 @@ def _list_tool_hints(limit: int = 8) -> str:
 
 def _list_domain_candidates(limit: int = 20) -> List[dict]:
     """读取领域候选集。"""
-    return agent_retrieval_repo.list_domain_candidates(limit=limit)
+    return retrieval_query.list_domain_candidates(limit=limit)
 
 
 def _format_domain_candidates_for_prompt(items: List[dict]) -> str:
@@ -229,14 +258,14 @@ def _list_skill_candidates(
 ) -> List[dict]:
     """读取技能候选集，支持按领域筛选。"""
     if domain_ids:
-        return agent_retrieval_repo.list_skill_candidates_by_domains(
+        return retrieval_query.list_skill_candidates_by_domains(
             domain_ids=domain_ids,
             limit=limit,
             query_text=query_text,
             debug=debug,
             skill_type=skill_type,
         )
-    return agent_retrieval_repo.list_skill_candidates(
+    return retrieval_query.list_skill_candidates(
         limit=limit,
         query_text=query_text,
         debug=debug,
@@ -271,7 +300,7 @@ def _format_skill_candidates_for_prompt(items: List[dict]) -> str:
 
 
 def _load_skills_by_ids(skill_ids: List[int]) -> List[dict]:
-    return agent_retrieval_repo.load_skills_by_ids(skill_ids)
+    return retrieval_query.load_skills_by_ids(skill_ids)
 
 
 def _format_skills_for_prompt(skills: List[dict], max_steps_per_skill: int = 6) -> str:
@@ -321,7 +350,7 @@ def _list_memory_candidates(
     - 相关性优先：FTS5
     - 兜底：最近 memories
     """
-    return agent_retrieval_repo.list_memory_candidates(limit=limit, query_text=query_text, debug=debug)
+    return retrieval_query.list_memory_candidates(limit=limit, query_text=query_text, debug=debug)
 
 
 def _format_memory_candidates_for_prompt(items: List[dict]) -> str:
@@ -404,23 +433,15 @@ def _select_relevant_memories(
 
     by_id: dict[int, dict] = {}
     for it in candidates:
-        if not isinstance(it, dict) or it.get("id") is None:
+        if not isinstance(it, dict):
             continue
-        try:
-            mid = int(it.get("id"))
-        except Exception:
+        mid = _to_positive_int(it.get("id"))
+        if mid is None or mid in by_id:
             continue
-        if mid > 0 and mid not in by_id:
-            by_id[mid] = it
+        by_id[mid] = it
 
     selected: List[dict] = []
-    for raw in ids_raw:
-        try:
-            mid = int(raw)
-        except Exception:
-            continue
-        if mid <= 0:
-            continue
+    for mid in _collect_positive_ids(ids_raw):
         item = by_id.get(mid)
         if not item:
             continue
@@ -468,18 +489,7 @@ def _select_relevant_skills(
     ids_raw = obj.get("skill_ids")
     if not isinstance(ids_raw, list):
         return []
-    selected: List[int] = []
-    for item in ids_raw:
-        try:
-            sid = int(item)
-        except Exception:
-            continue
-        if sid <= 0:
-            continue
-        if sid not in selected:
-            selected.append(sid)
-        if len(selected) >= AGENT_SKILL_PICK_MAX_SKILLS:
-            break
+    selected = _collect_positive_ids(ids_raw, limit=AGENT_SKILL_PICK_MAX_SKILLS)
     return _load_skills_by_ids(selected)
 
 
@@ -507,21 +517,21 @@ def _list_solution_candidates(
     读取方案候选集（Solution=skills_items.skill_type='solution'），支持按领域筛选。
     """
     if domain_ids:
-        return agent_retrieval_repo.list_skill_candidates_by_domains(
+        return retrieval_query.list_skill_candidates_by_domains(
             domain_ids=domain_ids,
             limit=limit,
             query_text=query_text,
             debug=debug,
             skill_type="solution",
         )
-    return agent_retrieval_repo.list_skill_candidates(
+    return retrieval_query.list_skill_candidates(
         limit=limit, query_text=query_text, debug=debug, skill_type="solution"
     )
 
 
 def _load_solutions_by_ids(solution_ids: List[int]) -> List[dict]:
     # 复用 skills_items 表：Solution 与 Skill 共享同一张表
-    return agent_retrieval_repo.load_skills_by_ids(solution_ids)
+    return retrieval_query.load_skills_by_ids(solution_ids)
 
 
 def _select_relevant_solutions(
@@ -544,22 +554,13 @@ def _select_relevant_solutions(
     - 为了与 docs/agent 对齐，方案会在 tags 中记录 skills_used（skill:{id}），便于按技能匹配；
     - 若缺少该类 tag（历史数据/老版本），则回退为 “message + 技能名” 的 query_text 提高召回。
     """
-    max_pick = int(max_solutions) if isinstance(max_solutions, int) and int(max_solutions) > 0 else int(AGENT_SOLUTION_PICK_MAX_SOLUTIONS)
+    max_pick = coerce_int(max_solutions, default=0) if isinstance(max_solutions, int) else 0
+    if max_pick <= 0:
+        max_pick = coerce_int(AGENT_SOLUTION_PICK_MAX_SOLUTIONS, default=4)
+    if max_pick <= 0:
+        max_pick = 4
 
-    skill_ids: List[int] = []
-    for s in skills or []:
-        if not isinstance(s, dict) or s.get("id") is None:
-            continue
-        try:
-            sid = int(s.get("id"))
-        except Exception:
-            continue
-        if sid <= 0:
-            continue
-        if sid not in skill_ids:
-            skill_ids.append(sid)
-        if len(skill_ids) >= 20:
-            break
+    skill_ids = _collect_positive_ids_from_items(skills or [], limit=20)
     skill_tags = [f"skill:{sid}" for sid in skill_ids]
 
     merged_candidates: List[dict] = []
@@ -567,13 +568,12 @@ def _select_relevant_solutions(
 
     def _merge_candidates(items: List[dict]) -> None:
         for it in items or []:
-            if not isinstance(it, dict) or it.get("id") is None:
+            if not isinstance(it, dict):
                 continue
-            try:
-                cid = int(it.get("id"))
-            except Exception:
+            cid = _to_positive_int(it.get("id"))
+            if cid is None:
                 continue
-            if cid <= 0 or cid in by_id:
+            if cid in by_id:
                 continue
             by_id[cid] = it
             merged_candidates.append(it)
@@ -581,9 +581,9 @@ def _select_relevant_solutions(
     # 1) 优先用 skill tag 匹配（更准）
     if skill_tags:
         try:
-            tag_candidates = agent_retrieval_repo.list_solution_candidates_by_skill_tags(
+            tag_candidates = retrieval_query.list_solution_candidates_by_skill_tags(
                 skill_tags=skill_tags,
-                limit=int(AGENT_SOLUTION_PICK_CANDIDATE_LIMIT),
+                limit=coerce_int(AGENT_SOLUTION_PICK_CANDIDATE_LIMIT, default=30),
                 domain_ids=domain_ids,
                 debug=debug,
             )
@@ -606,12 +606,7 @@ def _select_relevant_solutions(
 
     # 候选很少时跳过 LLM 精选
     if len(merged_candidates) <= max_pick:
-        ids = []
-        for it in merged_candidates[:max_pick]:
-            try:
-                ids.append(int(it.get("id")))
-            except Exception:
-                continue
+        ids = _collect_positive_ids_from_items(merged_candidates[:max_pick])
         return _load_solutions_by_ids(ids)
 
     candidates_text = _format_skill_candidates_for_prompt(merged_candidates)
@@ -639,16 +634,16 @@ def _select_relevant_solutions(
             merged_candidates,
             key=lambda it: (
                 _match_count(it),
-                int(it.get("id") or 0),
+                coerce_int(it.get("id") or 0, default=0),
             ),
             reverse=True,
         )
         fallback_ids = []
         for it in ranked[:max_pick]:
-            try:
-                fallback_ids.append(int(it.get("id")))
-            except Exception:
+            sid = coerce_int(it.get("id"), default=0)
+            if sid <= 0:
                 continue
+            fallback_ids.append(sid)
         if isinstance(debug, dict):
             debug["llm_pick_fallback"] = True
             debug["llm_pick_error"] = str(pick_err or "empty_response")
@@ -662,10 +657,10 @@ def _select_relevant_solutions(
             debug["llm_pick_error"] = "invalid_json"
         fallback_ids = []
         for it in merged_candidates[:max_pick]:
-            try:
-                fallback_ids.append(int(it.get("id")))
-            except Exception:
+            sid = coerce_int(it.get("id"), default=0)
+            if sid <= 0:
                 continue
+            fallback_ids.append(sid)
         return _load_solutions_by_ids(fallback_ids)
 
     ids_raw = obj.get("solution_ids")
@@ -673,26 +668,10 @@ def _select_relevant_solutions(
         if isinstance(debug, dict):
             debug["llm_pick_fallback"] = True
             debug["llm_pick_error"] = "missing_solution_ids"
-        fallback_ids = []
-        for it in merged_candidates[:max_pick]:
-            try:
-                fallback_ids.append(int(it.get("id")))
-            except Exception:
-                continue
+        fallback_ids = _collect_positive_ids_from_items(merged_candidates[:max_pick])
         return _load_solutions_by_ids(fallback_ids)
 
-    selected: List[int] = []
-    for item in ids_raw:
-        try:
-            sid = int(item)
-        except Exception:
-            continue
-        if sid <= 0:
-            continue
-        if sid not in selected:
-            selected.append(sid)
-        if len(selected) >= max_pick:
-            break
+    selected = _collect_positive_ids(ids_raw, limit=max_pick)
 
     return _load_solutions_by_ids(selected)
 
@@ -797,10 +776,7 @@ def _collect_tools_from_solutions(
     - 先把方案中提到的工具排在最前（若工具存在且已批准）
     - 再用“已注册工具清单”补齐到 limit
     """
-    try:
-        limit_value = int(limit)
-    except Exception:
-        limit_value = 8
+    limit_value = coerce_int(limit, default=8)
     if limit_value <= 0:
         limit_value = 8
 
@@ -811,7 +787,7 @@ def _collect_tools_from_solutions(
 
     if tool_names:
         try:
-            prioritized = agent_retrieval_repo.list_tool_hints_by_names(names=tool_names, limit=limit_value)
+            prioritized = retrieval_query.list_tool_hints_by_names(names=tool_names, limit=limit_value)
         except Exception:
             prioritized = []
         for it in prioritized:
@@ -825,7 +801,7 @@ def _collect_tools_from_solutions(
 
     if len(items) < limit_value:
         try:
-            fallback = agent_retrieval_repo.list_tool_hints(limit=max(limit_value * 4, 16))
+            fallback = retrieval_query.list_tool_hints(limit=max(limit_value * 4, 16))
         except Exception:
             fallback = []
         for it in fallback:
@@ -889,7 +865,7 @@ def _list_graph_candidates(message: str, limit: int) -> List[dict]:
     - 再补充最近节点（避免无命中时完全为空）
     """
     terms = _extract_graph_terms(message, limit=6)
-    return agent_retrieval_repo.list_graph_candidates(terms=terms, limit=limit)
+    return retrieval_query.list_graph_candidates(terms=terms, limit=limit)
 
 
 def _format_graph_candidates_for_prompt(items: List[dict]) -> str:
@@ -917,14 +893,14 @@ def _format_graph_candidates_for_prompt(items: List[dict]) -> str:
 
 
 def _load_graph_nodes_by_ids(node_ids: List[int]) -> List[dict]:
-    return agent_retrieval_repo.load_graph_nodes_by_ids(node_ids)
+    return retrieval_query.load_graph_nodes_by_ids(node_ids)
 
 
 def _load_graph_edges_between(node_ids: List[int], limit: int = 24) -> List[dict]:
     """
     只加载“候选节点集合内部”的边（避免边无限膨胀）。
     """
-    return agent_retrieval_repo.load_graph_edges_between(node_ids=node_ids, limit=limit)
+    return retrieval_query.load_graph_edges_between(node_ids=node_ids, limit=limit)
 
 
 def _format_graph_for_prompt(nodes: List[dict]) -> str:
@@ -933,15 +909,22 @@ def _format_graph_for_prompt(nodes: List[dict]) -> str:
     """
     if not nodes:
         return "(无)"
-    id_list = [int(n.get("id")) for n in nodes if n.get("id") is not None]
-    label_map = {
-        int(n.get("id")): str(n.get("label") or "")
-        for n in nodes
-        if n.get("id") is not None
-    }
+    id_list: List[int] = []
+    label_map: Dict[int, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = _to_positive_int(node.get("id"))
+        if node_id is None:
+            continue
+        if node_id not in label_map:
+            id_list.append(node_id)
+        label_map[node_id] = str(node.get("label") or "")
 
     lines: List[str] = []
     for node in nodes:
+        if not isinstance(node, dict):
+            continue
         nid = node.get("id")
         label = str(node.get("label") or "").strip()
         node_type = str(node.get("node_type") or "").strip()
@@ -952,8 +935,12 @@ def _format_graph_for_prompt(nodes: List[dict]) -> str:
     if edges:
         lines.append("关系:")
         for edge in edges:
-            src = label_map.get(int(edge.get("source")), str(edge.get("source")))
-            tgt = label_map.get(int(edge.get("target")), str(edge.get("target")))
+            if not isinstance(edge, dict):
+                continue
+            src_id = _to_positive_int(edge.get("source"))
+            tgt_id = _to_positive_int(edge.get("target"))
+            src = label_map.get(src_id, str(edge.get("source")))
+            tgt = label_map.get(tgt_id, str(edge.get("target")))
             rel = str(edge.get("relation") or "").strip()
             if not rel:
                 continue
@@ -992,18 +979,7 @@ def _select_relevant_graph_nodes(message: str, model: str, parameters: Optional[
     ids_raw = obj.get("node_ids")
     if not isinstance(ids_raw, list):
         return []
-    selected_ids: List[int] = []
-    for item in ids_raw:
-        try:
-            nid = int(item)
-        except Exception:
-            continue
-        if nid <= 0:
-            continue
-        if nid not in selected_ids:
-            selected_ids.append(nid)
-        if len(selected_ids) >= AGENT_GRAPH_PICK_MAX_NODES:
-            break
+    selected_ids = _collect_positive_ids(ids_raw, limit=AGENT_GRAPH_PICK_MAX_NODES)
     return _load_graph_nodes_by_ids(selected_ids)
 
 
@@ -1264,10 +1240,7 @@ def _draft_solution_from_skills(
             error="无可用技能草拟方案",
         )
 
-    try:
-        max_steps_value = int(max_steps)
-    except Exception:
-        max_steps_value = 8
+    max_steps_value = coerce_int(max_steps, default=8)
     if max_steps_value <= 0:
         max_steps_value = 8
     if max_steps_value > 20:
@@ -1546,11 +1519,7 @@ def _compose_skills(
     # 验证和清理 source_skill_ids
     source_skill_ids: List[int] = []
     if isinstance(source_skills_raw, list):
-        for sid in source_skills_raw:
-            try:
-                source_skill_ids.append(int(sid))
-            except (TypeError, ValueError):
-                continue
+        source_skill_ids = _collect_positive_ids(source_skills_raw)
 
     if not name:
         return ComposedSkillResult(

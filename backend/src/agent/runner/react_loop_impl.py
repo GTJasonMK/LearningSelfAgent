@@ -9,20 +9,20 @@ ReAct 执行循环核心实现。
 """
 
 import json
-import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, Generator, List, Optional, Tuple
 
-from backend.src.actions.registry import action_types_line
 from backend.src.agent.support import (
     _truncate_observation,
     apply_next_step_patch,
 )
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_helpers import (
+    build_react_step_prompt,
     call_llm_for_text,
     validate_and_normalize_action_text,
 )
+from backend.src.agent.runner.capability_router import build_capability_hint, resolve_step_capability
 from backend.src.agent.runner.feedback import is_task_feedback_step_title
 from backend.src.agent.runner.react_feedback_flow import (
     handle_task_feedback_step,
@@ -34,6 +34,7 @@ from backend.src.agent.runner.react_replan import run_replan_and_merge
 from backend.src.agent.runner.react_state_manager import (
     persist_loop_state,
     persist_plan_only,
+    resolve_executor,
 )
 from backend.src.agent.runner.react_step_executor import (
     generate_action_with_retry,
@@ -48,33 +49,30 @@ from backend.src.agent.runner.react_error_handler import (
     handle_allow_failure,
     handle_step_failure,
 )
+from backend.src.agent.source_failure_summary import summarize_recent_source_failures_for_prompt
 from backend.src.common.utils import now_iso
 from backend.src.constants import (
     ACTION_TYPE_MEMORY_WRITE,
     ACTION_TYPE_TASK_OUTPUT,
     ACTION_TYPE_USER_PROMPT,
     ACTION_TYPE_LLM_CALL,
-    ASSISTANT_OUTPUT_STYLE_GUIDE,
-    AGENT_EXPERIMENT_DIR_REL,
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
+    RUN_STATUS_STOPPED,
     STEP_STATUS_RUNNING,
     STREAM_TAG_FAIL,
     STREAM_TAG_OK,
     STREAM_TAG_STEP,
-    AGENT_REACT_STEP_PROMPT_TEMPLATE,
 )
-from backend.src.services.debug.debug_output import write_task_debug_output
+from backend.src.services.debug.safe_debug import safe_write_debug as _safe_write_debug
 from backend.src.services.llm.llm_client import sse_json
-from backend.src.repositories.task_steps_repo import (
+from backend.src.services.tasks.task_queries import (
     TaskStepCreateParams,
     create_task_step,
+    get_task_run,
     mark_task_step_done,
     mark_task_step_failed,
 )
-
-logger = logging.getLogger(__name__)
-
 
 @dataclass
 class ReactLoopResult:
@@ -82,29 +80,6 @@ class ReactLoopResult:
     run_status: str
     last_step_order: int
     plan_struct: Optional[PlanStructure] = None
-
-
-def _safe_write_debug(
-    *,
-    task_id: int,
-    run_id: int,
-    message: str,
-    data: Optional[dict] = None,
-    level: str = "debug",
-) -> None:
-    """
-    写入调试输出的"保险丝"：调试日志本身不应影响主链路。
-    """
-    try:
-        write_task_debug_output(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            message=message,
-            data=data if isinstance(data, dict) else None,
-            level=level,
-        )
-    except Exception:
-        logger.exception("write_task_debug_output failed: %s", message)
 
 
 def _enforce_allow_constraints(
@@ -167,6 +142,24 @@ def _enforce_allow_constraints(
         return None, None, None, f"action.type 不在 allow 内（allow={allowed_text} got={forced_type}）"
 
     return forced_obj, forced_type, forced_payload or {}, None
+
+
+def _is_run_stopped(*, run_id: int) -> bool:
+    """
+    读取 run 实时状态，检测是否已被外部取消收敛到 stopped。
+
+    说明：
+    - SSE 断连后，生命周期线程会把 run 标记为 stopped；
+    - 执行循环需要尽快感知并停止，避免“取消后继续落步骤”。
+    """
+    try:
+        row = get_task_run(run_id=int(run_id))
+    except Exception:
+        return False
+    if not row:
+        return False
+    status = str(row["status"] or "").strip().lower()
+    return status == str(RUN_STATUS_STOPPED)
 
 
 def run_react_loop_impl(
@@ -232,6 +225,17 @@ def run_react_loop_impl(
 
     # 主循环
     while idx < plan_struct.step_count:
+        if _is_run_stopped(run_id=int(run_id)):
+            _safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.react.run_stopped_detected",
+                data={"idx": int(idx)},
+                level="warning",
+            )
+            run_status = RUN_STATUS_STOPPED
+            break
+
         step_order = idx + 1
         last_step_order = step_order
         step = plan_struct.get_step(idx)
@@ -361,29 +365,47 @@ def run_react_loop_impl(
             safe_write_debug=_safe_write_debug,
             task_id=task_id,
             where="before_step",
+            # running 状态变更必须落盘：若此处被节流丢弃，崩溃后 resume 将从错误的步骤启动。
+            force=True,
         )
 
         yield sse_json({"delta": f"{STREAM_TAG_STEP} {title}\n"})
 
         obs_text = "\n".join(f"- {_truncate_observation(o)}" for o in observations[-3:]) or "(无)"
+        source_failure_summary = summarize_recent_source_failures_for_prompt(
+            observations=list(observations or []),
+            failure_signatures=(
+                agent_state.get("failure_signatures")
+                if isinstance(agent_state, dict) and isinstance(agent_state.get("failure_signatures"), dict)
+                else None
+            ),
+        )
 
-        react_prompt = AGENT_REACT_STEP_PROMPT_TEMPLATE.format(
-            now=now_iso(),
+        budget_meta: dict = {}
+        react_prompt = build_react_step_prompt(
+            now_utc=now_iso(),
             workdir=workdir,
-            agent_workspace=AGENT_EXPERIMENT_DIR_REL,
             message=message,
             plan=plan_struct.get_titles_json(),
             step_index=step_order,
             step_title=title,
             allowed_actions=allowed_text,
             observations=obs_text,
+            recent_source_failures=source_failure_summary,
             graph=graph_hint,
             tools=tools_hint,
             skills=skills_hint,
             memories=memories_hint,
-            output_style=ASSISTANT_OUTPUT_STYLE_GUIDE,
-            action_types_line=action_types_line(),
+            capability_hint=build_capability_hint(
+                capability=resolve_step_capability(
+                    allowed_actions=list(allowed or []),
+                    step_title=title,
+                )
+            ),
+            budget_meta_sink=budget_meta,
         )
+        if isinstance(agent_state, dict):
+            agent_state["context_budget_last_meta"] = dict(budget_meta or {})
 
         # 生成 action
         action_obj, action_type, payload_obj, action_validate_error, last_action_text = generate_action_with_retry(
@@ -486,6 +508,19 @@ def run_react_loop_impl(
             idx += 1
             continue
 
+        # stop 保护：LLM 生成 action 后，可能在“计划补丁落库前”收到 stop。
+        # 这里必须先检查一次，避免出现 stopped 后仍写入 plan_patch 的竞态。
+        if _is_run_stopped(run_id=int(run_id)):
+            _safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.react.run_stopped_before_plan_patch",
+                data={"step_order": int(step_order)},
+                level="warning",
+            )
+            run_status = RUN_STATUS_STOPPED
+            break
+
         # plan_patch 处理
         patch_obj = action_obj.get("plan_patch")
         if isinstance(patch_obj, dict):
@@ -546,9 +581,9 @@ def run_react_loop_impl(
             )
             if fallback_err:
                 run_status = RUN_STATUS_FAILED
-                plan_struct.set_step_status(step_order - 1, "failed")
+                plan_struct.set_step_status(idx, "failed")
                 yield sse_plan_delta(
-                    task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[step_order - 1]
+                    task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx]
                 )
                 yield sse_json({"delta": f"{STREAM_TAG_FAIL} {fallback_err}\n"})
                 break
@@ -587,51 +622,66 @@ def run_react_loop_impl(
 
         # docs/agent：Think 模式需要把 executor 角色落到 task_steps.executor 便于审计/复盘。
         # 约定：executor 由上游（think runner）写入 agent_state.executor_assignments，再由执行阶段按 step_order 查表。
-        executor_value = None
-        try:
-            assignments = agent_state.get("executor_assignments") if isinstance(agent_state, dict) else None
-            if isinstance(assignments, list):
-                for a in assignments:
-                    if not isinstance(a, dict):
-                        continue
-                    raw_order = a.get("step_order")
-                    try:
-                        order_value = int(raw_order)
-                    except Exception:
-                        continue
-                    if order_value != int(step_order):
-                        continue
-                    ev = str(a.get("executor") or "").strip()
-                    executor_value = ev or None
-                    break
-        except Exception:
-            executor_value = None
+        executor_value = resolve_executor(agent_state, step_order)
+
+        if _is_run_stopped(run_id=int(run_id)):
+            _safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.react.run_stopped_before_step_persist",
+                data={"step_order": int(step_order)},
+                level="warning",
+            )
+            run_status = RUN_STATUS_STOPPED
+            break
 
         # 执行步骤
         detail = json.dumps({"type": action_type, "payload": payload_obj}, ensure_ascii=False)
         step_created_at = now_iso()
-        step_id, _created, _updated = create_task_step(
-            TaskStepCreateParams(
+        try:
+            step_id, _created, _updated = create_task_step(
+                TaskStepCreateParams(
+                    task_id=int(task_id),
+                    run_id=int(run_id),
+                    title=title,
+                    status=STEP_STATUS_RUNNING,
+                    executor=executor_value,
+                    detail=detail,
+                    result=None,
+                    error=None,
+                    attempts=1,
+                    started_at=step_created_at,
+                    finished_at=None,
+                    step_order=step_order,
+                    created_at=step_created_at,
+                    updated_at=step_created_at,
+                )
+            )
+        except Exception as create_step_exc:
+            _safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
-                title=title,
-                status=STEP_STATUS_RUNNING,
-                executor=executor_value,
-                detail=detail,
-                result=None,
-                error=None,
-                attempts=1,
-                started_at=step_created_at,
-                finished_at=None,
-                step_order=step_order,
-                created_at=step_created_at,
-                updated_at=step_created_at,
+                message="agent.react.create_task_step_failed",
+                data={"step_order": int(step_order), "error": str(create_step_exc)},
+                level="error",
             )
-        )
+            run_status = RUN_STATUS_FAILED
+            break
 
         step_row = {"id": step_id, "title": title, "detail": detail}
         result, step_error = execute_step_action(int(task_id), int(run_id), step_row, context=context)
         finished_at = now_iso()
+
+        if _is_run_stopped(run_id=int(run_id)):
+            _safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.react.run_stopped_after_step_execution",
+                data={"step_order": int(step_order), "step_id": int(step_id)},
+                level="warning",
+            )
+            run_status = RUN_STATUS_STOPPED
+            break
 
         # 处理步骤失败
         if step_error:

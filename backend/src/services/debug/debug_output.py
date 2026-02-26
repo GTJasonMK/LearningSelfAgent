@@ -3,7 +3,7 @@ import json
 import sqlite3
 from typing import Any, Optional
 
-from backend.src.common.utils import truncate_text
+from backend.src.common.utils import coerce_int, truncate_text
 from backend.src.constants import AGENT_DEBUG_OUTPUT_MAX_CHARS, TASK_OUTPUT_TYPE_DEBUG
 from backend.src.repositories.task_outputs_repo import create_task_output
 
@@ -34,6 +34,9 @@ def write_task_debug_output(
     """
     level_value = str(level or "debug").strip().lower() or "debug"
     msg_value = str(message or "").strip() or "(empty)"
+    max_chars = coerce_int(AGENT_DEBUG_OUTPUT_MAX_CHARS, default=1200)
+    if max_chars <= 0:
+        max_chars = 1200
 
     payload: dict[str, Any] = {"kind": "debug", "level": level_value, "message": msg_value}
     if isinstance(data, dict) and data:
@@ -47,7 +50,7 @@ def write_task_debug_output(
             return json.dumps({"kind": "debug", "level": level_value, "message": msg_value, "error": "json_dump_failed"}, ensure_ascii=False)
 
     content = _dump(payload)
-    if len(content) > int(AGENT_DEBUG_OUTPUT_MAX_CHARS or 0):
+    if len(content) > max_chars:
         preview = ""
         if isinstance(data, dict) and data:
             try:
@@ -63,7 +66,7 @@ def write_task_debug_output(
         }
         content = _dump(payload)
 
-    if len(content) > int(AGENT_DEBUG_OUTPUT_MAX_CHARS or 0):
+    if len(content) > max_chars:
         payload = {
             "kind": "debug",
             "level": level_value,
@@ -71,10 +74,15 @@ def write_task_debug_output(
             "truncated": True,
         }
         content = _dump(payload)
+
+    task_id_value = coerce_int(task_id, default=0)
+    run_id_value = coerce_int(run_id, default=0)
+    if task_id_value <= 0 or run_id_value <= 0:
+        return
     try:
         create_task_output(
-            task_id=int(task_id),
-            run_id=int(run_id),
+            task_id=task_id_value,
+            run_id=run_id_value,
             output_type=TASK_OUTPUT_TYPE_DEBUG,
             content=content,
         )

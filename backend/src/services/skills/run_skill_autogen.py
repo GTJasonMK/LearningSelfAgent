@@ -1,7 +1,13 @@
 import json
 from typing import Any, Dict, List, Optional
 
-from backend.src.common.utils import extract_json_object, now_iso, truncate_text
+from backend.src.common.utils import (
+    action_type_from_step_detail,
+    extract_json_object,
+    json_preview,
+    now_iso,
+    truncate_text,
+)
 from backend.src.constants import (
     ACTION_TYPE_FILE_WRITE,
     ACTION_TYPE_SHELL_COMMAND,
@@ -19,17 +25,6 @@ from backend.src.services.skills.skills_publish import publish_skill_file
 from backend.src.services.skills.skills_upsert import upsert_skill_from_agent_payload
 from backend.src.storage import get_connection
 
-def _coerce_json_preview(value: Any, max_chars: int) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return truncate_text(value, max_chars)
-    try:
-        return truncate_text(json.dumps(value, ensure_ascii=False), max_chars)
-    except Exception:
-        return truncate_text(str(value), max_chars)
-
-
 def _compact_plan(plan_text: str) -> dict:
     obj = extract_json_object(plan_text or "") or {}
     if not isinstance(obj, dict):
@@ -43,18 +38,7 @@ def _compact_plan(plan_text: str) -> dict:
 
 
 def _extract_step_action_type(detail_text: Optional[str]) -> Optional[str]:
-    raw = str(detail_text or "").strip()
-    if not raw:
-        return None
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(obj, dict):
-        t = obj.get("type") or (obj.get("action") or {}).get("type")
-        if t:
-            return str(t).strip() or None
-    return None
+    return action_type_from_step_detail(detail_text)
 
 
 def _compact_steps(step_rows: List[dict]) -> List[dict]:
@@ -64,7 +48,7 @@ def _compact_steps(step_rows: List[dict]) -> List[dict]:
         status = str((row or {}).get("status") or "").strip()
         action_type = _extract_step_action_type((row or {}).get("detail"))
         error = truncate_text(str((row or {}).get("error") or ""), 200)
-        result = _coerce_json_preview((row or {}).get("result"), 260)
+        result = json_preview((row or {}).get("result"), 260)
         compact.append(
             {
                 "title": title,

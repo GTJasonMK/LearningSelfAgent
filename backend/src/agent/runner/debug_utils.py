@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import logging
 from typing import Optional
 
-from backend.src.services.debug.debug_output import write_task_debug_output
-
-logger = logging.getLogger(__name__)
+from backend.src.services.debug.safe_debug import safe_write_debug as _safe_write_debug_impl
 
 
 def safe_write_debug(
@@ -23,15 +20,10 @@ def safe_write_debug(
     - 调试写入失败不影响主链路；
     - 所有入口统一通过该函数写 task_outputs(debug)。
     """
-    if task_id is None or run_id is None:
-        return
-    try:
-        write_task_debug_output(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            message=message,
-            data=data if isinstance(data, dict) else None,
-            level=level,
-        )
-    except Exception:
-        logger.exception("write_task_debug_output failed: %s", message)
+    _safe_write_debug_impl(
+        task_id=task_id,
+        run_id=run_id,
+        message=message,
+        data=data,
+        level=level,
+    )

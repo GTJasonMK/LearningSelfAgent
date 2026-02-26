@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
-from backend.src.actions.registry import normalize_action_type
+from backend.src.actions.registry import list_action_types, normalize_action_type
 from backend.src.agent.plan_utils import (
     _fallback_brief_from_title,
     drop_non_artifact_file_write_steps,
@@ -61,22 +61,8 @@ from backend.src.agent.think.think_voting import (
 )
 
 
-# 允许的 action 类型列表
-ALLOWED_ACTION_TYPES = [
-    ACTION_TYPE_LLM_CALL,
-    ACTION_TYPE_MEMORY_WRITE,
-    ACTION_TYPE_TASK_OUTPUT,
-    ACTION_TYPE_TOOL_CALL,
-    ACTION_TYPE_SHELL_COMMAND,
-    ACTION_TYPE_FILE_WRITE,
-    ACTION_TYPE_FILE_READ,
-    ACTION_TYPE_HTTP_REQUEST,
-    ACTION_TYPE_FILE_APPEND,
-    ACTION_TYPE_FILE_LIST,
-    ACTION_TYPE_FILE_DELETE,
-    ACTION_TYPE_JSON_PARSE,
-    ACTION_TYPE_USER_PROMPT,
-]
+# 允许的 action 类型列表（与 actions.registry 保持单一来源，避免静态漂移）。
+ALLOWED_ACTION_TYPES = list_action_types()
 
 
 def normalize_plan_data_for_execution(

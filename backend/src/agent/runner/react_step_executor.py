@@ -9,6 +9,10 @@ import json
 import logging
 from typing import Callable, Dict, Generator, List, Optional, Tuple
 
+from backend.src.agent.contracts.stream_events import (
+    build_need_input_payload,
+    generate_prompt_token,
+)
 from backend.src.agent.support import _truncate_observation
 from backend.src.agent.runner.react_helpers import (
     call_llm_for_text,
@@ -18,7 +22,8 @@ from backend.src.agent.runner.react_helpers import (
 from backend.src.agent.runner.need_input_choices import resolve_need_input_choices
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.plan_events import sse_plan_delta
-from backend.src.common.utils import now_iso
+from backend.src.agent.runner.react_state_manager import resolve_executor
+from backend.src.common.utils import coerce_int, now_iso
 from backend.src.constants import (
     ACTION_TYPE_FILE_WRITE,
     ACTION_TYPE_FILE_READ,
@@ -46,16 +51,23 @@ from backend.src.constants import (
 )
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.services.output.output_format import format_visible_result
-from backend.src.repositories.task_outputs_repo import create_task_output
-from backend.src.repositories.task_steps_repo import (
+from backend.src.services.tasks.task_queries import (
+    create_task_output,
     TaskStepCreateParams,
     create_task_step,
     mark_task_step_failed,
+    update_task,
+    update_task_run,
 )
-from backend.src.repositories.task_runs_repo import update_task_run
-from backend.src.repositories.tasks_repo import update_task
 
 logger = logging.getLogger(__name__)
+
+
+def _run_with_optional_lock(db_lock: Optional[object], fn: Callable[[], object]) -> object:
+    if db_lock is not None:
+        with db_lock:
+            return fn()
+    return fn()
 
 
 def generate_action_with_retry(
@@ -96,7 +108,7 @@ def generate_action_with_retry(
     last_action_text = None
     prompt_for_attempt = react_prompt
 
-    retries = int(AGENT_REACT_ACTION_RETRY_MAX_ATTEMPTS or 0)
+    retries = coerce_int(AGENT_REACT_ACTION_RETRY_MAX_ATTEMPTS or 0, default=0)
     for attempt in range(0, 1 + max(0, retries)):
         attempt_params = dict(react_params)
         if attempt > 0:
@@ -402,65 +414,27 @@ def handle_user_prompt_action(
     try:
         detail = json.dumps({"type": ACTION_TYPE_USER_PROMPT, "payload": payload_obj}, ensure_ascii=False)
 
-        executor_value = None
-        try:
-            assignments = agent_state.get("executor_assignments") if isinstance(agent_state, dict) else None
-            if isinstance(assignments, list):
-                for a in assignments:
-                    if not isinstance(a, dict):
-                        continue
-                    raw_order = a.get("step_order")
-                    try:
-                        order_value = int(raw_order)
-                    except Exception:
-                        continue
-                    if order_value != int(step_order):
-                        continue
-                    ev = str(a.get("executor") or "").strip()
-                    executor_value = ev or None
-                    break
-        except Exception:
-            executor_value = None
-
-        if db_lock is not None:
-            with db_lock:
-                step_id, _created, _updated = create_task_step(
-                    TaskStepCreateParams(
-                        task_id=int(task_id),
-                        run_id=int(run_id),
-                        title=title,
-                        status=STEP_STATUS_WAITING,
-                        executor=executor_value,
-                        detail=detail,
-                        result=None,
-                        error=None,
-                        attempts=1,
-                        started_at=step_created_at,
-                        finished_at=None,
-                        step_order=int(step_order),
-                        created_at=step_created_at,
-                        updated_at=step_created_at,
-                    )
-                )
-        else:
-            step_id, _created, _updated = create_task_step(
-                TaskStepCreateParams(
-                    task_id=int(task_id),
-                    run_id=int(run_id),
-                    title=title,
-                    status=STEP_STATUS_WAITING,
-                    executor=executor_value,
-                    detail=detail,
-                    result=None,
-                    error=None,
-                    attempts=1,
-                    started_at=step_created_at,
-                    finished_at=None,
-                    step_order=int(step_order),
-                    created_at=step_created_at,
-                    updated_at=step_created_at,
-                )
-            )
+        executor_value = resolve_executor(agent_state, step_order)
+        step_params = TaskStepCreateParams(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            title=title,
+            status=STEP_STATUS_WAITING,
+            executor=executor_value,
+            detail=detail,
+            result=None,
+            error=None,
+            attempts=1,
+            started_at=step_created_at,
+            finished_at=None,
+            step_order=int(step_order),
+            created_at=step_created_at,
+            updated_at=step_created_at,
+        )
+        step_id, _created, _updated = _run_with_optional_lock(
+            db_lock,
+            lambda: create_task_step(step_params),
+        )
     except Exception as exc:
         step_id = None
         safe_write_debug(
@@ -474,23 +448,17 @@ def handle_user_prompt_action(
     # 写入输出记录
     created_at = step_created_at
     try:
-        if db_lock is not None:
-            with db_lock:
-                create_task_output(
-                    task_id=int(task_id),
-                    run_id=int(run_id),
-                    output_type=TASK_OUTPUT_TYPE_USER_PROMPT,
-                    content=question,
-                    created_at=created_at,
-                )
-        else:
+        _run_with_optional_lock(
+            db_lock,
+            lambda:
             create_task_output(
                 task_id=int(task_id),
                 run_id=int(run_id),
                 output_type=TASK_OUTPUT_TYPE_USER_PROMPT,
                 content=question,
                 created_at=created_at,
-            )
+            ),
+        )
     except Exception as exc:
         safe_write_debug(
             task_id=int(task_id),
@@ -508,12 +476,21 @@ def handle_user_prompt_action(
         level="info",
     )
 
+    prompt_token = generate_prompt_token(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        step_order=int(step_order),
+        question=question,
+        created_at=created_at,
+    )
+
     # 持久化暂停状态
     agent_state["paused"] = {
         "question": question,
         "step_order": step_order,
         "step_title": title,
         "created_at": created_at,
+        "prompt_token": prompt_token,
     }
     if kind:
         agent_state["paused"]["kind"] = kind
@@ -525,8 +502,7 @@ def handle_user_prompt_action(
     updated_at = now_iso()
 
     try:
-        if db_lock is not None:
-            with db_lock:
+        def _persist_waiting_state() -> None:
                 update_task_run(
                     run_id=int(run_id),
                     status=RUN_STATUS_WAITING,
@@ -535,15 +511,7 @@ def handle_user_prompt_action(
                     updated_at=updated_at,
                 )
                 update_task(task_id=int(task_id), status=STATUS_WAITING, updated_at=updated_at)
-        else:
-            update_task_run(
-                run_id=int(run_id),
-                status=RUN_STATUS_WAITING,
-                agent_plan=plan_struct.to_agent_plan_payload(),
-                agent_state=agent_state,
-                updated_at=updated_at,
-            )
-            update_task(task_id=int(task_id), status=STATUS_WAITING, updated_at=updated_at)
+        _run_with_optional_lock(db_lock, _persist_waiting_state)
     except Exception as exc:
         safe_write_debug(
             task_id=int(task_id),
@@ -553,11 +521,15 @@ def handle_user_prompt_action(
             level="error",
         )
 
-    need_input_payload = {"type": "need_input", "task_id": task_id, "run_id": run_id, "question": question}
-    if kind:
-        need_input_payload["kind"] = kind
-    if normalized_choices:
-        need_input_payload["choices"] = normalized_choices
+    need_input_payload = build_need_input_payload(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        question=question,
+        kind=kind,
+        choices=normalized_choices,
+        prompt_token=prompt_token,
+        session_key=str(agent_state.get("session_key") or "") if isinstance(agent_state, dict) else "",
+    )
 
     yield sse_json(need_input_payload)
     yield sse_json({"delta": f"{STREAM_TAG_ASK} {question}\n"})

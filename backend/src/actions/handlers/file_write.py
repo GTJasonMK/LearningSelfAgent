@@ -2,6 +2,11 @@ import os
 import re
 from typing import Optional, Tuple
 
+from backend.src.actions.handlers.file_action_common import (
+    ensure_write_permission_for_action,
+    normalize_encoding,
+    require_action_path,
+)
 from backend.src.actions.file_write import write_text_file
 
 # 仅拦截“明显模拟数据”标记，避免对正常业务词汇误报。
@@ -81,6 +86,18 @@ def _maybe_warn_business_data_write(path: str, content: str, context: Optional[d
     )
 
 
+def _validate_business_data_write(path: str, content: str) -> Optional[str]:
+    """
+    业务数据文件写入硬校验：
+    - CSV 不能为空（空文件会在后续链路中放大为“伪成功”）。
+    """
+    if not _is_business_data_path(path):
+        return None
+    if str(content or "").strip():
+        return None
+    return "file_write 拒绝写入空 CSV：请先完成数据抓取/换算后再写入结果文件。"
+
+
 def execute_file_write(
     payload: dict,
     *,
@@ -89,15 +106,21 @@ def execute_file_write(
     """
     执行 file_write：写入文本文件。
     """
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError("file_write.path 不能为空")
+    path = require_action_path(payload, "file_write")
+    permission_error = ensure_write_permission_for_action(path, "file_write")
+    if permission_error:
+        return None, permission_error
 
     content = payload.get("content")
     if content is None:
         content = ""
     if not isinstance(content, str):
         raise ValueError("file_write.content 必须是字符串")
+
+    # 开发阶段严格模式：业务 CSV 空写入一律失败，避免把“空产物”标记为成功步骤。
+    validation_error = _validate_business_data_write(path=path, content=content)
+    if validation_error:
+        return None, validation_error
 
     warnings = []
     warn_text = _maybe_warn_business_data_write(path=path, content=content, context=context)
@@ -110,9 +133,7 @@ def execute_file_write(
             items.append(warn_text)
             context["quality_warnings"] = items
 
-    encoding = payload.get("encoding") or "utf-8"
-    if not isinstance(encoding, str) or not encoding.strip():
-        encoding = "utf-8"
+    encoding = normalize_encoding(payload.get("encoding"))
 
     result = write_text_file(path=path, content=content, encoding=encoding)
     if warnings:

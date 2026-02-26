@@ -1688,6 +1688,65 @@ input:focus, select:focus, textarea:focus {
   color: var(--color_ink);
 }
 
+.world-thoughts {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.world-thoughts-section {
+  border: 1px solid var(--color_border);
+  border-radius: var(--size-radius-md);
+  background: var(--color_paper);
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.world-thoughts-section-title {
+  font-size: var(--font-size-xs);
+  color: var(--color_muted);
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+  font-family: var(--font_display);
+}
+
+.world-thoughts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.world-thoughts-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.world-thoughts-item.is-sub {
+  padding-left: 18px;
+}
+
+.world-thoughts-item-main {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.world-thoughts-label {
+  color: var(--color_muted);
+  margin-right: 4px;
+}
+
+.world-thoughts-value,
+.world-thoughts-text {
+  color: var(--color_ink);
+}
+
 .world-chat {
   display: flex;
   flex-direction: column;

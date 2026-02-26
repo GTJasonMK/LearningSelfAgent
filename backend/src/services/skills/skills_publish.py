@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.src.common.path_utils import is_path_within_root
+from backend.src.common.serializers import skill_content_from_row
 from backend.src.common.utils import coerce_str_list, extract_json_object, now_iso, parse_json_list, truncate_text
 from backend.src.constants import (
     DEFAULT_SKILL_VERSION,
@@ -83,28 +85,17 @@ def _skill_meta_from_db_row(row) -> Dict[str, Any]:
     """
     将 skills_items 的 row 转为写文件需要的 meta。
     """
-    return {
-        "name": row["name"],
-        "category": row["category"] or SKILL_DEFAULT_CATEGORY,
-        "tags": parse_json_list(row["tags"]),
-        "triggers": parse_json_list(row["triggers"]),
-        "aliases": parse_json_list(row["aliases"]),
-        "description": row["description"],
-        "scope": row["scope"],
-        "prerequisites": parse_json_list(row["prerequisites"]),
-        "inputs": parse_json_list(row["inputs"]),
-        "outputs": parse_json_list(row["outputs"]),
-        "steps": parse_json_list(row["steps"]),
-        "failure_modes": parse_json_list(row["failure_modes"]),
-        "validation": parse_json_list(row["validation"]),
-        "version": row["version"] or DEFAULT_SKILL_VERSION,
-        # Phase 2：Solution/Skill 统一格式（便于 files <-> DB 同步）
-        "domain_id": row["domain_id"] if "domain_id" in row.keys() else None,
-        "skill_type": row["skill_type"] if "skill_type" in row.keys() else None,
-        "status": row["status"] if "status" in row.keys() else None,
-        "source_task_id": row["source_task_id"] if "source_task_id" in row.keys() else None,
-        "source_run_id": row["source_run_id"] if "source_run_id" in row.keys() else None,
-    }
+    meta = skill_content_from_row(row)
+    meta.pop("source_path", None)
+    meta["category"] = meta.get("category") or SKILL_DEFAULT_CATEGORY
+    meta["version"] = meta.get("version") or DEFAULT_SKILL_VERSION
+    # Phase 2：Solution/Skill 统一格式（便于 files <-> DB 同步）
+    meta["domain_id"] = row["domain_id"] if "domain_id" in row.keys() else None
+    meta["skill_type"] = row["skill_type"] if "skill_type" in row.keys() else None
+    meta["status"] = row["status"] if "status" in row.keys() else None
+    meta["source_task_id"] = row["source_task_id"] if "source_task_id" in row.keys() else None
+    meta["source_run_id"] = row["source_run_id"] if "source_run_id" in row.keys() else None
+    return meta
 
 
 def publish_skill_file(skill_id: int) -> Tuple[Optional[str], Optional[str]]:
@@ -124,7 +115,7 @@ def publish_skill_file(skill_id: int) -> Tuple[Optional[str], Optional[str]]:
             root = skills_prompt_dir().resolve()
             target = (root / Path(existing_source_path)).resolve()
             try:
-                if not target.is_relative_to(root):
+                if not is_path_within_root(target, root):
                     return None, "invalid_source_path"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 markdown = build_skill_markdown(meta=meta)
@@ -162,10 +153,7 @@ def delete_skill_file_by_source_path(source_path: Optional[str]) -> Tuple[bool, 
 
     root = skills_prompt_dir().resolve()
     target = (root / Path(value)).resolve()
-    try:
-        if not target.is_relative_to(root):
-            return False, "invalid_source_path"
-    except Exception:
+    if not is_path_within_root(target, root):
         # 兜底：is_relative_to 仅用于防止路径漂移；失败时直接拒绝删除
         return False, "invalid_source_path"
 
@@ -195,10 +183,7 @@ def stage_delete_skill_file_by_source_path(source_path: Optional[str]) -> Tuple[
     root = skills_prompt_dir().resolve()
     target = (root / Path(value)).resolve()
     # 统一路径安全校验（拒绝越界）
-    try:
-        if not target.is_relative_to(root):
-            return None, "invalid_source_path"
-    except Exception:
+    if not is_path_within_root(target, root):
         return None, "invalid_source_path"
 
     trash_path, err = stage_delete_file(root_dir=root, target_path=target)

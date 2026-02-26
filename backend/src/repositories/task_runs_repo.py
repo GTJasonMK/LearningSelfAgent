@@ -4,7 +4,8 @@ import json
 import sqlite3
 from typing import Any, Optional, Tuple
 
-from backend.src.common.utils import now_iso
+from backend.src.common.sql import in_clause_placeholders, normalize_non_empty_texts
+from backend.src.common.utils import now_iso, parse_json_dict
 from backend.src.constants import (
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
@@ -13,6 +14,31 @@ from backend.src.constants import (
     RUN_STATUS_WAITING,
 )
 from backend.src.repositories.repo_conn import provide_connection
+
+
+def _status_items_and_placeholders(statuses: list[str]) -> tuple[list[str], Optional[str]]:
+    items = normalize_non_empty_texts(statuses or [])
+    return items, in_clause_placeholders(items)
+
+
+def _stop_task_runs(
+    *,
+    from_status: str,
+    to_status: str,
+    stopped_at: str,
+    run_id: Optional[int],
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    where_clause = "status = ?"
+    params: list[Any] = [str(to_status or ""), str(stopped_at or ""), str(stopped_at or "")]
+    if run_id is not None:
+        where_clause = "id = ? AND status = ?"
+        params.extend([int(run_id), str(from_status or "")])
+    else:
+        params.append(str(from_status or ""))
+    sql = f"UPDATE task_runs SET status = ?, finished_at = ?, updated_at = ? WHERE {where_clause}"
+    with provide_connection(conn) as inner:
+        inner.execute(sql, params)
 
 
 def create_task_run(
@@ -65,10 +91,13 @@ def stop_all_running_task_runs(
     """
     批量把 task_runs 从 running 类状态收敛到 stopped（本次尝试结束，因此写 finished_at）。
     """
-    sql = "UPDATE task_runs SET status = ?, finished_at = ?, updated_at = ? WHERE status = ?"
-    params = (str(to_status or ""), str(stopped_at or ""), str(stopped_at or ""), str(from_status or ""))
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
+    _stop_task_runs(
+        from_status=from_status,
+        to_status=to_status,
+        stopped_at=stopped_at,
+        run_id=None,
+        conn=conn,
+    )
 
 
 def stop_task_run_if_running(
@@ -79,10 +108,13 @@ def stop_task_run_if_running(
     stopped_at: str,
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
-    sql = "UPDATE task_runs SET status = ?, finished_at = ?, updated_at = ? WHERE id = ? AND status = ?"
-    params = (str(to_status or ""), str(stopped_at or ""), str(stopped_at or ""), int(run_id), str(from_status or ""))
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
+    _stop_task_runs(
+        from_status=from_status,
+        to_status=to_status,
+        stopped_at=stopped_at,
+        run_id=int(run_id),
+        conn=conn,
+    )
 
 
 def list_task_runs(
@@ -126,13 +158,12 @@ def list_agent_runs_missing_reviews(
     - 使用 NOT EXISTS 避免 N+1 查询；
     - order by id desc：优先补齐最近的 runs。
     """
-    items = [str(s) for s in (statuses or []) if str(s)]
-    if not items:
+    items, placeholders = _status_items_and_placeholders(statuses)
+    if not items or not placeholders:
         return []
     if int(limit) <= 0:
         return []
 
-    placeholders = ",".join(["?"] * len(items))
     sql = (
         "SELECT r.* "
         "FROM task_runs r "
@@ -210,11 +241,8 @@ def update_task_run(
             if isinstance(agent_state, dict):
                 mode_value = str(agent_state.get("mode") or "").strip() or None
             elif isinstance(agent_state, str):
-                try:
-                    parsed = json.loads(agent_state)
-                except Exception:
-                    parsed = None
-                if isinstance(parsed, dict):
+                parsed = parse_json_dict(agent_state)
+                if parsed:
                     mode_value = str(parsed.get("mode") or "").strip() or None
 
         fields_without_mode = list(fields)
@@ -261,10 +289,9 @@ def fetch_agent_run_with_task_title_by_statuses(
     """
     获取最近一条 Agent run（summary LIKE 'agent_%'）并附带 tasks.title。
     """
-    items = [str(s) for s in (statuses or []) if str(s)]
-    if not items:
+    items, placeholders = _status_items_and_placeholders(statuses)
+    if not items or not placeholders:
         return None
-    placeholders = ",".join(["?"] * len(items))
     sql = (
         "SELECT r.*, t.title AS task_title "
         "FROM task_runs r "

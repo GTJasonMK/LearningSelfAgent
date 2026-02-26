@@ -22,8 +22,19 @@ async def iter_stream_task_events(
     out_q: "asyncio.Queue[str]" = asyncio.Queue()
     emit = make_queue_emit(out_q)
     task = asyncio.create_task(task_builder(emit))
-    async for msg in pump_async_task_messages(task, out_q):
-        if msg:
-            yield ("msg", str(msg))
-    result = await task
-    yield ("done", result)
+    try:
+        async for msg in pump_async_task_messages(task, out_q):
+            if msg:
+                yield ("msg", str(msg))
+        result = await task
+        yield ("done", result)
+    except (asyncio.CancelledError, GeneratorExit):
+        # 关键：当上游 SSE 连接断开时，必须同步取消内部 task，避免“外层已停止、
+        # 内层仍继续改 plan/写步骤”的竞态。
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+        raise

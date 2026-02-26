@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import shutil
 import tempfile
@@ -12,6 +13,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     httpx = None
 
+HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+
 
 class TestAgentCommandStreamDoPendingPlanningAskUserTwiceMessageAccumulates(unittest.IsolatedAsyncioTestCase):
     """
@@ -23,6 +26,8 @@ class TestAgentCommandStreamDoPendingPlanningAskUserTwiceMessageAccumulates(unit
     def setUp(self):
         if httpx is None:
             self.skipTest("httpx 未安装，跳过需要 ASGI 客户端的测试")
+        if not HAS_FASTAPI:
+            self.skipTest("fastapi 未安装，跳过需要 ASGI 客户端的测试")
 
         import backend.src.storage as storage
 

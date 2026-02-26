@@ -29,6 +29,17 @@ def get_chat_message(*, message_id: int, conn: Optional[sqlite3.Connection] = No
         return inner.execute(sql, params).fetchone()
 
 
+def _query_desc_then_reverse(
+    *,
+    sql: str,
+    params: Sequence,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[sqlite3.Row]:
+    with provide_connection(conn) as inner:
+        rows = inner.execute(sql, params).fetchall()
+    return list(reversed(list(rows)))
+
+
 def create_chat_message(
     params: ChatMessageCreateParams,
     *,
@@ -52,9 +63,7 @@ def list_chat_messages_latest(
     """
     sql = "SELECT * FROM chat_messages ORDER BY id DESC LIMIT ?"
     params = (int(limit),)
-    with provide_connection(conn) as inner:
-        rows = inner.execute(sql, params).fetchall()
-    return list(reversed(list(rows)))
+    return _query_desc_then_reverse(sql=sql, params=params, conn=conn)
 
 
 def list_chat_messages_before(
@@ -68,9 +77,7 @@ def list_chat_messages_before(
     """
     sql = "SELECT * FROM chat_messages WHERE id < ? ORDER BY id DESC LIMIT ?"
     params = (int(before_id), int(limit))
-    with provide_connection(conn) as inner:
-        rows = inner.execute(sql, params).fetchall()
-    return list(reversed(list(rows)))
+    return _query_desc_then_reverse(sql=sql, params=params, conn=conn)
 
 
 def list_chat_messages_after(

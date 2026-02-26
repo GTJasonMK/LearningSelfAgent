@@ -1,29 +1,19 @@
-import json
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.src.common.utils import atomic_write_text, now_iso, parse_json_list
+from backend.src.common.path_utils import is_path_within_root
+from backend.src.common.utils import (
+    atomic_write_text,
+    build_json_frontmatter_markdown,
+    discover_markdown_files,
+    dump_json_list,
+    now_iso,
+    parse_json_list,
+)
 from backend.src.prompt.paths import memory_prompt_dir
 from backend.src.prompt.skill_files import parse_skill_markdown
 from backend.src.storage import get_connection
-
-
-_FRONTMATTER_DELIM = "---"
-
-
-def _build_memory_markdown(meta: Dict[str, Any], content: str) -> str:
-    """
-    生成 memory Markdown（JSON frontmatter + 正文）。
-
-    说明：
-    - frontmatter 采用 JSON（而不是 YAML），避免依赖 PyYAML；
-    - parse_skill_markdown 已支持 JSON frontmatter 兜底解析。
-    """
-    fm_text = json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True).strip()
-    body = str(content or "").rstrip()
-    lines = [_FRONTMATTER_DELIM, fm_text, _FRONTMATTER_DELIM, "", body, ""]
-    return "\n".join(lines)
 
 
 def _safe_uid(value: Optional[str]) -> Optional[str]:
@@ -52,10 +42,7 @@ def delete_memory_file_by_uid(uid: Optional[str], base_dir: Optional[Path] = Non
         return False, None
     path = memory_file_path(uid_value, base_dir=base_dir).resolve()
     root = _memory_base_dir(base_dir).resolve()
-    try:
-        if not path.is_relative_to(root):
-            return False, "invalid_uid_path"
-    except Exception:
+    if not is_path_within_root(path, root):
         return False, "invalid_uid_path"
     if not path.exists():
         return False, None
@@ -95,7 +82,7 @@ def publish_memory_item_file(
         conn.execute("UPDATE memory_items SET uid = ? WHERE id = ?", (uid_value, int(item_id)))
         row = conn.execute("SELECT * FROM memory_items WHERE id = ? LIMIT 1", (int(item_id),)).fetchone()
 
-    tags = parse_json_list(row["tags"]) if row["tags"] else []
+    tags = parse_json_list(row["tags"])
     meta = {
         "uid": uid_value,
         "created_at": row["created_at"] or now_iso(),
@@ -103,27 +90,10 @@ def publish_memory_item_file(
         "tags": tags,
         "task_id": row["task_id"],
     }
-    markdown = _build_memory_markdown(meta=meta, content=row["content"] or "")
+    markdown = build_json_frontmatter_markdown(meta=meta, body=row["content"] or "")
     path = memory_file_path(uid_value, base_dir=base_dir)
     atomic_write_text(path, markdown, encoding="utf-8")
     return {"ok": True, "uid": uid_value, "path": str(path)}
-
-
-def _discover_memory_files(base_dir: Path) -> List[Path]:
-    if not base_dir.exists():
-        return []
-    files: List[Path] = []
-    for path in base_dir.rglob("*.md"):
-        if not path.is_file():
-            continue
-        name = path.name.lower()
-        if name in {"readme.md", "_readme.md"}:
-            continue
-        # 跳过隐藏目录/文件（例如 .trash），避免“删除暂存”被同步回数据库
-        if any(part.startswith(".") for part in path.parts):
-            continue
-        files.append(path)
-    return sorted(files)
 
 
 def sync_memory_from_files(base_dir: Optional[Path] = None, *, prune: bool = True) -> dict:
@@ -148,7 +118,7 @@ def sync_memory_from_files(base_dir: Optional[Path] = None, *, prune: bool = Tru
 
     # 重要：parse 失败不应误删 DB，因此先记录“存在的 uid 集合”（即使解析失败也尽量保留）。
     parsed_items: List[Tuple[str, Dict[str, Any], str]] = []
-    for path in _discover_memory_files(base):
+    for path in discover_markdown_files(base):
         uid_value: Optional[str] = None
         try:
             text = path.read_text(encoding="utf-8")
@@ -161,7 +131,7 @@ def sync_memory_from_files(base_dir: Optional[Path] = None, *, prune: bool = Tru
                 # 自动修复：补齐 uid 并回写文件（避免用户手写新文件忘记 uid）
                 meta = dict(meta)
                 meta["uid"] = uid_value
-                fixed = _build_memory_markdown(meta=meta, content=parsed.body or "")
+                fixed = build_json_frontmatter_markdown(meta=meta, body=parsed.body or "")
                 atomic_write_text(path, fixed, encoding="utf-8")
             discovered_uids.add(uid_value)
             parsed_items.append((uid_value, meta, parsed.body or ""))
@@ -192,7 +162,7 @@ def sync_memory_from_files(base_dir: Optional[Path] = None, *, prune: bool = Tru
                 params: List[Any] = [
                     content,
                     memory_type,
-                    json.dumps(list(tags), ensure_ascii=False),
+                    dump_json_list(tags),
                     int(task_id) if task_id is not None else None,
                 ]
                 if created_at and created_at != str(row["created_at"] or ""):
@@ -208,7 +178,7 @@ def sync_memory_from_files(base_dir: Optional[Path] = None, *, prune: bool = Tru
                         content,
                         created_at or now_iso(),
                         memory_type,
-                        json.dumps(list(tags), ensure_ascii=False),
+                        dump_json_list(tags),
                         int(task_id) if task_id is not None else None,
                         uid_value,
                     ),
@@ -216,7 +186,9 @@ def sync_memory_from_files(base_dir: Optional[Path] = None, *, prune: bool = Tru
                 inserted += 1
             upserts += 1
 
-        # 2) DB -> 文件：补齐未跟踪（uid 为空）的历史记录，避免“DB 有、文件无”导致恢复不完整
+    # 2) DB -> 文件：补齐未跟踪（uid 为空）的历史记录。
+    # 独立事务，避免与 upsert 阶段共享长锁。
+    with get_connection() as conn:
         rows = conn.execute(
             "SELECT id FROM memory_items WHERE uid IS NULL OR uid = '' ORDER BY id ASC"
         ).fetchall()
@@ -226,8 +198,10 @@ def sync_memory_from_files(base_dir: Optional[Path] = None, *, prune: bool = Tru
                 discovered_uids.add(str(info.get("uid")))
                 published += 1
 
-        # 3) prune：文件不存在 -> 删除 DB 记录（仅对已跟踪 uid 生效）
-        if prune:
+    # 3) prune：文件不存在 -> 删除 DB 记录。
+    # 独立事务，缩短写锁粒度，避免阻塞并发的 create_memory_item 调用。
+    if prune:
+        with get_connection() as conn:
             rows = conn.execute(
                 "SELECT id, uid FROM memory_items WHERE uid IS NOT NULL AND uid != ''"
             ).fetchall()

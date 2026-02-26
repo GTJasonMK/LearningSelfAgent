@@ -2,7 +2,12 @@ from typing import List, Optional
 
 from fastapi import APIRouter
 
-from backend.src.common.serializers import task_from_row
+from backend.src.api.utils import (
+    clamp_non_negative_int,
+    clamp_page_limit,
+    parse_positive_int,
+)
+from backend.src.common.sql import in_clause_placeholders
 from backend.src.common.utils import truncate_text
 from backend.src.constants import (
     DEFAULT_PAGE_LIMIT,
@@ -32,32 +37,17 @@ def list_recent_records(
     - 用于前端主面板 Dashboard 展示“日志/动态”，让用户随时看到 Agent/系统做了什么。
     - 数据来源于现有表（run/step/output/llm/tool/memory/skill/agent_review），不引入额外日志系统。
     """
-    if offset < 0:
-        offset = 0
-    if limit <= 0:
-        limit = DEFAULT_PAGE_LIMIT
-    if limit > DEFAULT_PAGE_LIMIT:
-        limit = DEFAULT_PAGE_LIMIT
+    offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT, max_value=DEFAULT_PAGE_LIMIT)
 
-    try:
-        task_id_value = int(task_id) if task_id is not None else None
-    except Exception:
-        task_id_value = None
-    if task_id_value is not None and task_id_value <= 0:
-        task_id_value = None
-
-    try:
-        run_id_value = int(run_id) if run_id is not None else None
-    except Exception:
-        run_id_value = None
-    if run_id_value is not None and run_id_value <= 0:
-        run_id_value = None
+    task_id_value = parse_positive_int(task_id, default=None)
+    run_id_value = parse_positive_int(run_id, default=None)
 
     def _where(*, run_field: Optional[str], task_field: Optional[str]) -> tuple[str, List[int]]:
         if run_id_value is not None and run_field:
-            return f"WHERE {run_field} = ?", [int(run_id_value)]
+            return f"WHERE {run_field} = ?", [run_id_value]
         if task_id_value is not None and task_field:
-            return f"WHERE {task_field} = ?", [int(task_id_value)]
+            return f"WHERE {task_field} = ?", [task_id_value]
         return "", []
 
     segments: List[str] = []
@@ -243,7 +233,7 @@ def list_recent_records(
         "ORDER BY timestamp DESC\n"
         "LIMIT ? OFFSET ?"
     )
-    params.extend([int(limit), int(offset)])
+    params.extend([limit, offset])
 
     with get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
@@ -251,12 +241,13 @@ def list_recent_records(
         task_ids = sorted({int(r["task_id"]) for r in rows if r["task_id"] is not None})
         task_titles = {}
         if task_ids:
-            placeholders = ",".join(["?"] * len(task_ids))
-            task_rows = conn.execute(
-                f"SELECT id, title FROM tasks WHERE id IN ({placeholders})",
-                task_ids,
-            ).fetchall()
-            task_titles = {int(r["id"]): str(r["title"] or "") for r in task_rows}
+            placeholders = in_clause_placeholders(task_ids)
+            if placeholders:
+                task_rows = conn.execute(
+                    f"SELECT id, title FROM tasks WHERE id IN ({placeholders})",
+                    task_ids,
+                ).fetchall()
+                task_titles = {int(r["id"]): str(r["title"] or "") for r in task_rows}
 
     items = []
     for row in rows:

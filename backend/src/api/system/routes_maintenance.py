@@ -16,7 +16,9 @@ from backend.src.api.schemas import (
     MaintenanceKnowledgeValidateTagsRequest,
     MaintenanceKnowledgeDedupeSkillsRequest,
 )
-from backend.src.api.utils import ensure_write_permission, error_response, now_iso
+from backend.src.api.utils import clamp_page_limit, error_response, now_iso, require_write_permission
+from backend.src.common.sql import in_clause_placeholders
+from backend.src.common.utils import parse_json_list
 from backend.src.constants import (
     CLEANUP_MODE_ARCHIVE,
     CLEANUP_MODE_DELETE,
@@ -60,20 +62,132 @@ _CLEANUP_TABLES = {
 }
 
 
+def _invalid_mode_error():
+    return error_response(
+        ERROR_CODE_INVALID_REQUEST,
+        "非法清理模式",
+        HTTP_STATUS_BAD_REQUEST,
+    )
+
+
+def _missing_cutoff_error():
+    return error_response(
+        ERROR_CODE_INVALID_REQUEST,
+        "缺少保留天数或截止时间",
+        HTTP_STATUS_BAD_REQUEST,
+    )
+
+
+def _unsupported_tables_error(invalid_tables: List[str]):
+    return error_response(
+        ERROR_CODE_INVALID_REQUEST,
+        f"不支持的表: {', '.join(invalid_tables)}",
+        HTTP_STATUS_BAD_REQUEST,
+    )
+
+
+def _normalize_cleanup_mode(mode: Optional[str]) -> Tuple[Optional[str], Optional[dict]]:
+    mode_value = mode or CLEANUP_MODE_DELETE
+    if mode_value not in {CLEANUP_MODE_DELETE, CLEANUP_MODE_ARCHIVE}:
+        return None, _invalid_mode_error()
+    return mode_value, None
+
+
+def _invalid_cleanup_tables(tables: List[str]) -> List[str]:
+    return [name for name in tables if name not in _CLEANUP_TABLES]
+
+
+def _normalize_cleanup_tables(
+    tables: Optional[List[str]],
+) -> Tuple[Optional[List[str]], Optional[dict]]:
+    table_list = tables or list(_CLEANUP_TABLES.keys())
+    invalid_tables = _invalid_cleanup_tables(table_list)
+    if invalid_tables:
+        return None, _unsupported_tables_error(invalid_tables)
+    return table_list, None
+
+
+def _payload_bool(value: Optional[bool], *, default: bool) -> bool:
+    return bool(value) if value is not None else bool(default)
+
+
+def _payload_int(value: Optional[int], *, default: int) -> int:
+    try:
+        return int(value) if value is not None else int(default)
+    except Exception:
+        return int(default)
+
+
+def _payload_float(value: Optional[float], *, default: float) -> float:
+    try:
+        return float(value) if value is not None else float(default)
+    except Exception:
+        return float(default)
+
+
+def _payload_text(
+    value: Optional[str],
+    *,
+    default: Optional[str] = None,
+    lower: bool = False,
+) -> Optional[str]:
+    text = str(value or "").strip()
+    if lower:
+        text = text.lower()
+    if text:
+        return text
+    return default
+
+
+def _invalid_positive_int_error(field_name: str) -> dict:
+    return error_response(
+        ERROR_CODE_INVALID_REQUEST,
+        f"{field_name} 必须为正整数",
+        HTTP_STATUS_BAD_REQUEST,
+    )
+
+
+def _invalid_kind_error() -> dict:
+    return error_response(
+        code=ERROR_CODE_INVALID_REQUEST,
+        message="invalid_kind",
+        status_code=HTTP_STATUS_BAD_REQUEST,
+    )
+
+
+def _cleanup_job_not_found_error() -> dict:
+    return error_response(
+        ERROR_CODE_INVALID_REQUEST,
+        "任务不存在",
+        HTTP_STATUS_BAD_REQUEST,
+    )
+
+
+def _resolve_positive_int(
+    value: Optional[int],
+    *,
+    default: int,
+    field_name: str,
+) -> Tuple[Optional[int], Optional[dict]]:
+    parsed = _payload_int(value, default=default)
+    if parsed <= 0:
+        return None, _invalid_positive_int_error(field_name)
+    return parsed, None
+
+
 @router.post("/maintenance/stop-running")
+@require_write_permission
 def maintenance_stop_running() -> dict:
     """
     终止遗留的 running 状态（用于应用退出/崩溃后的自恢复）。
 
     典型场景：Electron 退出时 kill 掉 uvicorn，导致 tasks/task_runs/task_steps 的 finally 没机会把状态从 running 改回去。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     return {"result": stop_running_task_records(reason="maintenance_api")}
 
 
 @router.post("/maintenance/knowledge/rollback")
+@require_write_permission
 def maintenance_knowledge_rollback(payload: MaintenanceKnowledgeRollbackRequest) -> dict:
     """
     知识治理：一键回滚/废弃某次 run 产生的知识（skills/tools）。
@@ -82,116 +196,98 @@ def maintenance_knowledge_rollback(payload: MaintenanceKnowledgeRollbackRequest)
     - 某次 run 沉淀了错误的技能/工具，导致后续检索与规划被污染；
     - 需要快速把这次 run 的知识降级为 deprecated/abandoned 或工具 rejected。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     return rollback_knowledge_from_run(
         run_id=int(payload.run_id),
-        dry_run=bool(payload.dry_run) if payload.dry_run is not None else False,
-        include_skills=bool(payload.include_skills) if payload.include_skills is not None else True,
-        include_tools=bool(payload.include_tools) if payload.include_tools is not None else True,
-        draft_skill_target_status=str(payload.draft_skill_target_status or "").strip().lower()
+        dry_run=_payload_bool(payload.dry_run, default=False),
+        include_skills=_payload_bool(payload.include_skills, default=True),
+        include_tools=_payload_bool(payload.include_tools, default=True),
+        draft_skill_target_status=_payload_text(
+            payload.draft_skill_target_status,
+            default="abandoned",
+            lower=True,
+        )
         or "abandoned",
-        approved_skill_target_status=str(payload.approved_skill_target_status or "").strip().lower()
+        approved_skill_target_status=_payload_text(
+            payload.approved_skill_target_status,
+            default="deprecated",
+            lower=True,
+        )
         or "deprecated",
-        tool_target_status=str(payload.tool_target_status or "").strip().lower() or "rejected",
-        reason=str(payload.reason or "").strip() or None,
+        tool_target_status=_payload_text(payload.tool_target_status, default="rejected", lower=True)
+        or "rejected",
+        reason=_payload_text(payload.reason),
     )
 
 
 @router.post("/maintenance/knowledge/auto-deprecate")
+@require_write_permission
 def maintenance_knowledge_auto_deprecate(payload: MaintenanceKnowledgeAutoDeprecateRequest) -> dict:
     """
     知识治理：按“最近成功率/复用验证”信号自动废弃低质量知识（skills/tools）。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    try:
-        since_days = int(payload.since_days) if payload.since_days is not None else 30
-    except Exception:
-        since_days = 30
-    try:
-        min_calls = int(payload.min_calls) if payload.min_calls is not None else 3
-    except Exception:
-        min_calls = 3
-    try:
-        threshold = float(payload.success_rate_threshold) if payload.success_rate_threshold is not None else 0.3
-    except Exception:
-        threshold = 0.3
+    since_days = _payload_int(payload.since_days, default=30)
+    min_calls = _payload_int(payload.min_calls, default=3)
+    threshold = _payload_float(payload.success_rate_threshold, default=0.3)
 
     return auto_deprecate_low_quality_knowledge(
         since_days=int(since_days),
         min_calls=int(min_calls),
         success_rate_threshold=float(threshold),
-        dry_run=bool(payload.dry_run) if payload.dry_run is not None else False,
-        include_skills=bool(payload.include_skills) if payload.include_skills is not None else True,
-        include_tools=bool(payload.include_tools) if payload.include_tools is not None else True,
-        reason=str(payload.reason or "").strip() or None,
+        dry_run=_payload_bool(payload.dry_run, default=False),
+        include_skills=_payload_bool(payload.include_skills, default=True),
+        include_tools=_payload_bool(payload.include_tools, default=True),
+        reason=_payload_text(payload.reason),
     )
 
 
 @router.post("/maintenance/knowledge/rollback-version")
+@require_write_permission
 def maintenance_knowledge_rollback_version(payload: MaintenanceKnowledgeRollbackVersionRequest) -> dict:
     """
     知识治理：一键回滚到上一版本（skills/tools）。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    kind = str(payload.kind or "").strip().lower()
+    kind = _payload_text(payload.kind, default="", lower=True) or ""
     rid = int(payload.id)
-    dry_run = bool(payload.dry_run) if payload.dry_run is not None else False
-    reason = str(payload.reason or "").strip() or None
+    dry_run = _payload_bool(payload.dry_run, default=False)
+    reason = _payload_text(payload.reason)
     if kind == "skill":
         return rollback_skill_to_previous_version(skill_id=int(rid), dry_run=dry_run, reason=reason)
     if kind == "tool":
         return rollback_tool_to_previous_version(tool_id=int(rid), dry_run=dry_run, reason=reason)
-    return error_response(code=ERROR_CODE_INVALID_REQUEST, message="invalid_kind", status_code=HTTP_STATUS_BAD_REQUEST)
+    return _invalid_kind_error()
 
 
 @router.post("/maintenance/knowledge/validate-tags")
+@require_write_permission
 def maintenance_knowledge_validate_tags(payload: MaintenanceKnowledgeValidateTagsRequest) -> dict:
     """
     知识治理：校验/修复 skills_items.tags。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    dry_run = bool(payload.dry_run) if payload.dry_run is not None else True
-    fix = bool(payload.fix) if payload.fix is not None else False
-    strict_keys = bool(payload.strict_keys) if payload.strict_keys is not None else False
-    include_draft = bool(payload.include_draft) if payload.include_draft is not None else True
-    try:
-        limit = int(payload.limit) if payload.limit is not None else 5000
-    except Exception:
-        limit = 5000
+    dry_run = _payload_bool(payload.dry_run, default=True)
+    fix = _payload_bool(payload.fix, default=False)
+    strict_keys = _payload_bool(payload.strict_keys, default=False)
+    include_draft = _payload_bool(payload.include_draft, default=True)
+    limit = _payload_int(payload.limit, default=5000)
 
     return validate_and_fix_skill_tags(
         dry_run=dry_run,
         fix=fix,
         strict_keys=strict_keys,
         include_draft=include_draft,
-        limit=int(limit),
+        limit=limit,
     )
 
 
 @router.post("/maintenance/knowledge/dedupe-skills")
+@require_write_permission
 def maintenance_knowledge_dedupe_skills(payload: MaintenanceKnowledgeDedupeSkillsRequest) -> dict:
     """
     知识治理：去重 + 版本合并（同 scope/name）。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    dry_run = bool(payload.dry_run) if payload.dry_run is not None else True
-    include_draft = bool(payload.include_draft) if payload.include_draft is not None else True
-    merge_across_domains = bool(payload.merge_across_domains) if payload.merge_across_domains is not None else False
-    reason = str(payload.reason or "").strip() or None
+    dry_run = _payload_bool(payload.dry_run, default=True)
+    include_draft = _payload_bool(payload.include_draft, default=True)
+    merge_across_domains = _payload_bool(payload.merge_across_domains, default=False)
+    reason = _payload_text(payload.reason)
 
     return dedupe_and_merge_skills(
         dry_run=dry_run,
@@ -262,7 +358,9 @@ def _archive_rows(
             for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
         ]
         columns = [name for name in columns if name != "archived_at"]
-        placeholders = ",".join(["?"] * len(ids))
+        placeholders = in_clause_placeholders(ids)
+        if not placeholders:
+            return 0, archive_table
         column_list = ", ".join(columns)
         conn.execute(
             f"INSERT INTO {archive_table} ({column_list}, archived_at) "
@@ -279,7 +377,9 @@ def _archive_rows(
 def _delete_rows(table_name: str, ids: List[int]) -> int:
     if not ids:
         return 0
-    placeholders = ",".join(["?"] * len(ids))
+    placeholders = in_clause_placeholders(ids)
+    if not placeholders:
+        return 0
     with get_connection() as conn:
         conn.execute(
             f"DELETE FROM {table_name} WHERE id IN ({placeholders})",
@@ -294,7 +394,7 @@ def _serialize_job_row(row) -> dict:
         "name": row["name"],
         "status": row["status"],
         "mode": row["mode"],
-        "tables": json.loads(row["tables"]) if row["tables"] else [],
+        "tables": parse_json_list(row["tables"]),
         "retention_days": row["retention_days"],
         "before": row["before"],
         "limit": row["limit_value"],
@@ -349,7 +449,7 @@ def _run_job_once(job_row, run_at: str) -> None:
     run_id = _create_job_run(job_row["id"], run_at)
     payload = MaintenanceCleanupRequest(
         mode=job_row["mode"],
-        tables=json.loads(job_row["tables"]) if job_row["tables"] else None,
+        tables=parse_json_list(job_row["tables"]) or None,
         retention_days=job_row["retention_days"],
         before=job_row["before"],
         limit=job_row["limit_value"],
@@ -431,38 +531,23 @@ def _ensure_scheduler_started() -> None:
 
 
 @router.post("/maintenance/cleanup")
+@require_write_permission
 def cleanup_records(payload: MaintenanceCleanupRequest) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     return _cleanup_execute(payload)
 
 
 def _cleanup_execute(payload: MaintenanceCleanupRequest) -> dict:
-    mode = payload.mode or CLEANUP_MODE_DELETE
-    if mode not in {CLEANUP_MODE_DELETE, CLEANUP_MODE_ARCHIVE}:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            "非法清理模式",
-            HTTP_STATUS_BAD_REQUEST,
-        )
+    mode, mode_error = _normalize_cleanup_mode(payload.mode)
+    if mode_error:
+        return mode_error
     cutoff = _resolve_cutoff(payload.retention_days, payload.before)
     if not cutoff:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            "缺少保留天数或截止时间",
-            HTTP_STATUS_BAD_REQUEST,
-        )
-    tables = payload.tables or list(_CLEANUP_TABLES.keys())
-    invalid_tables = [name for name in tables if name not in _CLEANUP_TABLES]
-    if invalid_tables:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            f"不支持的表: {', '.join(invalid_tables)}",
-            HTTP_STATUS_BAD_REQUEST,
-        )
+        return _missing_cutoff_error()
+    tables, tables_error = _normalize_cleanup_tables(payload.tables)
+    if tables_error:
+        return tables_error
     limit = payload.limit or DEFAULT_CLEANUP_LIMIT
-    dry_run = bool(payload.dry_run)
+    dry_run = _payload_bool(payload.dry_run, default=False)
     archived_at = now_iso()
     results: List[Dict] = []
     for table_name in tables:
@@ -513,44 +598,25 @@ def _cleanup_execute(payload: MaintenanceCleanupRequest) -> dict:
 
 
 @router.post("/maintenance/jobs")
+@require_write_permission
 def create_cleanup_job(payload: CleanupJobCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-    mode = payload.mode or CLEANUP_MODE_DELETE
-    if mode not in {CLEANUP_MODE_DELETE, CLEANUP_MODE_ARCHIVE}:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            "非法清理模式",
-            HTTP_STATUS_BAD_REQUEST,
-        )
-    tables = payload.tables or list(_CLEANUP_TABLES.keys())
-    invalid_tables = [name for name in tables if name not in _CLEANUP_TABLES]
-    if invalid_tables:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            f"不支持的表: {', '.join(invalid_tables)}",
-            HTTP_STATUS_BAD_REQUEST,
-        )
-    interval_minutes = (
-        payload.interval_minutes
-        if payload.interval_minutes is not None
-        else DEFAULT_CLEANUP_JOB_INTERVAL_MINUTES
+    mode, mode_error = _normalize_cleanup_mode(payload.mode)
+    if mode_error:
+        return mode_error
+    tables, tables_error = _normalize_cleanup_tables(payload.tables)
+    if tables_error:
+        return tables_error
+    interval_minutes, interval_error = _resolve_positive_int(
+        payload.interval_minutes,
+        default=DEFAULT_CLEANUP_JOB_INTERVAL_MINUTES,
+        field_name="interval_minutes",
     )
-    if int(interval_minutes) <= 0:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            "interval_minutes 必须为正整数",
-            HTTP_STATUS_BAD_REQUEST,
-        )
+    if interval_error:
+        return interval_error
     retention_days = payload.retention_days
     before = payload.before
     if retention_days is None and not before:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            "缺少保留天数或截止时间",
-            HTTP_STATUS_BAD_REQUEST,
-        )
+        return _missing_cutoff_error()
     created_at = now_iso()
     updated_at = created_at
     status = (
@@ -597,41 +663,32 @@ def get_cleanup_job(job_id: int) -> dict:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM cleanup_jobs WHERE id = ?", (job_id,)).fetchone()
     if not row:
-        return error_response(ERROR_CODE_INVALID_REQUEST, "任务不存在", HTTP_STATUS_BAD_REQUEST)
+        return _cleanup_job_not_found_error()
     return {"job": _serialize_job_row(row)}
 
 
 @router.patch("/maintenance/jobs/{job_id}")
+@require_write_permission
 def update_cleanup_job(job_id: int, payload: CleanupJobUpdate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     fields = []
     params: List = []
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM cleanup_jobs WHERE id = ?", (job_id,)).fetchone()
         if not row:
-            return error_response(ERROR_CODE_INVALID_REQUEST, "任务不存在", HTTP_STATUS_BAD_REQUEST)
+            return _cleanup_job_not_found_error()
         if payload.name is not None:
             fields.append("name = ?")
             params.append(payload.name)
         if payload.mode is not None:
-            if payload.mode not in {CLEANUP_MODE_DELETE, CLEANUP_MODE_ARCHIVE}:
-                return error_response(
-                    ERROR_CODE_INVALID_REQUEST,
-                    "非法清理模式",
-                    HTTP_STATUS_BAD_REQUEST,
-                )
+            _, mode_error = _normalize_cleanup_mode(payload.mode)
+            if mode_error:
+                return mode_error
             fields.append("mode = ?")
             params.append(payload.mode)
         if payload.tables is not None:
-            invalid_tables = [name for name in payload.tables if name not in _CLEANUP_TABLES]
+            invalid_tables = _invalid_cleanup_tables(payload.tables)
             if invalid_tables:
-                return error_response(
-                    ERROR_CODE_INVALID_REQUEST,
-                    f"不支持的表: {', '.join(invalid_tables)}",
-                    HTTP_STATUS_BAD_REQUEST,
-                )
+                return _unsupported_tables_error(invalid_tables)
             fields.append("tables = ?")
             params.append(json.dumps(payload.tables))
         if payload.retention_days is not None:
@@ -644,16 +701,17 @@ def update_cleanup_job(job_id: int, payload: CleanupJobUpdate) -> dict:
             fields.append("limit_value = ?")
             params.append(payload.limit)
         if payload.interval_minutes is not None:
-            if int(payload.interval_minutes) <= 0:
-                return error_response(
-                    ERROR_CODE_INVALID_REQUEST,
-                    "interval_minutes 必须为正整数",
-                    HTTP_STATUS_BAD_REQUEST,
-                )
+            interval_minutes, interval_error = _resolve_positive_int(
+                payload.interval_minutes,
+                default=DEFAULT_CLEANUP_JOB_INTERVAL_MINUTES,
+                field_name="interval_minutes",
+            )
+            if interval_error:
+                return interval_error
             fields.append("interval_minutes = ?")
-            params.append(payload.interval_minutes)
+            params.append(interval_minutes)
             fields.append("next_run_at = ?")
-            params.append(_compute_next_run(None, payload.interval_minutes))
+            params.append(_compute_next_run(None, interval_minutes))
         if payload.enabled is not None:
             fields.append("status = ?")
             params.append(
@@ -674,10 +732,11 @@ def update_cleanup_job(job_id: int, payload: CleanupJobUpdate) -> dict:
 
 @router.get("/maintenance/jobs/{job_id}/runs")
 def list_cleanup_job_runs(job_id: int, limit: int = DEFAULT_CLEANUP_LIMIT) -> dict:
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_CLEANUP_LIMIT)
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM cleanup_job_runs WHERE job_id = ? ORDER BY id DESC LIMIT ?",
-            (job_id, limit),
+            (job_id, safe_limit),
         ).fetchall()
     return {
         "items": [
@@ -696,21 +755,15 @@ def list_cleanup_job_runs(job_id: int, limit: int = DEFAULT_CLEANUP_LIMIT) -> di
 
 
 @router.post("/maintenance/jobs/{job_id}/run")
+@require_write_permission
 def run_cleanup_job(job_id: int) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     with get_connection() as conn:
         row = conn.execute(
             "SELECT * FROM cleanup_jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
     if not row:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            "任务不存在",
-            HTTP_STATUS_BAD_REQUEST,
-        )
+        return _cleanup_job_not_found_error()
     _ensure_scheduler_started()
     _run_job_async(row)
     return {"job": _serialize_job_row(row), "queued": True}

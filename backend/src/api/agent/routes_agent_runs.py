@@ -3,9 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
-from backend.src.api.utils import error_response, parse_json_value
+from backend.src.api.utils import (
+    clamp_page_limit,
+    error_response,
+    parse_json_value,
+    parse_positive_int,
+)
 from backend.src.constants import (
     ERROR_CODE_INVALID_REQUEST,
     ERROR_CODE_NOT_FOUND,
@@ -15,14 +20,38 @@ from backend.src.constants import (
     RUN_STATUS_RUNNING,
     RUN_STATUS_WAITING,
 )
-from backend.src.repositories.task_runs_repo import (
+from backend.src.services.tasks.task_queries import (
     fetch_agent_run_with_task_title_by_statuses,
     fetch_latest_agent_run_with_task_title,
     get_task_run_with_task_title,
+    list_task_run_events,
 )
 from backend.src.storage import get_connection
 
 router = APIRouter()
+
+
+def _record_not_found_response():
+    return error_response(
+        ERROR_CODE_NOT_FOUND,
+        ERROR_MESSAGE_RECORD_NOT_FOUND,
+        HTTP_STATUS_NOT_FOUND,
+    )
+
+
+def _invalid_run_id_response():
+    return error_response(
+        ERROR_CODE_INVALID_REQUEST,
+        "run_id 不合法",
+        HTTP_STATUS_BAD_REQUEST,
+    )
+
+
+def _parse_run_id_or_error(run_id: Any) -> tuple[Optional[int], Optional[dict]]:
+    rid = parse_positive_int(run_id, default=None)
+    if rid is None:
+        return None, _invalid_run_id_response()
+    return int(rid), None
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -289,23 +318,20 @@ def get_agent_run_detail(run_id: int) -> dict:
     """
     获取某次 Agent run 的 plan/state 细节，用于主面板展示“计划/观测/暂停点”。
     """
-    try:
-        rid = int(run_id)
-    except Exception:
-        rid = 0
-    if rid <= 0:
-        return error_response(ERROR_CODE_INVALID_REQUEST, "run_id 不合法", HTTP_STATUS_BAD_REQUEST)
+    rid, rid_error = _parse_run_id_or_error(run_id)
+    if rid_error:
+        return rid_error
 
-    row = get_task_run_with_task_title(run_id=int(rid))
+    row = get_task_run_with_task_title(run_id=rid)
     if not row:
-        return error_response(ERROR_CODE_NOT_FOUND, ERROR_MESSAGE_RECORD_NOT_FOUND, HTTP_STATUS_NOT_FOUND)
+        return _record_not_found_response()
 
     agent_plan = parse_json_value(row["agent_plan"]) or None
     agent_state = parse_json_value(row["agent_state"]) or None
 
     # ===== 运行快照（P3：可观测性）=====
     plan_snapshot = _compute_plan_snapshot(agent_plan=agent_plan, agent_state=agent_state)
-    counters = _compute_run_counters(run_id=int(rid))
+    counters = _compute_run_counters(run_id=rid)
 
     # stage：优先以 run.status 收敛（waiting/done/failed/stopped），running 时再看 agent_state.stage。
     status_value = str(row["status"] or "").strip().lower()
@@ -355,4 +381,51 @@ def get_agent_run_detail(run_id: int) -> dict:
         "agent_plan": agent_plan,
         "agent_state": agent_state,
         "snapshot": snapshot,
+    }
+
+
+@router.get("/agent/runs/{run_id}/events")
+def get_agent_run_events(
+    run_id: int,
+    after_event_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict:
+    """
+    获取 run 事件回放日志（用于 SSE 断流后的增量恢复）。
+    """
+    rid, rid_error = _parse_run_id_or_error(run_id)
+    if rid_error:
+        return rid_error
+
+    run_row = get_task_run_with_task_title(run_id=rid)
+    if not run_row:
+        return _record_not_found_response()
+
+    safe_limit = clamp_page_limit(limit, default=200, max_value=2000)
+    rows = list_task_run_events(
+        run_id=rid,
+        after_event_id=str(after_event_id or "").strip() or None,
+        limit=safe_limit,
+    )
+    items = []
+    for row in rows or []:
+        payload = parse_json_value(row["payload"]) if "payload" in set(row.keys()) else None
+        items.append(
+            {
+                "id": _safe_int(row["id"]),
+                "task_id": _safe_int(row["task_id"]),
+                "run_id": _safe_int(row["run_id"]),
+                "session_key": str(row["session_key"] or "").strip() or None,
+                "event_id": str(row["event_id"] or "").strip() or None,
+                "event_type": str(row["event_type"] or "").strip() or None,
+                "payload": payload if isinstance(payload, dict) else None,
+                "created_at": str(row["created_at"] or "").strip() or None,
+            }
+        )
+
+    return {
+        "run_id": rid,
+        "task_id": _safe_int(run_row["task_id"]),
+        "after_event_id": str(after_event_id or "").strip() or None,
+        "items": items,
     }

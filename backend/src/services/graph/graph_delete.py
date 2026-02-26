@@ -3,14 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.src.common.errors import AppError
+from backend.src.common.app_error_utils import invalid_request_error, not_found_error
 from backend.src.constants import (
-    ERROR_CODE_INVALID_REQUEST,
-    ERROR_CODE_NOT_FOUND,
     ERROR_MESSAGE_EDGE_NOT_FOUND,
     ERROR_MESSAGE_NODE_NOT_FOUND,
-    HTTP_STATUS_BAD_REQUEST,
-    HTTP_STATUS_NOT_FOUND,
 )
 from backend.src.prompt.file_trash import finalize_staged_delete, restore_staged_file, stage_delete_file
 from backend.src.prompt.paths import graph_prompt_dir
@@ -23,7 +19,6 @@ from backend.src.repositories.graph_repo import (
 from backend.src.services.graph.graph_store import graph_edge_file_path, graph_node_file_path
 from backend.src.storage import get_connection
 
-
 def _stage_one(root: Path, target: Path) -> Tuple[Optional[Path], Optional[str]]:
     return stage_delete_file(root_dir=root, target_path=target)
 
@@ -34,31 +29,19 @@ def delete_graph_edge_strong(edge_id: int) -> Dict[str, Any]:
     """
     existing = get_graph_edge_repo(edge_id=int(edge_id))
     if not existing:
-        raise AppError(
-            code=ERROR_CODE_NOT_FOUND,
-            message=ERROR_MESSAGE_EDGE_NOT_FOUND,
-            status_code=HTTP_STATUS_NOT_FOUND,
-        )
+        raise not_found_error(ERROR_MESSAGE_EDGE_NOT_FOUND)
 
     root = graph_prompt_dir().resolve()
     target_path = graph_edge_file_path(int(edge_id)).resolve()
     trash_path, err = _stage_one(root, target_path)
     if err:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=str(err),
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error(str(err))
 
     try:
         with get_connection() as conn:
             row = delete_graph_edge_repo(edge_id=int(edge_id), conn=conn)
             if not row:
-                raise AppError(
-                    code=ERROR_CODE_NOT_FOUND,
-                    message=ERROR_MESSAGE_EDGE_NOT_FOUND,
-                    status_code=HTTP_STATUS_NOT_FOUND,
-                )
+                raise not_found_error(ERROR_MESSAGE_EDGE_NOT_FOUND)
     except Exception:
         if trash_path:
             restore_staged_file(original_path=target_path, trash_path=trash_path)
@@ -84,11 +67,7 @@ def delete_graph_node_strong(node_id: int) -> Dict[str, Any]:
     """
     existing = get_graph_node_repo(node_id=int(node_id))
     if not existing:
-        raise AppError(
-            code=ERROR_CODE_NOT_FOUND,
-            message=ERROR_MESSAGE_NODE_NOT_FOUND,
-            status_code=HTTP_STATUS_NOT_FOUND,
-        )
+        raise not_found_error(ERROR_MESSAGE_NODE_NOT_FOUND)
 
     root = graph_prompt_dir().resolve()
 
@@ -105,7 +84,7 @@ def delete_graph_node_strong(node_id: int) -> Dict[str, Any]:
     def _stage(target: Path) -> None:
         trash_path, err = _stage_one(root, target)
         if err:
-            raise AppError(ERROR_CODE_INVALID_REQUEST, str(err), HTTP_STATUS_BAD_REQUEST)
+            raise invalid_request_error(str(err))
         if trash_path:
             staged.append((target, trash_path))
 
@@ -119,11 +98,7 @@ def delete_graph_node_strong(node_id: int) -> Dict[str, Any]:
         with get_connection() as conn:
             row = delete_graph_node_repo(node_id=int(node_id), conn=conn)
             if not row:
-                raise AppError(
-                    code=ERROR_CODE_NOT_FOUND,
-                    message=ERROR_MESSAGE_NODE_NOT_FOUND,
-                    status_code=HTTP_STATUS_NOT_FOUND,
-                )
+                raise not_found_error(ERROR_MESSAGE_NODE_NOT_FOUND)
     except Exception:
         # 回滚：尽量恢复所有已暂存文件
         for original, trash in reversed(staged):

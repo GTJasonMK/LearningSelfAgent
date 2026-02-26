@@ -5,7 +5,14 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.src.common.utils import atomic_write_text, now_iso
+from backend.src.common.path_utils import is_path_within_root
+from backend.src.common.utils import (
+    atomic_write_text,
+    build_json_frontmatter_markdown,
+    discover_markdown_files,
+    now_iso,
+    parse_json_dict,
+)
 from backend.src.constants import DEFAULT_TOOL_VERSION
 from backend.src.prompt.file_trash import stage_delete_file
 from backend.src.prompt.paths import tools_prompt_dir
@@ -15,21 +22,9 @@ from backend.src.storage import get_connection
 
 logger = logging.getLogger(__name__)
 
-_FRONTMATTER_DELIM = "---"
 
-
-def _build_tool_markdown(meta: Dict[str, Any], body: Optional[str] = None) -> str:
-    """
-    生成 tool Markdown（JSON frontmatter + 正文）。
-
-    说明：
-    - 使用 JSON frontmatter，避免强依赖 PyYAML；
-    - 正文主要用于人工补充说明（可为空）。
-    """
-    fm_text = json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True).strip()
-    body_text = str(body or "").rstrip()
-    lines = [_FRONTMATTER_DELIM, fm_text, _FRONTMATTER_DELIM, "", body_text, ""]
-    return "\n".join(lines)
+def _dump_json_or_none(value: Any) -> Optional[str]:
+    return json.dumps(value, ensure_ascii=False) if value is not None else None
 
 
 def _tools_base_dir(base_dir: Optional[Path] = None) -> Path:
@@ -38,20 +33,6 @@ def _tools_base_dir(base_dir: Optional[Path] = None) -> Path:
 
 def tool_file_path_from_source_path(source_path: str, base_dir: Optional[Path] = None) -> Path:
     return _tools_base_dir(base_dir) / Path(str(source_path or "").strip())
-
-
-def _safe_json_obj(value: Any) -> Optional[dict]:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            out = json.loads(value)
-            return out if isinstance(out, dict) else None
-        except json.JSONDecodeError:
-            return None
-    return None
 
 
 def publish_tool_file(
@@ -80,7 +61,7 @@ def publish_tool_file(
         "name": row["name"],
         "description": row["description"],
         "version": row["version"],
-        "metadata": _safe_json_obj(row["metadata"]) if row["metadata"] else None,
+        "metadata": parse_json_dict(row["metadata"]) if row["metadata"] else None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "last_used_at": row["last_used_at"],
@@ -90,12 +71,9 @@ def publish_tool_file(
     if existing_source_path:
         target = tool_file_path_from_source_path(existing_source_path, base_dir=base_dir).resolve()
         root = _tools_base_dir(base_dir).resolve()
-        try:
-            if not target.is_relative_to(root):
-                return {"ok": False, "error": "invalid_source_path"}
-        except Exception:
+        if not is_path_within_root(target, root):
             return {"ok": False, "error": "invalid_source_path"}
-        markdown = _build_tool_markdown(meta=meta, body="")
+        markdown = build_json_frontmatter_markdown(meta=meta, body="")
         atomic_write_text(target, markdown, encoding="utf-8")
         return {"ok": True, "source_path": existing_source_path.replace("\\", "/"), "path": str(target)}
 
@@ -103,9 +81,12 @@ def publish_tool_file(
     filename = f"{slugify_filename(str(row['name'] or 'tool'))}_{int(row['id'])}.md"
     rel = filename
     target = (_tools_base_dir(base_dir) / filename).resolve()
-    markdown = _build_tool_markdown(meta=meta, body="")
-    atomic_write_text(target, markdown, encoding="utf-8")
+    markdown = build_json_frontmatter_markdown(meta=meta, body="")
+    # 先更新 DB（在事务内），再写文件：
+    # - DB 失败 → 事务回滚，文件不写，一致；
+    # - DB 成功但文件失败 → 下次 sync 会从 DB 补齐文件，不丢数据。
     conn.execute("UPDATE tools_items SET source_path = ? WHERE id = ?", (rel, int(tool_id)))
+    atomic_write_text(target, markdown, encoding="utf-8")
     return {"ok": True, "source_path": rel.replace("\\", "/"), "path": str(target)}
 
 
@@ -119,10 +100,7 @@ def stage_delete_tool_file_by_source_path(source_path: Optional[str]) -> Tuple[O
 
     root = tools_prompt_dir().resolve()
     target = tool_file_path_from_source_path(value).resolve()
-    try:
-        if not target.is_relative_to(root):
-            return None, "invalid_source_path"
-    except Exception:
+    if not is_path_within_root(target, root):
         return None, "invalid_source_path"
 
     trash_path, err = stage_delete_file(root_dir=root, target_path=target)
@@ -135,23 +113,6 @@ def stage_delete_tool_file_by_source_path(source_path: Optional[str]) -> Tuple[O
     except Exception:
         rel = str(trash_path)
     return rel, None
-
-
-def _discover_tool_files(base_dir: Path) -> List[Path]:
-    if not base_dir.exists():
-        return []
-    files: List[Path] = []
-    for path in base_dir.rglob("*.md"):
-        if not path.is_file():
-            continue
-        name = path.name.lower()
-        if name in {"readme.md", "_readme.md"}:
-            continue
-        # 跳过隐藏目录/文件（例如 .trash）
-        if any(part.startswith(".") for part in path.parts):
-            continue
-        files.append(path)
-    return sorted(files)
 
 
 def sync_tools_from_files(base_dir: Optional[Path] = None, *, prune: bool = True) -> dict:
@@ -171,7 +132,7 @@ def sync_tools_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
     discovered_source_paths = set()
     parsed_items: List[Tuple[str, Dict[str, Any]]] = []
 
-    for path in _discover_tool_files(base):
+    for path in discover_markdown_files(base):
         try:
             rel = str(path.relative_to(base)).replace("\\", "/")
         except Exception:
@@ -202,7 +163,7 @@ def sync_tools_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
             if not version:
                 version = DEFAULT_TOOL_VERSION
             metadata_obj = meta.get("metadata")
-            metadata = metadata_obj if isinstance(metadata_obj, dict) else _safe_json_obj(metadata_obj)
+            metadata = parse_json_dict(metadata_obj)
 
             created_at = str(meta.get("created_at") or "").strip() or now_iso()
             updated_at = str(meta.get("updated_at") or "").strip() or created_at
@@ -228,7 +189,7 @@ def sync_tools_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
                             created_at,
                             updated_at,
                             last_used_at,
-                            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+                            _dump_json_or_none(metadata),
                             source_path,
                             int(tool_id),
                         ),
@@ -247,7 +208,7 @@ def sync_tools_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
                         created_at,
                         updated_at,
                         last_used_at,
-                        json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+                        _dump_json_or_none(metadata),
                         source_path,
                     ),
                 )
@@ -266,7 +227,7 @@ def sync_tools_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
                         description or "",
                         version,
                         updated_at,
-                        json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+                        _dump_json_or_none(metadata),
                         int(row["id"]),
                     ),
                 )
@@ -281,7 +242,7 @@ def sync_tools_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
                         created_at,
                         updated_at,
                         last_used_at,
-                        json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+                        _dump_json_or_none(metadata),
                         source_path,
                     ),
                 )

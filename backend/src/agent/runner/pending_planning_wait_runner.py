@@ -10,6 +10,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from backend.src.agent.runner.execution_pipeline import enter_pending_planning_waiting
 from backend.src.agent.runner.stream_task_events import iter_stream_task_events
+from backend.src.common.utils import parse_positive_int
 
 
 @dataclass
@@ -52,7 +53,7 @@ async def iter_pending_planning_wait_events(
             workdir=str(config.workdir or ""),
             model=str(config.model or ""),
             parameters=dict(config.parameters or {}),
-            max_steps=int(config.max_steps),
+            max_steps=config.max_steps,
             user_prompt_question=str(config.user_prompt_question or ""),
             tools_hint=str(config.tools_hint or "(无)"),
             skills_hint=str(config.skills_hint or "(无)"),
@@ -62,11 +63,7 @@ async def iter_pending_planning_wait_events(
             domain_ids=list(config.domain_ids or []),
             skills=list(config.skills or []),
             solutions=list(config.solutions or []),
-            draft_solution_id=(
-                int(config.draft_solution_id)
-                if isinstance(config.draft_solution_id, int) and int(config.draft_solution_id) > 0
-                else None
-            ),
+            draft_solution_id=parse_positive_int(config.draft_solution_id, default=None),
             think_config=config.think_config if isinstance(config.think_config, dict) else None,
             yield_func=emit,
             safe_write_debug_func=config.safe_write_debug_func,

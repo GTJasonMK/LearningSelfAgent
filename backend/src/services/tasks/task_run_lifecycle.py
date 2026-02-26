@@ -47,6 +47,16 @@ def _safe_debug(task_id: Optional[int], run_id: Optional[int], message: str, dat
         return
 
 
+def _run_worker_in_test_or_thread(worker) -> None:
+    try:
+        if is_test_env():
+            worker()
+        else:
+            threading.Thread(target=worker, daemon=True).start()
+    except Exception:
+        worker()
+
+
 def normalize_run_status(run_status: object) -> str:
     value = str(run_status or "").strip()
     if value in {
@@ -186,13 +196,7 @@ def enqueue_review_on_feedback_waiting(*, task_id: int, run_id: int, agent_state
         except Exception:
             return
 
-    try:
-        if is_test_env():
-            _worker()
-        else:
-            threading.Thread(target=_worker, daemon=True).start()
-    except Exception:
-        _worker()
+    _run_worker_in_test_or_thread(_worker)
 
 
 def enqueue_postprocess_thread(*, task_id: int, run_id: int, run_status: object) -> None:
@@ -249,13 +253,7 @@ def enqueue_postprocess_thread(*, task_id: int, run_id: int, run_status: object)
             )
             return
 
-    try:
-        if is_test_env():
-            _worker()
-        else:
-            threading.Thread(target=_worker, daemon=True).start()
-    except Exception:
-        _worker()
+    _run_worker_in_test_or_thread(_worker)
 
 
 def enqueue_stop_task_run_records(*, task_id: Optional[int], run_id: int, reason: str) -> None:
@@ -301,10 +299,4 @@ def enqueue_stop_task_run_records(*, task_id: Optional[int], run_id: int, reason
             level="warning",
         )
 
-    try:
-        if is_test_env():
-            _worker()
-        else:
-            threading.Thread(target=_worker, daemon=True).start()
-    except Exception:
-        _worker()
+    _run_worker_in_test_or_thread(_worker)

@@ -2,8 +2,13 @@ import json
 import os
 import tempfile
 import unittest
+import importlib.util
 
 
+HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+
+
+@unittest.skipUnless(HAS_FASTAPI, "fastapi 未安装，跳过依赖路由模块的集成测试")
 class TestTaskExecuteStreamCancelMarksStopped(unittest.TestCase):
     def setUp(self):
         import backend.src.storage as storage

@@ -1,32 +1,33 @@
 import json
-import sqlite3
 import time
 from typing import Any, Callable, TypeVar
 
+from backend.src.common.app_error_utils import invalid_request_error, not_found_error
 from backend.src.common.errors import AppError
+from backend.src.common.sql import run_with_sqlite_locked_retry
 from backend.src.common.serializers import llm_record_from_row
 from backend.src.common.utils import dump_model, now_iso, render_prompt
 from backend.src.constants import (
-    ERROR_CODE_INVALID_REQUEST,
-    ERROR_CODE_NOT_FOUND,
     ERROR_MESSAGE_LLM_CALL_FAILED,
     ERROR_MESSAGE_PROMPT_NOT_FOUND,
     ERROR_MESSAGE_PROMPT_RENDER_FAILED,
-    HTTP_STATUS_BAD_REQUEST,
-    HTTP_STATUS_NOT_FOUND,
     LLM_PROVIDER_OPENAI,
     LLM_STATUS_DRY_RUN,
     LLM_STATUS_ERROR,
     LLM_STATUS_RUNNING,
     LLM_STATUS_SUCCESS,
 )
-from backend.src.services.llm.llm_client import call_llm
+from backend.src.services.llm.llm_client import call_llm, classify_llm_error_text
 from backend.src.storage import get_connection
 
 T = TypeVar("T")
 
 LLM_CALL_MAX_ATTEMPTS = 3
 LLM_CALL_RETRY_BASE_SECONDS = 0.6
+
+
+def _fetch_llm_record_by_id(conn, record_id: int):
+    return conn.execute("SELECT * FROM llm_records WHERE id = ?", (record_id,)).fetchone()
 
 
 def _with_sqlite_locked_retry(op: Callable[[], T]) -> T:
@@ -37,17 +38,7 @@ def _with_sqlite_locked_retry(op: Callable[[], T]) -> T:
     - 依赖 storage.get_connection 的 busy_timeout 先等待；
     - 若仍抛出 locked，再做最多 3 次轻量重试，避免并行 Agent 把瞬时争用误判为“步骤失败”。
     """
-    last_exc: Exception | None = None
-    for attempt in range(0, 3):
-        try:
-            return op()
-        except sqlite3.OperationalError as exc:
-            last_exc = exc
-            if "locked" in str(exc or "").lower() and attempt < 2:
-                time.sleep(0.05 * (attempt + 1))
-                continue
-            raise
-    raise RuntimeError(str(last_exc))
+    return run_with_sqlite_locked_retry(op, attempts=3, base_delay_seconds=0.05)
 
 
 def create_llm_call(payload: Any) -> dict:
@@ -61,11 +52,7 @@ def create_llm_call(payload: Any) -> dict:
     """
     data = dump_model(payload)
     if not data.get("prompt") and data.get("template_id") is None:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=ERROR_MESSAGE_PROMPT_RENDER_FAILED,
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error(ERROR_MESSAGE_PROMPT_RENDER_FAILED)
 
     prompt_text = data.get("prompt")
     if prompt_text is not None and not isinstance(prompt_text, str):
@@ -77,29 +64,17 @@ def create_llm_call(payload: Any) -> dict:
                 "SELECT * FROM prompt_templates WHERE id = ?", (template_id,)
             ).fetchone()
         if not template_row:
-            raise AppError(
-                code=ERROR_CODE_NOT_FOUND,
-                message=ERROR_MESSAGE_PROMPT_NOT_FOUND,
-                status_code=HTTP_STATUS_NOT_FOUND,
-            )
+            raise not_found_error(ERROR_MESSAGE_PROMPT_NOT_FOUND)
         rendered = render_prompt(
             template_row["template"],
             data.get("variables") if isinstance(data.get("variables"), dict) else None,
         )
         if rendered is None:
-            raise AppError(
-                code=ERROR_CODE_INVALID_REQUEST,
-                message=ERROR_MESSAGE_PROMPT_RENDER_FAILED,
-                status_code=HTTP_STATUS_BAD_REQUEST,
-            )
+            raise invalid_request_error(ERROR_MESSAGE_PROMPT_RENDER_FAILED)
         prompt_text = rendered
 
     if not prompt_text:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=ERROR_MESSAGE_PROMPT_RENDER_FAILED,
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error(ERROR_MESSAGE_PROMPT_RENDER_FAILED)
 
     try:
         from backend.src.services.llm.llm_client import resolve_default_model, resolve_default_provider
@@ -155,32 +130,15 @@ def create_llm_call(payload: Any) -> dict:
                     "UPDATE llm_records SET status = ?, finished_at = ?, updated_at = ? WHERE id = ?",
                     (LLM_STATUS_DRY_RUN, finished_at, finished_at, record_id),
                 )
-                return conn.execute(
-                    "SELECT * FROM llm_records WHERE id = ?", (record_id,)
-                ).fetchone()
+                return _fetch_llm_record_by_id(conn, record_id)
 
         row = _with_sqlite_locked_retry(_mark_dry_run)
         return {"record": llm_record_from_row(row)}
 
     parameters = data.get("parameters") if isinstance(data.get("parameters"), dict) else None
     def _should_retry_llm_error(error_text: str) -> bool:
-        text = str(error_text or "").lower()
-        if not text:
-            return False
-        transient_markers = (
-            "connection error",
-            "timed out",
-            "timeout",
-            "temporarily unavailable",
-            "service unavailable",
-            "rate limit",
-            "too many requests",
-            "429",
-            "502",
-            "503",
-            "504",
-        )
-        return any(marker in text for marker in transient_markers)
+        kind = classify_llm_error_text(error_text)
+        return kind in ("rate_limit", "transient")
 
     response_text = None
     tokens = None
@@ -214,9 +172,7 @@ def create_llm_call(payload: Any) -> dict:
                         record_id,
                     ),
                 )
-                return conn.execute(
-                    "SELECT * FROM llm_records WHERE id = ?", (record_id,)
-                ).fetchone()
+                return _fetch_llm_record_by_id(conn, record_id)
 
         row = _with_sqlite_locked_retry(_mark_error)
         return {"record": llm_record_from_row(row)}
@@ -224,21 +180,19 @@ def create_llm_call(payload: Any) -> dict:
     def _mark_success():
         with get_connection() as conn:
             conn.execute(
-                "UPDATE llm_records SET response = ?, status = ?, finished_at = ?, updated_at = ?, tokens_prompt = ?, tokens_completion = ?, tokens_total = ? WHERE id = ?",
+                "UPDATE llm_records SET response = ?, status = ?, error = NULL, finished_at = ?, updated_at = ?, tokens_prompt = ?, tokens_completion = ?, tokens_total = ? WHERE id = ?",
                 (
                     response_text,
                     LLM_STATUS_SUCCESS,
                     finished_at,
                     finished_at,
-                    tokens["prompt"] if tokens else None,
-                    tokens["completion"] if tokens else None,
-                    tokens["total"] if tokens else None,
+                    tokens.get("prompt") if isinstance(tokens, dict) else None,
+                    tokens.get("completion") if isinstance(tokens, dict) else None,
+                    tokens.get("total") if isinstance(tokens, dict) else None,
                     record_id,
                 ),
             )
-            return conn.execute(
-                "SELECT * FROM llm_records WHERE id = ?", (record_id,)
-            ).fetchone()
+            return _fetch_llm_record_by_id(conn, record_id)
 
     row = _with_sqlite_locked_retry(_mark_success)
     return {"record": llm_record_from_row(row)}

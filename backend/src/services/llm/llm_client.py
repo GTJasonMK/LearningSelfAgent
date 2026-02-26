@@ -8,19 +8,23 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
+from backend.src.common.app_error_utils import invalid_request_error
 from backend.src.common.errors import AppError
 from backend.src.constants import (
     AGENT_LLM_MAX_CONCURRENCY_GLOBAL,
     AGENT_LLM_MAX_CONCURRENCY_PER_MODEL,
     DEFAULT_LLM_MODEL,
-    ERROR_CODE_INVALID_REQUEST,
     ERROR_MESSAGE_LLM_API_KEY_MISSING,
     ERROR_MESSAGE_LLM_CALL_FAILED,
-    HTTP_STATUS_BAD_REQUEST,
     LLM_PROVIDER_OPENAI,
+    RIGHT_CODES_DEFAULT_BASE_URL,
 )
 from backend.src.constants import SINGLETON_ROW_ID
-from backend.src.services.llm.providers.registry import create_provider, normalize_provider_name
+from backend.src.services.llm.providers.registry import (
+    create_provider,
+    is_right_codes_provider_name,
+    normalize_provider_name,
+)
 from backend.src.storage import get_connection
 from backend.src.repositories.config_repo import fetch_llm_store_config
 
@@ -149,9 +153,31 @@ def _classify_llm_exception(exc: BaseException) -> str:
     text = str(exc or "").lower()
     if not text:
         return "other"
-    if "429" in text or "rate limit" in text or "ratelimit" in text or "too many requests" in text:
+    return classify_llm_error_text(text)
+
+
+def classify_llm_error_text(text: str) -> str:
+    """
+    统一的 LLM 错误文本分类（供并发控制和重试策略共用）。
+
+    返回值：
+    - "rate_limit"：429/限流，应等待后重试
+    - "transient"：超时/连接抖动/5xx，可立即重试
+    - "other"：永久性错误（配置、认证等），不应重试
+    """
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return "other"
+    if "429" in lowered or "rate limit" in lowered or "ratelimit" in lowered or "too many requests" in lowered:
         return "rate_limit"
-    if any(k in text for k in ("timeout", "timed out", "connection", "reset", "502", "503", "gateway", "temporarily")):
+    transient_markers = (
+        "timeout", "timed out",
+        "connection", "reset",
+        "502", "503", "504",
+        "gateway",
+        "temporarily", "service unavailable",
+    )
+    if any(k in lowered for k in transient_markers):
         return "transient"
     return "other"
 
@@ -229,60 +255,64 @@ def _get_llm_concurrency_semaphores(
 @contextmanager
 def _llm_concurrency_guard(provider_model_key: str):
     """
-    LLM 并发限制（同步调用）：
-    - 先 acquire global，再 acquire per-model，保证拿锁顺序稳定，避免死锁。
+    LLM 并发限制（同步调用）。
+
+    设计：
+    - 严格按 global → per-model 的顺序 acquire/release（避免死锁）；
+    - 只使用 _AdaptiveLimiter（兼具并发限制与动态降级），去掉冗余的 BoundedSemaphore
+      （旧实现同时 acquire sem + adaptive 共 4 层，在高并发下存在交叉持有风险）；
+    - release 顺序与 acquire 相反，且放在 finally 中保证异常安全。
     """
-    global_sem, model_sem, global_adaptive, model_adaptive = _get_llm_concurrency_semaphores(
+    _, _, global_adaptive, model_adaptive = _get_llm_concurrency_semaphores(
         provider_model_key=provider_model_key
     )
-    acquired: List[threading.BoundedSemaphore] = []
-    acquired_adaptive: List[_AdaptiveLimiter] = []
+    global_acquired = False
+    model_acquired = False
     try:
-        if global_sem is not None:
-            global_sem.acquire()
-            acquired.append(global_sem)
-        if model_sem is not None:
-            model_sem.acquire()
-            acquired.append(model_sem)
+        # 严格顺序：先 global，再 per-model
         if global_adaptive is not None:
             global_adaptive.acquire()
-            acquired_adaptive.append(global_adaptive)
+            global_acquired = True
         if model_adaptive is not None:
             model_adaptive.acquire()
-            acquired_adaptive.append(model_adaptive)
+            model_acquired = True
         yield
-        # success：尝试恢复并发（慢速）
-        for limiter in acquired_adaptive:
+        # 成功：尝试恢复并发（慢速）
+        if global_adaptive is not None:
             try:
-                limiter.on_success()
+                global_adaptive.on_success()
             except Exception:
-                continue
+                pass
+        if model_adaptive is not None:
+            try:
+                model_adaptive.on_success()
+            except Exception:
+                pass
     except Exception as exc:
         kind = _classify_llm_exception(exc)
-        if kind == "rate_limit":
-            for limiter in acquired_adaptive:
-                try:
+        for limiter in (global_adaptive, model_adaptive):
+            if limiter is None:
+                continue
+            try:
+                if kind == "rate_limit":
                     limiter.on_rate_limited()
-                except Exception:
-                    continue
-        elif kind == "transient":
-            for limiter in acquired_adaptive:
-                try:
+                elif kind == "transient":
                     limiter.on_transient_failure()
-                except Exception:
-                    continue
+            except Exception:
+                continue
         raise
     finally:
-        for limiter in reversed(acquired_adaptive):
+        # 反序 release：先 per-model，再 global
+        if model_acquired and model_adaptive is not None:
             try:
-                limiter.release()
+                model_adaptive.release()
             except Exception:
-                continue
-        for sem in reversed(acquired):
+                pass
+        if global_acquired and global_adaptive is not None:
             try:
-                sem.release()
+                global_adaptive.release()
             except Exception:
-                continue
+                pass
 
 
 class ContentCollectMode(Enum):
@@ -322,34 +352,40 @@ class LLMClient:
         strict_mode: bool = False,
     ):
         if strict_mode:
-            if not api_key:
-                raise AppError(
-                    code=ERROR_CODE_INVALID_REQUEST,
-                    message=ERROR_MESSAGE_LLM_API_KEY_MISSING,
-                    status_code=HTTP_STATUS_BAD_REQUEST,
-                )
             key = api_key
             url = base_url
             model = default_model
             provider_value = provider
         else:
             store = self._load_store_config()
-            key = api_key or store.get("api_key") or os.getenv("OPENAI_API_KEY")
-            if not key:
-                raise AppError(
-                    code=ERROR_CODE_INVALID_REQUEST,
-                    message=ERROR_MESSAGE_LLM_API_KEY_MISSING,
-                    status_code=HTTP_STATUS_BAD_REQUEST,
-                )
+            provider_value = provider or store.get("provider") or os.getenv("LLM_PROVIDER")
+            # API Key 兜底顺序：
+            # 1) 显式参数
+            # 2) DB 配置
+            # 3) OpenAI 兼容环境变量
+            # 4) right.codes 专用环境变量（同样走 OpenAI 兼容协议）
+            key = (
+                api_key
+                or store.get("api_key")
+                or os.getenv("OPENAI_API_KEY")
+                or os.getenv("RIGHT_CODES_API_KEY")
+            )
             # 兼容历史：OPENAI_BASE_URL / OPENAI_API_BASE
             url = (
                 base_url
                 or store.get("base_url")
                 or os.getenv("OPENAI_BASE_URL")
                 or os.getenv("OPENAI_API_BASE")
+                or os.getenv("RIGHT_CODES_BASE_URL")
             )
+            # right.codes 文档默认基址（OpenAI 兼容）：
+            # - 若 provider 明确为 right.codes 别名且未配置 base_url，则自动补齐。
+            if not url and is_right_codes_provider_name(provider_value):
+                url = RIGHT_CODES_DEFAULT_BASE_URL
             model = default_model or store.get("model") or os.getenv("MODEL")
-            provider_value = provider or store.get("provider")
+
+        if not key:
+            raise invalid_request_error(ERROR_MESSAGE_LLM_API_KEY_MISSING)
 
         self._default_model = model or DEFAULT_LLM_MODEL
         self._provider_name = normalize_provider_name(provider_value)
@@ -522,6 +558,114 @@ def resolve_default_provider() -> str:
     return normalize_provider_name(provider or os.getenv("LLM_PROVIDER") or LLM_PROVIDER_OPENAI)
 
 
+def resolve_default_provider_raw() -> str:
+    """
+    解析默认 Provider（原始值，不做别名归一化）。
+
+    用途：
+    - 让上层调用方在需要时保留 provider 别名语义（例如 right.codes），
+      便于后续基于别名推导专属默认 base_url / fallback 规则。
+    """
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT llm_provider FROM config_store WHERE id = ?",
+                (SINGLETON_ROW_ID,),
+            ).fetchone()
+        provider = row["llm_provider"] if row else None
+    except Exception:
+        provider = None
+    text = str(provider or "").strip() or str(os.getenv("LLM_PROVIDER") or "").strip()
+    return text or LLM_PROVIDER_OPENAI
+
+
+def resolve_llm_runtime_config(
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    解析当前运行时 LLM 配置快照（用于 run 级固化，不发起网络请求）。
+    """
+    try:
+        store = fetch_llm_store_config()
+    except Exception:
+        store = {"provider": None, "base_url": None, "model": None}
+
+    provider_value = normalize_provider_name(
+        provider
+        or store.get("provider")
+        or os.getenv("LLM_PROVIDER")
+        or LLM_PROVIDER_OPENAI
+    )
+
+    url = (
+        base_url
+        or store.get("base_url")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("OPENAI_API_BASE")
+        or os.getenv("RIGHT_CODES_BASE_URL")
+    )
+    if not url and is_right_codes_provider_name(provider_value):
+        url = RIGHT_CODES_DEFAULT_BASE_URL
+
+    model_value = str(
+        model
+        or store.get("model")
+        or os.getenv("MODEL")
+        or DEFAULT_LLM_MODEL
+    ).strip() or DEFAULT_LLM_MODEL
+
+    fallback_urls = _resolve_base_url_fallbacks(provider_value)
+    base_url_value = None
+    if url is not None:
+        base_url_value = str(url).strip() or None
+    return {
+        "provider": str(provider_value or LLM_PROVIDER_OPENAI),
+        "model": str(model_value),
+        "base_url": base_url_value,
+        "fallback_base_urls": list(fallback_urls or []),
+    }
+
+
+def _parse_base_url_candidates(raw_value: Optional[str]) -> List[str]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in text.split(","):
+        url = str(item or "").strip()
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def _resolve_base_url_fallbacks(provider_name: Optional[str]) -> List[str]:
+    normalized = normalize_provider_name(provider_name)
+    candidates: List[str] = []
+    seen = set()
+
+    env_keys: List[str] = ["LLM_BASE_URL_FALLBACKS", "OPENAI_BASE_URL_FALLBACKS"]
+    if is_right_codes_provider_name(provider_name):
+        env_keys.insert(0, "RIGHT_CODES_BASE_URL_FALLBACKS")
+    elif normalized == LLM_PROVIDER_OPENAI:
+        env_keys.append("RIGHT_CODES_BASE_URL_FALLBACKS")
+
+    for key in env_keys:
+        for url in _parse_base_url_candidates(os.getenv(key)):
+            if url in seen:
+                continue
+            seen.add(url)
+            candidates.append(url)
+    return candidates
+
+
 def call_llm(
     prompt: str,
     model: Optional[str],
@@ -536,37 +680,44 @@ def call_llm(
     - 供规划/后处理/技能抽象等同步链路复用；
     - provider 可选：用于多供应商扩展（对应质量报告 P2#8）。
     """
-    try:
-        client = LLMClient(provider=provider)
-    except AppError as exc:
-        raise exc
-    except Exception as exc:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED,
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+    fallback_urls = _resolve_base_url_fallbacks(provider)
+    client_urls: List[Optional[str]] = [None, *fallback_urls]
+    errors: List[str] = []
+    content = ""
+    tokens = None
 
-    try:
-        actual_model = str(model or client._default_model or "").strip() or DEFAULT_LLM_MODEL
-        key = f"{str(client._provider_name or '').strip() or LLM_PROVIDER_OPENAI}:{actual_model}"
-        with _llm_concurrency_guard(key):
-            content, tokens = client.complete_prompt_sync(
-                prompt=prompt, model=actual_model, parameters=parameters
-            )
-    except Exception as exc:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED,
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+    for idx, base_url_candidate in enumerate(client_urls):
+        try:
+            client = LLMClient(provider=provider, base_url=base_url_candidate)
+        except AppError as exc:
+            raise exc
+        except Exception as exc:
+            raise invalid_request_error(str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED)
+
+        try:
+            actual_model = str(model or client._default_model or "").strip() or DEFAULT_LLM_MODEL
+            key = f"{str(client._provider_name or '').strip() or LLM_PROVIDER_OPENAI}:{actual_model}"
+            with _llm_concurrency_guard(key):
+                content, tokens = client.complete_prompt_sync(
+                    prompt=prompt, model=actual_model, parameters=parameters
+                )
+            if str(content or "").strip():
+                break
+            errors.append(f"attempt#{idx + 1} empty_response")
+        except Exception as exc:
+            err_text = str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED
+            errors.append(f"attempt#{idx + 1} {err_text}")
+            error_kind = classify_llm_error_text(err_text)
+            can_try_next = idx < len(client_urls) - 1
+            if not can_try_next or error_kind not in {"rate_limit", "transient"}:
+                raise invalid_request_error(err_text)
+            continue
+    else:
+        summary = " | ".join(errors[:4]) if errors else ERROR_MESSAGE_LLM_CALL_FAILED
+        raise invalid_request_error(f"{ERROR_MESSAGE_LLM_CALL_FAILED}: {summary}")
 
     if not str(content or "").strip():
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=ERROR_MESSAGE_LLM_CALL_FAILED,
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error(errors[-1] if errors else ERROR_MESSAGE_LLM_CALL_FAILED)
 
     return content, tokens
 
@@ -574,7 +725,8 @@ def call_llm(
 def call_openai(prompt: str, model: Optional[str], parameters: Optional[dict]):
     # 兼容旧接口：绝大多数调用方仍使用 call_openai
     try:
-        content, tokens = call_llm(prompt, model, parameters, provider="openai")
+        provider_value = resolve_default_provider_raw()
+        content, tokens = call_llm(prompt, model, parameters, provider=provider_value)
         return content, tokens, None
     except AppError as exc:
         return None, None, exc.message or ERROR_MESSAGE_LLM_CALL_FAILED

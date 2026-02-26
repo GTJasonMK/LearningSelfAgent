@@ -1,10 +1,11 @@
-import json
 import os
 import re
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
+from backend.src.actions.handlers.common_utils import load_json_object
 from backend.src.common.serializers import task_output_from_row
+from backend.src.common.utils import dedupe_keep_order
 from backend.src.constants import (
     AGENT_ARTIFACT_CSV_MAX_PLACEHOLDER_RATIO,
     AGENT_ARTIFACT_CSV_MIN_DATE_SPAN_DAYS,
@@ -40,21 +41,6 @@ def _create_task_output_record(task_id: int, payload: dict) -> Tuple[Optional[di
     )
     row = get_task_output(output_id=int(output_id))
     return (task_output_from_row(row) if row else None), None
-
-
-def _load_json_object(value: object) -> Optional[dict]:
-    if isinstance(value, dict):
-        return dict(value)
-    if not isinstance(value, str):
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        obj = json.loads(text)
-    except Exception:
-        return None
-    return dict(obj) if isinstance(obj, dict) else None
 
 
 def _truncate_text(value: object, max_chars: int = 120) -> str:
@@ -171,9 +157,9 @@ def _collect_task_output_evidence(
             continue
 
         title = str(row["title"] or "").strip() if "title" in row.keys() else ""
-        detail_obj = _load_json_object(row["detail"] if "detail" in row.keys() else None)
+        detail_obj = load_json_object(row["detail"] if "detail" in row.keys() else None)
         action_type = str(detail_obj.get("type") or "").strip().lower() if isinstance(detail_obj, dict) else ""
-        result_obj = _load_json_object(row["result"] if "result" in row.keys() else None)
+        result_obj = load_json_object(row["result"] if "result" in row.keys() else None)
 
         if row_id is not None:
             step_item = {"id": int(row_id), "title": title}
@@ -215,21 +201,10 @@ def _collect_task_output_evidence(
                 evidence_flags.append("shell_missing_url_observed")
 
     # 去重 + 控制长度（保留最近证据）
-    def _dedupe_keep_order(items: List):
-        seen = set()
-        result = []
-        for item in items:
-            key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, dict) else str(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(item)
-        return result
-
-    step_refs = _dedupe_keep_order(step_refs)[-6:]
-    tool_call_record_ids = _dedupe_keep_order(tool_call_record_ids)[-6:]
-    artifact_paths = _dedupe_keep_order(artifact_paths)[-6:]
-    evidence_flags = _dedupe_keep_order(evidence_flags)[-12:]
+    step_refs = dedupe_keep_order(step_refs)[-6:]
+    tool_call_record_ids = dedupe_keep_order(tool_call_record_ids)[-6:]
+    artifact_paths = dedupe_keep_order(artifact_paths)[-6:]
+    evidence_flags = dedupe_keep_order(evidence_flags)[-12:]
     return {
         "steps": step_refs,
         "tool_calls": tool_call_record_ids,
@@ -437,7 +412,7 @@ def _enforce_csv_artifact_quality(
 
     last_workdir = os.getcwd()
     for row in rows or []:
-        detail_obj = _load_json_object(row["detail"] if row and "detail" in row.keys() else None)
+        detail_obj = load_json_object(row["detail"] if row and "detail" in row.keys() else None)
         if not isinstance(detail_obj, dict):
             continue
         if str(detail_obj.get("type") or "").strip().lower() != "shell_command":

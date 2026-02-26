@@ -4,8 +4,9 @@ from typing import List, Optional
 from fastapi import APIRouter
 
 from backend.src.api.schemas import TaskCreate, TaskUpdate
+from backend.src.api.tasks.route_common import is_valid_task_status
 from backend.src.common.serializers import task_from_row
-from backend.src.api.utils import ensure_write_permission, error_response, now_iso
+from backend.src.api.utils import error_response, now_iso, require_write_permission
 from backend.src.constants import (
     ERROR_CODE_INVALID_REQUEST,
     ERROR_CODE_NOT_FOUND,
@@ -16,22 +17,14 @@ from backend.src.constants import (
     HTTP_STATUS_NOT_FOUND,
     RUN_STATUS_RUNNING,
     RUN_STATUS_WAITING,
-    STATUS_CANCELLED,
-    STATUS_DONE,
-    STATUS_FAILED,
     STATUS_QUEUED,
-    STATUS_RUNNING,
-    STATUS_STOPPED,
-    STATUS_WAITING,
 )
-from backend.src.repositories.tasks_repo import (
-    count_tasks,
-    create_task as create_task_record,
-    fetch_current_task_title_by_run_statuses,
-    get_task as get_task_repo,
-    list_tasks as list_tasks_repo,
-    update_task as update_task_repo,
-)
+from backend.src.services.tasks.task_queries import count_tasks
+from backend.src.services.tasks.task_queries import create_task as create_task_record
+from backend.src.services.tasks.task_queries import fetch_current_task_title_by_run_statuses
+from backend.src.services.tasks.task_queries import get_task as get_task_repo
+from backend.src.services.tasks.task_queries import list_tasks as list_tasks_repo
+from backend.src.services.tasks.task_queries import update_task as update_task_repo
 
 router = APIRouter()
 
@@ -51,10 +44,8 @@ def tasks_summary() -> dict:
 
 
 @router.post("/tasks")
+@require_write_permission
 def create_task(payload: TaskCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     task_id, created_at = create_task_record(
         title=payload.title,
         status=STATUS_QUEUED,
@@ -132,23 +123,12 @@ def get_task(task_id: int):
 
 
 @router.patch("/tasks/{task_id}")
+@require_write_permission
 def update_task(task_id: int, payload: TaskUpdate):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     fields = []
     params: List = []
     if payload.status is not None:
-        allowed_statuses = {
-            STATUS_QUEUED,
-            STATUS_RUNNING,
-            STATUS_WAITING,
-            STATUS_DONE,
-            STATUS_CANCELLED,
-            STATUS_FAILED,
-            STATUS_STOPPED,
-        }
-        if payload.status not in allowed_statuses:
+        if not is_valid_task_status(payload.status):
             return error_response(
                 ERROR_CODE_INVALID_REQUEST,
                 ERROR_MESSAGE_INVALID_STATUS,

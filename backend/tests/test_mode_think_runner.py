@@ -80,29 +80,34 @@ class TestModeThinkRunner(unittest.IsolatedAsyncioTestCase):
     async def test_run_think_mode_execution_reflection_stops_when_no_fix_steps(self):
         chunks = []
         kwargs = self._build_kwargs()
+
+        reflection_calls = []
+
+        def _reflection_runner(**_params):
+            reflection_calls.append(True)
+            return SimpleNamespace(fix_steps=[], winning_analysis=None)
+
         with patch(
             "backend.src.agent.runner.mode_think_runner.run_think_parallel_loop",
             return_value=object(),
         ), patch(
             "backend.src.agent.runner.mode_think_runner.pump_sync_generator",
             side_effect=_iter_parallel_failed,
-        ), patch(
-            "backend.src.agent.runner.mode_think_runner.run_reflection",
-            return_value=SimpleNamespace(fix_steps=[], winning_analysis=None),
-        ) as mock_reflection:
+        ):
             result = await run_think_mode_execution_from_config(
                 ThinkExecutionConfig(
                     **kwargs,
                     yield_func=lambda msg: chunks.append(msg),
                     safe_write_debug=Mock(),
                     persist_reflection_plan_func=AsyncMock(return_value=None),
+                    reflection_runner=_reflection_runner,
                 )
             )
 
         self.assertEqual(result.run_status, "failed")
         self.assertEqual(result.reflection_count, 1)
         self.assertTrue(any("反思未能生成修复步骤" in text for text in chunks))
-        mock_reflection.assert_called_once()
+        self.assertEqual(1, len(reflection_calls))
 
     async def test_run_think_mode_execution_from_config_delegates(self):
         kwargs = self._build_kwargs()

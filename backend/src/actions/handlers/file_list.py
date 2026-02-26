@@ -1,20 +1,23 @@
 import os
 from typing import Optional, Tuple
 
-from backend.src.common.path_utils import normalize_windows_abs_path_on_posix
+from backend.src.actions.handlers.file_action_common import (
+    ensure_write_permission_for_action,
+    require_action_path,
+    resolve_action_target_path,
+)
 
 
 def execute_file_list(payload: dict) -> Tuple[Optional[dict], Optional[str]]:
     """
     执行 file_list：列出目录内容。
     """
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError("file_list.path 不能为空")
+    path = require_action_path(payload, "file_list")
+    permission_error = ensure_write_permission_for_action(path, "file_list")
+    if permission_error:
+        return None, permission_error
 
-    target_path = normalize_windows_abs_path_on_posix(path.strip())
-    if not os.path.isabs(target_path):
-        target_path = os.path.abspath(os.path.join(os.getcwd(), target_path))
+    target_path = resolve_action_target_path(path)
     if not os.path.exists(target_path):
         raise ValueError(f"file_list.path 不存在: {target_path}")
     if not os.path.isdir(target_path):

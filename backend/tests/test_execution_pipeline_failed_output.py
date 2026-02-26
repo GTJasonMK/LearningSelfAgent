@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -83,6 +84,46 @@ class TestExecutionPipelineFailedOutput(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(args[0]), 10)
         self.assertEqual(int(args[1]), 20)
         self.assertEqual(str(args[2]), str(RUN_STATUS_FAILED))
+
+    async def test_handle_execution_exception_emits_structured_error(self):
+        from backend.src.agent.runner.execution_pipeline import handle_execution_exception
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        emitted: list[str] = []
+        with patch(
+            "backend.src.agent.runner.execution_pipeline.mark_run_failed",
+            return_value=None,
+        ), patch(
+            "backend.src.agent.runner.execution_pipeline.ensure_failed_task_output",
+            AsyncMock(return_value=None),
+        ), patch(
+            "backend.src.agent.runner.execution_pipeline.enqueue_postprocess_thread",
+            return_value=None,
+        ), patch(
+            "backend.src.agent.runner.execution_pipeline.safe_write_debug",
+            return_value=None,
+        ), patch(
+            "backend.src.agent.runner.execution_pipeline.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            await handle_execution_exception(
+                RuntimeError("boom"),
+                10,
+                20,
+                lambda msg: emitted.append(str(msg)),
+                mode_prefix="agent.test",
+            )
+
+        self.assertTrue(emitted)
+        payload_line = [line for line in emitted[0].splitlines() if line.startswith("data: ")]
+        self.assertTrue(payload_line)
+        payload = json.loads(payload_line[0][len("data: ") :])
+        self.assertEqual(str(payload.get("code") or ""), "agent_unhandled_exception")
+        self.assertIn("[code=agent_unhandled_exception]", str(payload.get("message") or ""))
+        self.assertEqual(int(payload.get("task_id") or 0), 10)
+        self.assertEqual(int(payload.get("run_id") or 0), 20)
 
 
     def test_build_failed_step_lines_supports_sqlite_row(self):

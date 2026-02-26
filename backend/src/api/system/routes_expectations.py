@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from backend.src.api.schemas import EvalCreate, ExpectationCreate
 from backend.src.common.serializers import eval_criterion_from_row, eval_from_row, expectation_from_row
-from backend.src.api.utils import ensure_write_permission, error_response, now_iso
+from backend.src.api.utils import error_response, now_iso, require_write_permission
 from backend.src.constants import (
     EVAL_STATUS_UNKNOWN,
     ERROR_CODE_NOT_FOUND,
@@ -10,25 +10,19 @@ from backend.src.constants import (
     ERROR_MESSAGE_EXPECTATION_NOT_FOUND,
     HTTP_STATUS_NOT_FOUND,
 )
-from backend.src.repositories.eval_repo import (
-    create_eval_record,
-    get_eval_latest_summary,
-    get_eval_record,
-    list_eval_criteria_by_eval_id,
-)
-from backend.src.repositories.expectations_repo import (
-    create_expectation as create_expectation_repo,
-    get_expectation as get_expectation_repo,
-)
+from backend.src.services.system.expectations_eval import create_eval_record
+from backend.src.services.system.expectations_eval import create_expectation as create_expectation_repo
+from backend.src.services.system.expectations_eval import get_eval_latest_summary
+from backend.src.services.system.expectations_eval import get_eval_record
+from backend.src.services.system.expectations_eval import get_expectation as get_expectation_repo
+from backend.src.services.system.expectations_eval import list_eval_criteria_by_eval_id
 
 router = APIRouter()
 
 
 @router.post("/expectations")
+@require_write_permission
 def create_expectation(payload: ExpectationCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     created_at = now_iso()
     expectation_id, _ = create_expectation_repo(
         goal=payload.goal,
@@ -52,10 +46,8 @@ def get_expectation(expectation_id: int):
 
 
 @router.post("/eval")
+@require_write_permission
 def create_eval(payload: EvalCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     created_at = now_iso()
     eval_id, _ = create_eval_record(
         status=payload.status,

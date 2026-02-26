@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from backend.src.agent.core.plan_structure import PlanStructure
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import coerce_int, now_iso
 from backend.src.constants import (
     AGENT_MAX_STEPS_UNLIMITED,
     AGENT_REACT_PERSIST_MIN_INTERVAL_SECONDS,
@@ -22,7 +22,7 @@ from backend.src.constants import (
     RUN_STATUS_STOPPED,
     RUN_STATUS_WAITING,
 )
-from backend.src.repositories.task_runs_repo import update_task_run
+from backend.src.services.tasks.task_queries import update_task_run
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +60,10 @@ def prepare_replan_context(
     Returns:
         ReplanContext 包含是否可 replan、已完成步数、剩余限制等信息
     """
-    try:
-        replan_attempts = int(agent_state.get("replan_attempts") or 0)
-    except Exception:
-        replan_attempts = 0
+    replan_attempts = coerce_int(agent_state.get("replan_attempts"), default=0)
 
-    done_count = max(0, int(step_order) - 1)
+    step_order_value = coerce_int(step_order, default=0)
+    done_count = max(0, step_order_value - 1)
     remaining_limit: Optional[int] = None
 
     if isinstance(max_steps_limit, int) and max_steps_limit > 0:
@@ -79,19 +77,20 @@ def prepare_replan_context(
         can_replan = False
         reason = f"remaining_limit={remaining_limit}"
 
-    if replan_attempts >= int(AGENT_REACT_REPLAN_MAX_ATTEMPTS or 0):
+    replan_max_attempts = coerce_int(AGENT_REACT_REPLAN_MAX_ATTEMPTS, default=0)
+    if replan_max_attempts > 0 and replan_attempts >= replan_max_attempts:
         can_replan = False
-        reason = f"replan_attempts={replan_attempts} >= max={AGENT_REACT_REPLAN_MAX_ATTEMPTS}"
+        reason = f"replan_attempts={replan_attempts} >= max={replan_max_attempts}"
 
     # 计算 max_steps_value
     if remaining_limit is not None:
-        max_steps_value = int(remaining_limit)
+        max_steps_value = coerce_int(remaining_limit, default=0)
     else:
         # 开发阶段无上限：避免 replan 在“当前计划长度”处被误限流（例如需要插入补救步骤时被拦截）。
         if isinstance(max_steps_limit, int) and max_steps_limit > 0:
-            max_steps_value = int(max_steps_limit)
+            max_steps_value = coerce_int(max_steps_limit, default=AGENT_MAX_STEPS_UNLIMITED)
         else:
-            max_steps_value = int(AGENT_MAX_STEPS_UNLIMITED)
+            max_steps_value = coerce_int(AGENT_MAX_STEPS_UNLIMITED, default=9999)
 
     return ReplanContext(
         can_replan=can_replan,
@@ -122,8 +121,11 @@ def persist_loop_state(
     统一的循环状态持久化。
     """
     try:
+        run_id_value = coerce_int(run_id, default=0)
+        step_order_value = coerce_int(step_order, default=0)
+        task_id_value = coerce_int(task_id, default=0) if task_id is not None else 0
         agent_state["paused"] = paused
-        agent_state["step_order"] = step_order
+        agent_state["step_order"] = step_order_value
         agent_state["observations"] = observations
         agent_state["context"] = context
         updated_at = now_iso()
@@ -149,19 +151,21 @@ def persist_loop_state(
 
         is_final_step = False
         try:
-            is_final_step = int(step_order) >= int(plan_struct.step_count) + 1
+            is_final_step = step_order_value >= coerce_int(plan_struct.step_count, default=0) + 1
         except Exception:
             is_final_step = False
 
         if not bool(force) and not is_critical and not is_final_step and min_interval > 0:
             now_value = time.monotonic()
             with _PERSIST_THROTTLE_LOCK:
-                last_at = _PERSIST_THROTTLE_STATE.get(int(run_id))
-            if last_at is not None and (now_value - float(last_at)) < float(min_interval):
-                return True
+                last_at = _PERSIST_THROTTLE_STATE.get(run_id_value)
+                if last_at is not None and (now_value - float(last_at)) < float(min_interval):
+                    return True
+                # 预占时间戳，防止并发线程同时通过节流检查
+                _PERSIST_THROTTLE_STATE[run_id_value] = now_value
 
         update_kwargs = {
-            "run_id": int(run_id),
+            "run_id": run_id_value,
             "agent_plan": plan_struct.to_agent_plan_payload(),
             "agent_state": agent_state,
             "updated_at": updated_at,
@@ -179,18 +183,18 @@ def persist_loop_state(
                 should_cleanup = True
             with _PERSIST_THROTTLE_LOCK:
                 if should_cleanup:
-                    _PERSIST_THROTTLE_STATE.pop(int(run_id), None)
+                    _PERSIST_THROTTLE_STATE.pop(run_id_value, None)
                 else:
-                    _PERSIST_THROTTLE_STATE[int(run_id)] = time.monotonic()
+                    _PERSIST_THROTTLE_STATE[run_id_value] = time.monotonic()
         return True
 
     except Exception as exc:
-        if safe_write_debug and task_id is not None:
+        if safe_write_debug and task_id_value > 0:
             safe_write_debug(
-                task_id=int(task_id),
-                run_id=int(run_id),
+                task_id=task_id_value,
+                run_id=run_id_value,
                 message="agent.state.persist_failed",
-                data={"where": where, "step_order": int(step_order), "error": str(exc)},
+                data={"where": where, "step_order": step_order_value, "error": str(exc)},
                 level="warning",
             )
         return False
@@ -209,21 +213,45 @@ def persist_plan_only(
     仅持久化计划（用于 plan_patch 后立即保存）。
     """
     try:
+        run_id_value = coerce_int(run_id, default=0)
+        task_id_value = coerce_int(task_id, default=0) if task_id is not None else 0
+        step_order_value = coerce_int(step_order, default=0)
         updated_at = now_iso()
         update_task_run(
-            run_id=int(run_id),
+            run_id=run_id_value,
             agent_plan=plan_struct.to_agent_plan_payload(),
             updated_at=updated_at,
         )
         return True
 
     except Exception as exc:
-        if safe_write_debug and task_id is not None:
+        if safe_write_debug and task_id_value > 0:
             safe_write_debug(
-                task_id=int(task_id),
-                run_id=int(run_id),
+                task_id=task_id_value,
+                run_id=run_id_value,
                 message="agent.plan.persist_failed",
-                data={"where": where, "step_order": int(step_order), "error": str(exc)},
+                data={"where": where, "step_order": step_order_value, "error": str(exc)},
                 level="warning",
             )
         return False
+
+
+def resolve_executor(agent_state: Dict, step_order: int) -> Optional[str]:
+    """从 agent_state.executor_assignments 中按 step_order 查找执行器名称。"""
+    try:
+        step_order_value = coerce_int(step_order, default=0)
+        assignments = agent_state.get("executor_assignments") if isinstance(agent_state, dict) else None
+        if isinstance(assignments, list):
+            for a in assignments:
+                if not isinstance(a, dict):
+                    continue
+                order_value = coerce_int(a.get("step_order"), default=0)
+                if order_value <= 0:
+                    continue
+                if order_value != step_order_value:
+                    continue
+                ev = str(a.get("executor") or "").strip()
+                return ev or None
+    except Exception:
+        pass
+    return None

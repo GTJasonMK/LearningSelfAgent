@@ -43,3 +43,44 @@ def create_llm_call_func(
         return text or "", record_id
 
     return llm_call
+
+
+def create_step_llm_config_resolver(
+    *,
+    base_model: str,
+    think_config: object,
+    role_resolver: Callable[[int, str, List[str]], str],
+    fallback_role: str = "executor_code",
+) -> Callable[[int, str, List[str]], Tuple[str, Dict]]:
+    """
+    构造每步 LLM 选模/参数覆盖解析器（do/think/resume 共用）。
+    """
+
+    def resolve(step_order: int, title: str, allow: List[str]) -> Tuple[str, Dict]:
+        resolved_model = str(base_model or "").strip()
+        overrides: Dict = {}
+
+        try:
+            role = str(role_resolver(int(step_order or 0), str(title or ""), list(allow or [])) or "").strip()
+        except Exception:
+            role = ""
+
+        exec_cfg = None
+        try:
+            if role:
+                exec_cfg = think_config.get_executor(role)
+            if exec_cfg is None and isinstance(fallback_role, str) and fallback_role.strip():
+                exec_cfg = think_config.get_executor(fallback_role.strip())
+        except Exception:
+            exec_cfg = None
+
+        if exec_cfg:
+            if isinstance(getattr(exec_cfg, "model", None), str) and str(exec_cfg.model).strip():
+                resolved_model = str(exec_cfg.model).strip()
+            if getattr(exec_cfg, "temperature", None) is not None:
+                overrides["temperature"] = float(exec_cfg.temperature)
+            if getattr(exec_cfg, "max_tokens", None) is not None:
+                overrides["max_tokens"] = int(exec_cfg.max_tokens)
+        return resolved_model, overrides
+
+    return resolve

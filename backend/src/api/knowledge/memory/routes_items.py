@@ -4,7 +4,12 @@ from fastapi import APIRouter
 
 from backend.src.api.schemas import MemoryCreate, MemoryUpdate
 from backend.src.common.serializers import memory_from_row
-from backend.src.api.utils import ensure_write_permission, error_response
+from backend.src.api.utils import (
+    clamp_non_negative_int,
+    clamp_page_limit,
+    error_response,
+    require_write_permission,
+)
 from backend.src.constants import (
     DEFAULT_PAGE_LIMIT,
     DEFAULT_PAGE_OFFSET,
@@ -12,7 +17,7 @@ from backend.src.constants import (
     ERROR_MESSAGE_MEMORY_NOT_FOUND,
     HTTP_STATUS_NOT_FOUND,
 )
-from backend.src.repositories.memory_repo import (
+from backend.src.services.knowledge.knowledge_query import (
     count_memory_items,
     fetch_latest_memory_content,
     get_memory_item as get_memory_item_repo,
@@ -38,14 +43,13 @@ def memory_summary() -> dict:
 
 
 @router.post("/memory/items")
+@require_write_permission
 def create_memory_item(payload: MemoryCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     return create_memory_item_service(payload)
 
 
 @router.post("/memory/sync")
+@require_write_permission
 async def sync_memory() -> dict:
     """
     将 backend/prompt/memory 下的记忆文件同步到数据库（memory_items）。
@@ -54,9 +58,6 @@ async def sync_memory() -> dict:
     - 支持用户手工编辑/删除文件后，重建 SQLite 的“快速查询索引”；
     - prune=True：文件不存在则删除 DB 记录（强一致删除）。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     result = await asyncio.to_thread(sync_memory_from_files, None, prune=True)
     return {"result": result}
 
@@ -65,6 +66,8 @@ async def sync_memory() -> dict:
 def list_memory_items(
     offset: int = DEFAULT_PAGE_OFFSET, limit: int = DEFAULT_PAGE_LIMIT
 ) -> dict:
+    offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
     rows = list_memory_items_repo(offset=offset, limit=limit)
     return {"items": [memory_from_row(row) for row in rows]}
 
@@ -82,18 +85,14 @@ def get_memory_item(item_id: int):
 
 
 @router.delete("/memory/items/{item_id}")
+@require_write_permission
 def delete_memory_item(item_id: int):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     return delete_memory_item_service(item_id=int(item_id))
 
 
 @router.patch("/memory/items/{item_id}")
+@require_write_permission
 def update_memory_item(item_id: int, payload: MemoryUpdate):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     return update_memory_item_service(int(item_id), payload)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Dict, Optional, Tuple
 
+from backend.src.common.utils import coerce_int
 from backend.src.constants import SINGLETON_ROW_ID
 from backend.src.migrations import run_all_migrations
 from backend.src.repositories.repo_conn import provide_connection
@@ -69,6 +70,11 @@ def _row_value(row: object, index: int, key: str):
         return None
 
 
+def _fetch_singleton_row(conn: sqlite3.Connection, *, select_sql: str):
+    _ensure_config_tables(conn)
+    return conn.execute(select_sql, (SINGLETON_ROW_ID,)).fetchone()
+
+
 def fetch_llm_store_config(
     *,
     conn: Optional[sqlite3.Connection] = None,
@@ -80,11 +86,10 @@ def fetch_llm_store_config(
     - 返回 api_key 明文仅用于后端内部调用（LLMClient）；API 层应自行决定是否回显。
     """
     with provide_connection(conn) as inner:
-        _ensure_config_tables(inner)
-        row = inner.execute(
-            "SELECT llm_provider, llm_api_key, llm_base_url, llm_model FROM config_store WHERE id = ?",
-            (SINGLETON_ROW_ID,),
-        ).fetchone()
+        row = _fetch_singleton_row(
+            inner,
+            select_sql="SELECT llm_provider, llm_api_key, llm_base_url, llm_model FROM config_store WHERE id = ?",
+        )
 
     if not row:
         return {"provider": None, "api_key": None, "base_url": None, "model": None}
@@ -106,11 +111,10 @@ def fetch_app_config(
     读取 UI 开关配置（tray/pet/panel）。
     """
     with provide_connection(conn) as inner:
-        _ensure_config_tables(inner)
-        row = inner.execute(
-            "SELECT tray_enabled, pet_enabled, panel_enabled FROM config_store WHERE id = ?",
-            (SINGLETON_ROW_ID,),
-        ).fetchone()
+        row = _fetch_singleton_row(
+            inner,
+            select_sql="SELECT tray_enabled, pet_enabled, panel_enabled FROM config_store WHERE id = ?",
+        )
     if not row:
         return {"tray_enabled": None, "pet_enabled": None, "panel_enabled": None}
     return {
@@ -133,9 +137,21 @@ def update_app_config(
     with provide_connection(conn) as inner:
         _ensure_config_tables(inner)
         current = fetch_app_config(conn=inner)
-        next_tray = int(tray_enabled) if tray_enabled is not None else int(current.get("tray_enabled") or 0)
-        next_pet = int(pet_enabled) if pet_enabled is not None else int(current.get("pet_enabled") or 0)
-        next_panel = int(panel_enabled) if panel_enabled is not None else int(current.get("panel_enabled") or 0)
+        next_tray = (
+            coerce_int(tray_enabled, default=0)
+            if tray_enabled is not None
+            else coerce_int(current.get("tray_enabled") or 0, default=0)
+        )
+        next_pet = (
+            coerce_int(pet_enabled, default=0)
+            if pet_enabled is not None
+            else coerce_int(current.get("pet_enabled") or 0, default=0)
+        )
+        next_panel = (
+            coerce_int(panel_enabled, default=0)
+            if panel_enabled is not None
+            else coerce_int(current.get("panel_enabled") or 0, default=0)
+        )
 
         inner.execute(
             "UPDATE config_store SET tray_enabled = ?, pet_enabled = ?, panel_enabled = ? WHERE id = ?",
@@ -172,11 +188,10 @@ def fetch_permissions_store(
     若未初始化则返回 ("[]", "[]", "[]", "[]")。
     """
     with provide_connection(conn) as inner:
-        _ensure_config_tables(inner)
-        row = inner.execute(
-            "SELECT allowed_paths, allowed_ops, disabled_actions, disabled_tools FROM permissions_store WHERE id = ?",
-            (SINGLETON_ROW_ID,),
-        ).fetchone()
+        row = _fetch_singleton_row(
+            inner,
+            select_sql="SELECT allowed_paths, allowed_ops, disabled_actions, disabled_tools FROM permissions_store WHERE id = ?",
+        )
     if not row:
         return "[]", "[]", "[]", "[]"
     return (

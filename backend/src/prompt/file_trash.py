@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
+from backend.src.common.path_utils import is_path_within_root
+
 
 def _trash_timestamp() -> str:
     """
@@ -29,10 +31,7 @@ def stage_delete_file(*, root_dir: Path, target_path: Path) -> Tuple[Optional[Pa
     """
     root = Path(root_dir).resolve()
     target = Path(target_path).resolve()
-    try:
-        if not target.is_relative_to(root):
-            return None, "invalid_path"
-    except Exception:
+    if not is_path_within_root(target, root):
         return None, "invalid_path"
 
     if not target.exists():

@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import shutil
 import tempfile
@@ -11,6 +12,8 @@ try:
     import httpx  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     httpx = None
+
+HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
 
 
 class TestAgentCommandStreamDoFeedbackResume(unittest.IsolatedAsyncioTestCase):
@@ -25,6 +28,8 @@ class TestAgentCommandStreamDoFeedbackResume(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         if httpx is None:
             self.skipTest("httpx 未安装，跳过需要 ASGI 客户端的测试")
+        if not HAS_FASTAPI:
+            self.skipTest("fastapi 未安装，跳过需要 ASGI 客户端的测试")
 
         import backend.src.storage as storage
 

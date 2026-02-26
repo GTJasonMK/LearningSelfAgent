@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict
 
-from backend.src.common.errors import AppError
+from backend.src.common.app_error_utils import invalid_request_error, not_found_error
 from backend.src.constants import (
-    ERROR_CODE_INVALID_REQUEST,
-    ERROR_CODE_NOT_FOUND,
     ERROR_MESSAGE_TOOL_NOT_FOUND,
-    HTTP_STATUS_BAD_REQUEST,
-    HTTP_STATUS_NOT_FOUND,
 )
 from backend.src.prompt.file_trash import finalize_staged_delete, restore_staged_file
 from backend.src.prompt.paths import tools_prompt_dir
 from backend.src.repositories.tools_repo import get_tool as get_tool_repo
+from backend.src.services.common.staged_delete_utils import (
+    resolve_staged_paths,
+    staged_delete_file_result,
+)
 from backend.src.services.tools.tools_store import stage_delete_tool_file_by_source_path, tool_file_path_from_source_path
 from backend.src.storage import get_connection
-
 
 def delete_tool_strong(tool_id: int) -> Dict[str, Any]:
     """
@@ -24,33 +22,19 @@ def delete_tool_strong(tool_id: int) -> Dict[str, Any]:
     """
     existing = get_tool_repo(tool_id=int(tool_id))
     if not existing:
-        raise AppError(
-            code=ERROR_CODE_NOT_FOUND,
-            message=ERROR_MESSAGE_TOOL_NOT_FOUND,
-            status_code=HTTP_STATUS_NOT_FOUND,
-        )
+        raise not_found_error(ERROR_MESSAGE_TOOL_NOT_FOUND)
 
     trash_rel, stage_err = stage_delete_tool_file_by_source_path(existing["source_path"])
     if stage_err:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=str(stage_err),
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error(str(stage_err))
 
     root = tools_prompt_dir().resolve()
-    target_path = None
-    trash_path = None
-    try:
-        source_path = str(existing["source_path"] or "").strip()
-        if source_path:
-            target_path = tool_file_path_from_source_path(source_path).resolve()
-        if trash_rel:
-            candidate = Path(trash_rel)
-            trash_path = candidate if candidate.is_absolute() else (root / candidate).resolve()
-    except Exception:
-        target_path = None
-        trash_path = None
+    target_path, trash_path = resolve_staged_paths(
+        root=root,
+        source_path=existing["source_path"],
+        trash_rel=trash_rel,
+        resolve_source_path=lambda source: tool_file_path_from_source_path(source),
+    )
 
     try:
         with get_connection() as conn:
@@ -59,11 +43,7 @@ def delete_tool_strong(tool_id: int) -> Dict[str, Any]:
                 (int(tool_id),),
             ).fetchone()
             if not row:
-                raise AppError(
-                    code=ERROR_CODE_NOT_FOUND,
-                    message=ERROR_MESSAGE_TOOL_NOT_FOUND,
-                    status_code=HTTP_STATUS_NOT_FOUND,
-                )
+                raise not_found_error(ERROR_MESSAGE_TOOL_NOT_FOUND)
             # 删除版本记录（避免残留脏数据）
             conn.execute("DELETE FROM tool_version_records WHERE tool_id = ?", (int(tool_id),))
             conn.execute("DELETE FROM tools_items WHERE id = ?", (int(tool_id),))
@@ -79,11 +59,10 @@ def delete_tool_strong(tool_id: int) -> Dict[str, Any]:
 
     return {
         "row": dict(existing),
-        "file": {
-            "removed": bool(trash_rel),
-            "source_path": str(existing["source_path"] or "").strip() or None,
-            "trash_path": trash_rel,
-            "finalize_error": finalize_err,
-        },
+        "file": staged_delete_file_result(
+            source_path=existing["source_path"],
+            trash_rel=trash_rel,
+            finalize_error=finalize_err,
+        ),
     }
 

@@ -1,6 +1,6 @@
 from typing import Any
 
-from backend.src.common.errors import AppError
+from backend.src.common.app_error_utils import invalid_request_error, not_found_error
 from backend.src.common.serializers import memory_from_row
 from backend.src.common.utils import dump_model, now_iso
 from backend.src.prompt.file_trash import finalize_staged_delete, restore_staged_file, stage_delete_file
@@ -13,16 +13,12 @@ from backend.src.repositories.memory_repo import (
 )
 from backend.src.constants import (
     DEFAULT_MEMORY_TYPE,
-    ERROR_CODE_INVALID_REQUEST,
-    ERROR_CODE_NOT_FOUND,
     ERROR_MESSAGE_MEMORY_CONTENT_MISSING,
     ERROR_MESSAGE_MEMORY_NOT_FOUND,
-    HTTP_STATUS_BAD_REQUEST,
-    HTTP_STATUS_NOT_FOUND,
 )
+from backend.src.services.common.coerce import to_int, to_non_empty_optional_text
 from backend.src.services.memory.memory_store import memory_file_path, publish_memory_item_file
 from backend.src.storage import get_connection
-
 
 def create_memory_item(payload: Any) -> dict:
     """
@@ -35,11 +31,7 @@ def create_memory_item(payload: Any) -> dict:
     data = dump_model(payload)
     content = data.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=ERROR_MESSAGE_MEMORY_CONTENT_MISSING,
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error(ERROR_MESSAGE_MEMORY_CONTENT_MISSING)
 
     created_at = now_iso()
     memory_type = data.get("memory_type") or DEFAULT_MEMORY_TYPE
@@ -56,23 +48,15 @@ def create_memory_item(payload: Any) -> dict:
             created_at=created_at,
             conn=conn,
         )
-        publish = publish_memory_item_file(item_id=int(item_id), conn=conn)
-        row = get_memory_item_repo(item_id=int(item_id), conn=conn)
+        publish = publish_memory_item_file(item_id=to_int(item_id), conn=conn)
+        row = get_memory_item_repo(item_id=to_int(item_id), conn=conn)
 
     if not row:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message="memory_item_create_failed",
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error("memory_item_create_failed")
 
     if not publish.get("ok"):
         # 原则：落盘失败视为失败（避免 DB 有、文件无，导致“灵魂存档”缺失）
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=str(publish.get("error") or "publish_memory_failed"),
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+        raise invalid_request_error(str(publish.get("error") or "publish_memory_failed"))
 
     return {"item": memory_from_row(row), "file": publish}
 
@@ -84,7 +68,7 @@ def update_memory_item(item_id: int, payload: Any) -> dict:
     data = dump_model(payload)
     with get_connection() as conn:
         row = update_memory_item_repo(
-            item_id=int(item_id),
+            item_id=to_int(item_id),
             content=data.get("content"),
             memory_type=data.get("memory_type"),
             tags=data.get("tags"),
@@ -92,13 +76,9 @@ def update_memory_item(item_id: int, payload: Any) -> dict:
             conn=conn,
         )
         if not row:
-            raise AppError(
-                code=ERROR_CODE_NOT_FOUND,
-                message=ERROR_MESSAGE_MEMORY_NOT_FOUND,
-                status_code=HTTP_STATUS_NOT_FOUND,
-            )
-        publish = publish_memory_item_file(item_id=int(item_id), conn=conn)
-        latest = get_memory_item_repo(item_id=int(item_id), conn=conn)
+            raise not_found_error(ERROR_MESSAGE_MEMORY_NOT_FOUND)
+        publish = publish_memory_item_file(item_id=to_int(item_id), conn=conn)
+        latest = get_memory_item_repo(item_id=to_int(item_id), conn=conn)
 
     if not latest:
         latest = row
@@ -117,33 +97,21 @@ def delete_memory_item(item_id: int) -> dict:
 
     try:
         with get_connection() as conn:
-            existing = get_memory_item_repo(item_id=int(item_id), conn=conn)
+            existing = get_memory_item_repo(item_id=to_int(item_id), conn=conn)
             if not existing:
-                raise AppError(
-                    code=ERROR_CODE_NOT_FOUND,
-                    message=ERROR_MESSAGE_MEMORY_NOT_FOUND,
-                    status_code=HTTP_STATUS_NOT_FOUND,
-                )
+                raise not_found_error(ERROR_MESSAGE_MEMORY_NOT_FOUND)
 
-            uid = str(existing["uid"] or "").strip()
+            uid = to_non_empty_optional_text(existing["uid"])
             if uid:
                 root = memory_prompt_dir().resolve()
                 target_path = memory_file_path(uid).resolve()
                 trash_path, publish_err = stage_delete_file(root_dir=root, target_path=target_path)
                 if publish_err:
-                    raise AppError(
-                        code=ERROR_CODE_INVALID_REQUEST,
-                        message=str(publish_err),
-                        status_code=HTTP_STATUS_BAD_REQUEST,
-                    )
+                    raise invalid_request_error(str(publish_err))
 
-            row = delete_memory_item_repo(item_id=int(item_id), conn=conn)
+            row = delete_memory_item_repo(item_id=to_int(item_id), conn=conn)
             if not row:
-                raise AppError(
-                    code=ERROR_CODE_NOT_FOUND,
-                    message=ERROR_MESSAGE_MEMORY_NOT_FOUND,
-                    status_code=HTTP_STATUS_NOT_FOUND,
-                )
+                raise not_found_error(ERROR_MESSAGE_MEMORY_NOT_FOUND)
     except Exception:
         # DB 删除失败：尽量把文件恢复回去，避免“文件没了但 DB 还在”
         if trash_path and target_path:

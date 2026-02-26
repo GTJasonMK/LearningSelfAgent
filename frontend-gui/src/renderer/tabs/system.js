@@ -34,8 +34,15 @@ function normalizeString(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function normalizeStringList(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+}
+
 function normalizeDisabledList(value) {
-  return Array.isArray(value) ? value.map((item) => String(item)) : [];
+  return normalizeStringList(value);
 }
 
 /**
@@ -141,6 +148,98 @@ export function bind(section) {
   };
 
   let cachedTools = [];
+
+  function normalizePermissionsConfigPayload(payload) {
+    const data = payload && typeof payload === "object" ? payload : {};
+    return {
+      allowed_paths: normalizeStringList(data.allowed_paths),
+      allowed_ops: normalizeStringList(data.allowed_ops),
+      disabled_actions: normalizeDisabledList(data.disabled_actions),
+      disabled_tools: normalizeDisabledList(data.disabled_tools)
+    };
+  }
+
+  function normalizePermissionsMatrixPayload(payload) {
+    const root = payload && typeof payload === "object" ? payload : {};
+    const matrix = root.matrix && typeof root.matrix === "object" ? root.matrix : root;
+    const ops = matrix.ops && typeof matrix.ops === "object" ? matrix.ops : {};
+    return {
+      allowed_paths: normalizeStringList(matrix.allowed_paths),
+      disabled_actions: normalizeDisabledList(matrix.disabled_actions),
+      disabled_tools: normalizeDisabledList(matrix.disabled_tools),
+      ops: {
+        write: Boolean(ops.write),
+        execute: Boolean(ops.execute)
+      }
+    };
+  }
+
+  function mergeAllowedOpsWithMatrix(baseAllowedOps, matrixOps) {
+    const set = new Set(normalizeStringList(baseAllowedOps));
+    if (matrixOps && typeof matrixOps === "object") {
+      if (matrixOps.write) {
+        set.add("write");
+      } else {
+        set.delete("write");
+      }
+      if (matrixOps.execute) {
+        set.add("execute");
+      } else {
+        set.delete("execute");
+      }
+    }
+    return Array.from(set);
+  }
+
+  async function fetchMergedPermissionsState() {
+    let baseConfig = null;
+    let matrixConfig = null;
+
+    await Promise.all([
+      api
+        .fetchPermissions()
+        .then((result) => {
+          baseConfig = normalizePermissionsConfigPayload(result);
+        })
+        .catch(() => {}),
+      api
+        .fetchPermissionsMatrix()
+        .then((result) => {
+          matrixConfig = normalizePermissionsMatrixPayload(result);
+        })
+        .catch(() => {})
+    ]);
+
+    if (!baseConfig && !matrixConfig) {
+      throw new Error("load permissions failed");
+    }
+
+    const fallbackBase = baseConfig || {
+      allowed_paths: [],
+      allowed_ops: [],
+      disabled_actions: [],
+      disabled_tools: []
+    };
+    const fallbackMatrix = matrixConfig || {
+      allowed_paths: null,
+      disabled_actions: null,
+      disabled_tools: null,
+      ops: null
+    };
+
+    return {
+      allowed_paths: Array.isArray(fallbackMatrix.allowed_paths)
+        ? fallbackMatrix.allowed_paths
+        : fallbackBase.allowed_paths,
+      allowed_ops: mergeAllowedOpsWithMatrix(fallbackBase.allowed_ops, fallbackMatrix.ops),
+      disabled_actions: Array.isArray(fallbackMatrix.disabled_actions)
+        ? fallbackMatrix.disabled_actions
+        : fallbackBase.disabled_actions,
+      disabled_tools: Array.isArray(fallbackMatrix.disabled_tools)
+        ? fallbackMatrix.disabled_tools
+        : fallbackBase.disabled_tools
+    };
+  }
 
   // --- 页面切换 ---
 
@@ -500,21 +599,15 @@ export function bind(section) {
 
   async function fetchPermissionsStateShallow() {
     try {
-      const result = await api.fetchPermissions();
-      permissionsState = {
-        allowed_paths: Array.isArray(result.allowed_paths) ? result.allowed_paths : [],
-        allowed_ops: Array.isArray(result.allowed_ops) ? result.allowed_ops : [],
-        disabled_actions: Array.isArray(result.disabled_actions) ? result.disabled_actions : [],
-        disabled_tools: Array.isArray(result.disabled_tools) ? result.disabled_tools : []
-      };
+      permissionsState = await fetchMergedPermissionsState();
     } catch (error) {
       // ignore
     }
   }
 
   async function loadResources() {
+    await fetchPermissionsStateShallow();
     await Promise.all([
-      fetchPermissionsStateShallow(),
       loadResourceOverview(),
       loadDomainsTree(),
       loadSolutionsList(solutionsQueryEl?.value?.trim() || ""),
@@ -722,13 +815,7 @@ export function bind(section) {
   async function loadPermissions() {
     if (permissionsStatusEl) permissionsStatusEl.textContent = UI_TEXT.LOADING;
     try {
-      const result = await api.fetchPermissions();
-      permissionsState = {
-        allowed_paths: Array.isArray(result.allowed_paths) ? result.allowed_paths : [],
-        allowed_ops: Array.isArray(result.allowed_ops) ? result.allowed_ops : [],
-        disabled_actions: Array.isArray(result.disabled_actions) ? result.disabled_actions : [],
-        disabled_tools: Array.isArray(result.disabled_tools) ? result.disabled_tools : []
-      };
+      permissionsState = await fetchMergedPermissionsState();
       if (permissionsPathsEl) {
         permissionsPathsEl.value = permissionsState.allowed_paths.join(", ");
       }

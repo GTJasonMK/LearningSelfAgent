@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from typing import List, Optional, Sequence, Tuple
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import dump_json_list, now_iso
 from backend.src.repositories.repo_conn import provide_connection
 
 
@@ -16,7 +15,7 @@ def create_expectation(
     conn: Optional[sqlite3.Connection] = None,
 ) -> Tuple[int, str]:
     created = created_at or now_iso()
-    criteria_json = json.dumps(list(criteria or []), ensure_ascii=False)
+    criteria_json = dump_json_list(criteria)
     sql = "INSERT INTO expectations (goal, criteria, created_at) VALUES (?, ?, ?)"
     params = (goal, criteria_json, created)
     with provide_connection(conn) as inner:

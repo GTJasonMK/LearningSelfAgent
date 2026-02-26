@@ -14,7 +14,7 @@ from typing import AsyncGenerator, List, Optional
 from backend.src.agent.core.run_context import AgentRunContext
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.debug_utils import safe_write_debug as _safe_write_debug
-from backend.src.agent.runner.feedback import append_task_feedback_step
+from backend.src.agent.runner.feedback import canonicalize_task_feedback_steps, canonicalized_feedback_meta
 from backend.src.agent.runner.run_startup import start_new_mode_run
 from backend.src.agent.runner.run_stage import persist_run_stage
 from backend.src.agent.runner.pending_planning_wait_runner import (
@@ -23,10 +23,20 @@ from backend.src.agent.runner.pending_planning_wait_runner import (
 )
 from backend.src.agent.runner.run_context_knowledge import apply_knowledge_identity_to_run_ctx
 from backend.src.agent.runner.stream_entry_common import (
-    done_sse_event,
-    iter_execution_exception_events,
     iter_finalization_events,
+    require_write_permission_stream,
 )
+from backend.src.agent.runner.session_queue import acquire_stream_queue_ticket
+from backend.src.agent.runner.stream_mode_lifecycle import (
+    StreamModeLifecycle,
+    iter_stream_done_tail,
+    iter_stream_exception_tail,
+)
+from backend.src.agent.runner.stream_request import (
+    ParsedStreamCommandRequest,
+    parse_stream_command_request,
+)
+from backend.src.agent.runner.stream_startup_bridge import bootstrap_stream_mode_lifecycle
 from backend.src.agent.runner.stream_task_events import iter_stream_task_events
 from backend.src.agent.runner.think_parallel_loop import run_think_parallel_loop
 from backend.src.agent.runner.think_helpers import create_llm_call_func
@@ -67,25 +77,22 @@ from backend.src.agent.think import (
     run_reflection,
 )
 from backend.src.api.schemas import AgentCommandStreamRequest
-from backend.src.common.utils import error_response, now_iso
+from backend.src.common.utils import now_iso, parse_positive_int
 from backend.src.constants import (
-    AGENT_DEFAULT_MAX_STEPS,
     AGENT_MAX_STEPS_UNLIMITED,
     AGENT_EXPERIMENT_DIR_REL,
     AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS,
     AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
-    ERROR_CODE_INVALID_REQUEST,
-    ERROR_MESSAGE_LLM_CHAT_MESSAGE_MISSING,
-    HTTP_STATUS_BAD_REQUEST,
     RUN_STATUS_DONE,
+    RUN_STATUS_FAILED,
+    RUN_STATUS_STOPPED,
     STREAM_TAG_EXEC,
     STREAM_TAG_THINK,
     SSE_TYPE_MEMORY_ITEM,
     THINK_REFLECTION_MAX_ROUNDS,
 )
-from backend.src.services.llm.llm_client import resolve_default_model, sse_json
-from backend.src.services.permissions.permission_checks import ensure_write_permission
-from backend.src.repositories.skills_repo import create_skill
+from backend.src.services.llm.llm_client import sse_json
+from backend.src.services.skills.skills_draft import create_skill
 from backend.src.services.skills.skills_publish import publish_skill_file
 from backend.src.services.tasks.task_run_lifecycle import (
     check_missing_artifacts,
@@ -100,6 +107,7 @@ logger = logging.getLogger(__name__)
 NON_FATAL_STREAM_ERRORS = (sqlite3.Error, RuntimeError, TypeError, ValueError, OSError, AttributeError, ImportError)
 
 
+@require_write_permission_stream
 def stream_agent_think_command(payload: AgentCommandStreamRequest):
     """
     Think 模式指令执行（SSE 流式）：
@@ -109,22 +117,15 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
     - 多 Executor 分工执行（按依赖并行调度；保留顺序收尾步骤）
     - 失败时触发反思机制
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    message = (payload.message or "").strip()
-    if not message:
-        return error_response(
-            ERROR_CODE_INVALID_REQUEST,
-            ERROR_MESSAGE_LLM_CHAT_MESSAGE_MISSING,
-            HTTP_STATUS_BAD_REQUEST,
-        )
-
-    max_steps = payload.max_steps or AGENT_DEFAULT_MAX_STEPS
-    dry_run = bool(payload.dry_run)
-    model = (payload.model or "").strip() or resolve_default_model()
-    parameters = payload.parameters or {"temperature": 0.2}
+    parsed = parse_stream_command_request(payload)
+    if not isinstance(parsed, ParsedStreamCommandRequest):
+        return parsed
+    message = parsed.message
+    max_steps = parsed.requested_max_steps
+    normalized_max_steps = int(parsed.normalized_max_steps)
+    dry_run = bool(parsed.dry_run)
+    model = parsed.model
+    parameters = dict(parsed.parameters or {})
 
     # 解析 Think 配置
     think_config: ThinkConfig
@@ -146,42 +147,49 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
     async def gen() -> AsyncGenerator[str, None]:
         task_id: Optional[int] = None
         run_id: Optional[int] = None
+        run_status: str = ""
+        lifecycle = StreamModeLifecycle()
         plan_items: List[dict] = []
         run_ctx: Optional[AgentRunContext] = None
 
         try:
             workdir = os.getcwd()
 
-            started = await start_new_mode_run(
-                message=message,
-                mode="think",
-                model=model,
-                parameters=parameters,
-                max_steps=int(max_steps) if isinstance(max_steps, int) else None,
-                workdir=workdir,
-                stage_where_prefix="think_run",
-                safe_write_debug=_safe_write_debug,
-                state_overrides={"think_config": payload.think_config},
-                tools_hint="(无)",
-                skills_hint="(无)",
-                solutions_hint="(无)",
-                memories_hint="(无)",
-                graph_hint="",
-                start_debug_message="agent.think.start",
-                start_debug_data={
+            startup = await bootstrap_stream_mode_lifecycle(
+                lifecycle=lifecycle,
+                start_mode_run_func=start_new_mode_run,
+                start_mode_run_kwargs={
+                    "message": message,
                     "mode": "think",
                     "model": model,
-                    "max_steps": max_steps,
-                    "dry_run": dry_run,
+                    "parameters": parameters,
+                    "max_steps": normalized_max_steps,
                     "workdir": workdir,
-                    "planner_count": think_config.get_planner_count(),
+                    "stage_where_prefix": "think_run",
+                    "safe_write_debug": _safe_write_debug,
+                    "state_overrides": {"think_config": payload.think_config},
+                    "tools_hint": "(无)",
+                    "skills_hint": "(无)",
+                    "solutions_hint": "(无)",
+                    "memories_hint": "(无)",
+                    "graph_hint": "",
+                    "start_debug_message": "agent.think.start",
+                    "start_debug_data": {
+                        "mode": "think",
+                        "model": model,
+                        "max_steps": max_steps,
+                        "dry_run": dry_run,
+                        "workdir": workdir,
+                        "planner_count": think_config.get_planner_count(),
+                    },
+                    "start_delta": f"{STREAM_TAG_THINK} Think 模式启动，{think_config.get_planner_count()} 个规划者协作\n",
                 },
-                start_delta=f"{STREAM_TAG_THINK} Think 模式启动，{think_config.get_planner_count()} 个规划者协作\n",
+                acquire_queue_ticket_func=acquire_stream_queue_ticket,
             )
-            task_id = int(started.task_id)
-            run_id = int(started.run_id)
-            run_ctx = started.run_ctx
-            for event in started.events:
+            task_id = int(startup.task_id)
+            run_id = int(startup.run_id)
+            run_ctx = startup.run_ctx
+            for event in startup.emitted_events:
                 yield str(event)
             # 工具清单会在“方案匹配”之后汇总（方案提到的工具优先）
             tools_hint = "(无)"
@@ -214,7 +222,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 )
             ):
                 if event_type == "msg":
-                    yield str(event_payload)
+                    yield lifecycle.emit(str(event_payload))
                     continue
                 retrieval_result = event_payload
             if not isinstance(retrieval_result, dict):
@@ -230,6 +238,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
             solutions_hint = str(retrieval_result.get("solutions_hint") or "(无)")
             tools_hint = str(retrieval_result.get("tools_hint") or "(无)")
             draft_solution_id = retrieval_result.get("draft_solution_id")
+            draft_solution_id_value = parse_positive_int(draft_solution_id, default=None)
             planner_hints = (
                 dict(retrieval_result.get("planner_hints") or {})
                 if isinstance(retrieval_result.get("planner_hints"), dict)
@@ -249,7 +258,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                         workdir=workdir,
                         model=model,
                         parameters=parameters,
-                        max_steps=int(max_steps),
+                        max_steps=normalized_max_steps,
                         user_prompt_question=user_prompt_question,
                         tools_hint=tools_hint,
                         skills_hint=skills_hint,
@@ -259,25 +268,22 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                         domain_ids=list(domain_ids or []),
                         skills=list(merged_skills or []),
                         solutions=list(merged_solutions or []),
-                        draft_solution_id=(
-                            int(draft_solution_id)
-                            if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0
-                            else None
-                        ),
+                        draft_solution_id=draft_solution_id_value,
                         think_config=payload.think_config if isinstance(payload.think_config, dict) else None,
                         safe_write_debug_func=_safe_write_debug,
                     )
                 ):
                     if event_type == "msg":
-                        yield str(event_payload)
+                        yield lifecycle.emit(str(event_payload))
                         continue
                     wait_result = event_payload
                 if wait_result is None:
                     raise RuntimeError("think pending_planning waiting 结果为空")
+                await lifecycle.release_queue_ticket_once()
                 return
 
             # --- Think 模式规划（六阶段头脑风暴）---
-            yield sse_json({"delta": f"{STREAM_TAG_THINK} 开始多模型协作规划…\n"})
+            yield lifecycle.emit(sse_json({"delta": f"{STREAM_TAG_THINK} 开始多模型协作规划…\n"}))
             if run_ctx is None:
                 run_ctx = AgentRunContext.from_agent_state(
                     {},
@@ -285,7 +291,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                     message=message,
                     model=model,
                     parameters=parameters,
-                    max_steps=int(max_steps) if isinstance(max_steps, int) else None,
+                    max_steps=normalized_max_steps,
                     workdir=workdir,
                 )
             run_ctx.set_extra("think_config", payload.think_config)
@@ -298,7 +304,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 safe_write_debug=_safe_write_debug,
             )
             if stage_event:
-                yield stage_event
+                yield lifecycle.emit(stage_event)
             # 开发阶段：规划步数不设上限（用超大值近似无限），避免被 max_steps 门槛截断。
             planning_max_steps = int(AGENT_MAX_STEPS_UNLIMITED)
 
@@ -334,7 +340,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
 
             # 输出规划进度
             for msg in progress_messages:
-                yield sse_json({"delta": f"{msg}\n"})
+                yield lifecycle.emit(sse_json({"delta": f"{msg}\n"}))
 
             duration_ms = int((time.monotonic() - plan_started_at) * 1000)
             _safe_write_debug(
@@ -357,7 +363,11 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                     run_id=int(run_id),
                     reason="think_planning_empty",
                 )
-                yield sse_json({"message": "Think 模式规划失败：未生成有效计划"}, event="error")
+                status_event = lifecycle.emit_run_status(RUN_STATUS_FAILED)
+                if status_event:
+                    yield status_event
+                yield lifecycle.emit(sse_json({"message": "Think 模式规划失败：未生成有效计划"}, event="error"))
+                await lifecycle.release_queue_ticket_once()
                 return
 
             plan_titles = think_plan_result.plan_titles
@@ -379,13 +389,28 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
             plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
             plan_briefs = [str((item or {}).get("brief") or "") for item in plan_items]
 
-            # 追加确认满意度步骤
-            append_task_feedback_step(
+            # 统一规范反馈步骤，避免计划中间残留“确认满意度”导致提前进入 waiting。
+            feedback_canonicalized = canonicalize_task_feedback_steps(
                 plan_titles=plan_titles,
                 plan_items=plan_items,
                 plan_allows=plan_allows,
-                max_steps=int(max_steps) if isinstance(max_steps, int) else None,
+                keep_single_tail=True,
+                feedback_asked=False,
+                max_steps=normalized_max_steps,
             )
+            feedback_meta = canonicalized_feedback_meta(feedback_canonicalized)
+            if feedback_meta["changed"]:
+                _safe_write_debug(
+                    task_id=task_id,
+                    run_id=run_id,
+                    message="agent.think.plan.feedback_step_canonicalized",
+                    data={
+                        "found": feedback_meta["found"],
+                        "removed": feedback_meta["removed"],
+                        "appended": feedback_meta["appended"],
+                    },
+                    level="info",
+                )
             plan_struct = PlanStructure.from_legacy(
                 plan_titles=list(plan_titles or []),
                 plan_items=list(plan_items or []),
@@ -394,7 +419,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
             )
             plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
 
-            yield sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items})
+            yield lifecycle.emit(sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items}))
 
             # 持久化 agent 运行态
             base_state = build_base_agent_state(
@@ -416,11 +441,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 domain_ids=list(domain_ids or []),
                 skills=list(merged_skills or []),
                 solutions=list(merged_solutions or []),
-                draft_solution_id=(
-                    int(draft_solution_id)
-                    if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0
-                    else None
-                ),
+                draft_solution_id=draft_solution_id_value,
             )
             run_ctx.set_extra("think_config", payload.think_config)
             run_ctx.set_extra("winning_planner_id", think_plan_result.winning_planner_id)
@@ -442,16 +463,21 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 logger.exception("agent.think.state.persist_failed: %s", exc)
 
             if dry_run:
-                yield sse_json({"delta": f"{STREAM_TAG_EXEC} dry_run: 已生成步骤，未执行。\n"})
+                yield lifecycle.emit(sse_json({"delta": f"{STREAM_TAG_EXEC} dry_run: 已生成步骤，未执行。\n"}))
                 await asyncio.to_thread(
                     finalize_run_and_task_status,
                     task_id=int(task_id),
                     run_id=int(run_id),
                     run_status=RUN_STATUS_DONE,
                 )
+                run_status = RUN_STATUS_DONE
+                status_event = lifecycle.emit_run_status(run_status)
+                if status_event:
+                    yield status_event
+                await lifecycle.release_queue_ticket_once()
                 return
 
-            yield sse_json({"delta": f"{STREAM_TAG_EXEC} 开始执行…\n"})
+            yield lifecycle.emit(sse_json({"delta": f"{STREAM_TAG_EXEC} 开始执行…\n"}))
             if run_ctx is None:
                 run_ctx = AgentRunContext.from_agent_state(agent_state, mode="think")
             agent_state, _, stage_event = await persist_run_stage(
@@ -463,7 +489,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 safe_write_debug=_safe_write_debug,
             )
             if stage_event:
-                yield stage_event
+                yield lifecycle.emit(stage_event)
 
             base_dependencies = None
             try:
@@ -512,7 +538,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 )
             ):
                 if event_type == "msg":
-                    yield str(event_payload)
+                    yield lifecycle.emit(str(event_payload))
                     continue
                 think_result = event_payload
             if think_result is None:
@@ -536,25 +562,32 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 workdir=workdir,
             ):
                 if event_type == "msg":
-                    yield str(event_payload)
+                    yield lifecycle.emit(str(event_payload))
                 elif event_type == "status":
                     run_status = str(event_payload or "")
+                    status_event = lifecycle.emit_run_status(run_status)
+                    if status_event:
+                        yield status_event
 
         except (asyncio.CancelledError, GeneratorExit):
             handle_stream_cancellation(task_id=task_id, run_id=run_id, reason="agent_think_stream_cancelled")
+            await lifecycle.release_queue_ticket_once()
             raise
         except Exception as exc:
-            async for chunk in iter_execution_exception_events(
+            async for chunk in iter_stream_exception_tail(
+                lifecycle=lifecycle,
                 exc=exc,
-                task_id=task_id,
-                run_id=run_id,
                 mode_prefix="agent.think",
             ):
                 yield chunk
 
         try:
-            yield done_sse_event()
-        except BaseException:
-            return
+            async for chunk in iter_stream_done_tail(
+                lifecycle=lifecycle,
+                run_status=run_status,
+            ):
+                yield chunk
+        finally:
+            await lifecycle.release_queue_ticket_once()
 
     return create_sse_response(gen)

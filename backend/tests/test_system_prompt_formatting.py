@@ -47,15 +47,18 @@ class TestSystemPromptFormatting(unittest.TestCase):
             step_title="step1",
             allowed_actions="tool_call",
             observations="- none",
+            recent_source_failures="(无)",
             graph="(无)",
             tools="(无)",
             skills="(无)",
             memories="(无)",
             output_style="简洁输出",
             action_types_line="tool_call,task_output",
+            action_payload_keys_guide="- tool_call: input, output\n- task_output: content, output_type",
         )
         self.assertIn("user_prompt", text)
-        self.assertIn("{label,value}", text)
+        self.assertIn("\"label\":\"快速\"", text)
+        self.assertIn("\"value\":\"fast\"", text)
 
 
 if __name__ == "__main__":

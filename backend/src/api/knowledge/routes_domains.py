@@ -3,19 +3,19 @@
 
 提供领域的 CRUD 操作接口。
 """
-import json
 from typing import Optional
 
 from fastapi import APIRouter
 
 from backend.src.api.schemas import DomainCreate, DomainUpdate
-from backend.src.api.utils import ensure_write_permission
+from backend.src.api.utils import require_write_permission
+from backend.src.common.utils import parse_json_list
 from backend.src.constants import (
     ERROR_CODE_NOT_FOUND,
     ERROR_MESSAGE_NOT_FOUND,
     HTTP_STATUS_NOT_FOUND,
 )
-from backend.src.repositories.domains_repo import (
+from backend.src.services.knowledge.knowledge_query import (
     DomainCreateParams,
     DomainUpdateParams,
     count_domains,
@@ -33,16 +33,35 @@ from backend.src.storage import get_connection
 router = APIRouter()
 
 
+def _error_payload(*, code: str, message: str, status: int) -> dict:
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "status": status,
+        }
+    }
+
+
+def _not_found_payload() -> dict:
+    return _error_payload(
+        code=ERROR_CODE_NOT_FOUND,
+        message=ERROR_MESSAGE_NOT_FOUND,
+        status=HTTP_STATUS_NOT_FOUND,
+    )
+
+
+def _keywords_or_none(value) -> Optional[list]:
+    if value is None or value == "":
+        return None
+    return parse_json_list(value)
+
+
 def _domain_from_row(row) -> dict:
     """将数据库行转换为 API 响应格式。"""
     if not row:
         return None
-    keywords = None
-    if row["keywords"]:
-        try:
-            keywords = json.loads(row["keywords"])
-        except json.JSONDecodeError:
-            keywords = []
+    keywords = _keywords_or_none(row["keywords"])
     return {
         "id": row["id"],
         "domain_id": row["domain_id"],
@@ -103,22 +122,14 @@ def get_domain(domain_id: str) -> dict:
     with get_connection() as conn:
         row = get_domain_repo(domain_id=domain_id, conn=conn)
     if not row:
-        return {
-            "error": {
-                "code": ERROR_CODE_NOT_FOUND,
-                "message": ERROR_MESSAGE_NOT_FOUND,
-                "status": HTTP_STATUS_NOT_FOUND,
-            }
-        }
+        return _not_found_payload()
     return _domain_from_row(row)
 
 
 @router.post("/domains")
+@require_write_permission
 def create_domain(payload: DomainCreate) -> dict:
     """创建新领域。"""
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     with get_connection() as conn:
         # 检查是否已存在
         existing = get_domain_repo(domain_id=payload.domain_id, conn=conn)
@@ -145,21 +156,13 @@ def create_domain(payload: DomainCreate) -> dict:
 
 
 @router.patch("/domains/{domain_id}")
+@require_write_permission
 def update_domain(domain_id: str, payload: DomainUpdate) -> dict:
     """更新领域。"""
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     with get_connection() as conn:
         existing = get_domain_repo(domain_id=domain_id, conn=conn)
         if not existing:
-            return {
-                "error": {
-                    "code": ERROR_CODE_NOT_FOUND,
-                    "message": ERROR_MESSAGE_NOT_FOUND,
-                    "status": HTTP_STATUS_NOT_FOUND,
-                }
-            }
+            return _not_found_payload()
         update_domain_repo(
             domain_id=domain_id,
             params=DomainUpdateParams(
@@ -175,21 +178,13 @@ def update_domain(domain_id: str, payload: DomainUpdate) -> dict:
 
 
 @router.delete("/domains/{domain_id}")
+@require_write_permission
 def delete_domain(domain_id: str) -> dict:
     """删除领域。"""
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     with get_connection() as conn:
         existing = get_domain_repo(domain_id=domain_id, conn=conn)
         if not existing:
-            return {
-                "error": {
-                    "code": ERROR_CODE_NOT_FOUND,
-                    "message": ERROR_MESSAGE_NOT_FOUND,
-                    "status": HTTP_STATUS_NOT_FOUND,
-                }
-            }
+            return _not_found_payload()
         # 检查是否有子领域
         children = list_child_domains(parent_id=domain_id, conn=conn)
         if children:

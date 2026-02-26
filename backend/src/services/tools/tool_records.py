@@ -1,18 +1,13 @@
-import json
 from typing import Any
 
-from backend.src.common.errors import AppError
+from backend.src.common.app_error_utils import invalid_request_error, not_found_error
 from backend.src.common.serializers import tool_call_from_row
-from backend.src.common.utils import dump_model, now_iso
+from backend.src.common.utils import dump_model, now_iso, parse_json_dict
 from backend.src.constants import (
     DEFAULT_TOOL_VERSION,
-    ERROR_CODE_INVALID_REQUEST,
-    ERROR_CODE_NOT_FOUND,
     ERROR_MESSAGE_INVALID_STATUS,
     ERROR_MESSAGE_TOOL_NOT_FOUND,
     ERROR_MESSAGE_TOOL_REQUIRED,
-    HTTP_STATUS_BAD_REQUEST,
-    HTTP_STATUS_NOT_FOUND,
     SQL_BOOL_FALSE,
     SQL_BOOL_TRUE,
     TOOL_APPROVAL_STATUS_DRAFT,
@@ -35,8 +30,53 @@ from backend.src.repositories.tools_repo import (
     update_tool,
     update_tool_last_used_at,
 )
+from backend.src.services.common.coerce import to_int, to_text
 from backend.src.services.tools.tools_store import publish_tool_file
 from backend.src.storage import get_connection
+
+
+TOOL_REUSE_ALLOWED_STATUSES = frozenset(
+    {
+        TOOL_REUSE_STATUS_PASS,
+        TOOL_REUSE_STATUS_FAIL,
+        TOOL_REUSE_STATUS_UNKNOWN,
+    }
+)
+
+
+def _update_tool_partial(
+    *,
+    tool_id: int,
+    conn,
+    description: Any = None,
+    version: Any = None,
+    metadata: Any = None,
+    change_notes: Any = None,
+    updated_at: str,
+) -> None:
+    update_tool(
+        tool_id=to_int(tool_id),
+        name=None,
+        description=description,
+        version=version,
+        metadata=metadata,
+        change_notes=change_notes,
+        updated_at=updated_at,
+        conn=conn,
+    )
+
+def is_valid_tool_reuse_status(value, *, allow_none: bool = False) -> bool:
+    if value is None:
+        return bool(allow_none)
+    return value in TOOL_REUSE_ALLOWED_STATUSES
+
+
+def empty_tool_reuse_status_counts() -> dict:
+    return {
+        TOOL_REUSE_STATUS_PASS: 0,
+        TOOL_REUSE_STATUS_FAIL: 0,
+        TOOL_REUSE_STATUS_UNKNOWN: 0,
+    }
 
 
 def create_tool_record(payload: Any) -> dict:
@@ -48,17 +88,8 @@ def create_tool_record(payload: Any) -> dict:
     - Agent 执行链路也会复用该函数（避免直接调用 async 路由函数导致 coroutine 泄漏）。
     """
     data = dump_model(payload)
-    allowed_statuses = {
-        TOOL_REUSE_STATUS_PASS,
-        TOOL_REUSE_STATUS_FAIL,
-        TOOL_REUSE_STATUS_UNKNOWN,
-    }
-    if data.get("reuse_status") is not None and data.get("reuse_status") not in allowed_statuses:
-        raise AppError(
-            code=ERROR_CODE_INVALID_REQUEST,
-            message=ERROR_MESSAGE_INVALID_STATUS,
-            status_code=HTTP_STATUS_BAD_REQUEST,
-        )
+    if not is_valid_tool_reuse_status(data.get("reuse_status"), allow_none=True):
+        raise invalid_request_error(ERROR_MESSAGE_INVALID_STATUS)
 
     reuse_flag = data.get("reuse")
     if reuse_flag is None and data.get("skill_id") is not None:
@@ -82,28 +113,20 @@ def create_tool_record(payload: Any) -> dict:
         )
 
         if tool_id is not None:
-            tool_row = get_tool(tool_id=int(tool_id), conn=conn)
+            tool_row = get_tool(tool_id=to_int(tool_id), conn=conn)
             if not tool_row:
-                raise AppError(
-                    code=ERROR_CODE_NOT_FOUND,
-                    message=ERROR_MESSAGE_TOOL_NOT_FOUND,
-                    status_code=HTTP_STATUS_NOT_FOUND,
-                )
+                raise not_found_error(ERROR_MESSAGE_TOOL_NOT_FOUND)
         else:
-            tool_name = str(data.get("tool_name") or "").strip()
+            tool_name = to_text(data.get("tool_name")).strip()
             if not tool_name:
-                raise AppError(
-                    code=ERROR_CODE_INVALID_REQUEST,
-                    message=ERROR_MESSAGE_TOOL_REQUIRED,
-                    status_code=HTTP_STATUS_BAD_REQUEST,
-                )
+                raise invalid_request_error(ERROR_MESSAGE_TOOL_REQUIRED)
             tool_row = get_tool_by_name(name=tool_name, conn=conn)
             if tool_row:
-                tool_id = int(tool_row["id"])
+                tool_id = to_int(tool_row["id"])
             else:
                 tool_created_at = now_iso()
-                tool_version = str(data.get("tool_version") or DEFAULT_TOOL_VERSION)
-                tool_description = str(data.get("tool_description") or "自动生成工具")
+                tool_version = to_text(data.get("tool_version") or DEFAULT_TOOL_VERSION)
+                tool_description = to_text(data.get("tool_description") or "自动生成工具")
                 # 新工具注册策略（MVP）：
                 # - 若来自 agent（run_id 存在），先标记为 draft，待 Eval 通过后再进入“可复用工具清单”；
                 # - 若非 agent 创建（无 run_id），默认视为已批准（不写 approval 字段也视为 approved）。
@@ -121,12 +144,12 @@ def create_tool_record(payload: Any) -> dict:
                     approval["status"] = TOOL_APPROVAL_STATUS_DRAFT
                     approval["created_at"] = tool_created_at
                     try:
-                        approval["created_run_id"] = int(data.get("run_id"))
+                        approval["created_run_id"] = to_int(data.get("run_id"))
                     except Exception:
                         pass
                     if data.get("task_id") is not None:
                         try:
-                            approval["created_task_id"] = int(data.get("task_id"))
+                            approval["created_task_id"] = to_int(data.get("task_id"))
                         except Exception:
                             pass
                     meta_for_create[TOOL_METADATA_APPROVAL_KEY] = approval
@@ -151,41 +174,27 @@ def create_tool_record(payload: Any) -> dict:
         if tool_id is not None and tool_row:
             if data.get("tool_description"):
                 if not tool_row["description"] or tool_row["description"] == "自动生成工具":
-                    update_tool(
-                        tool_id=int(tool_id),
-                        name=None,
-                        description=str(data.get("tool_description") or ""),
-                        version=None,
-                        metadata=None,
-                        change_notes=None,
-                        updated_at=created_at,
+                    _update_tool_partial(
+                        tool_id=tool_id,
                         conn=conn,
+                        description=to_text(data.get("tool_description")),
+                        updated_at=created_at,
                     )
                     tool_changed = True
             if data.get("tool_version") and data.get("tool_version") != tool_row["version"]:
-                update_tool(
-                    tool_id=int(tool_id),
-                    name=None,
-                    description=None,
-                    version=str(data.get("tool_version") or ""),
-                    metadata=None,
+                _update_tool_partial(
+                    tool_id=tool_id,
+                    conn=conn,
+                    version=to_text(data.get("tool_version")),
                     change_notes=TOOL_VERSION_CHANGE_NOTE_AUTO,
                     updated_at=created_at,
-                    conn=conn,
                 )
                 tool_changed = True
 
         # 合并工具 metadata（尽量保留历史字段）
         if tool_id is not None and isinstance(tool_metadata_obj, dict) and tool_row:
             existing_metadata = tool_row["metadata"]
-            merged = None
-            if existing_metadata:
-                try:
-                    merged = json.loads(existing_metadata)
-                except json.JSONDecodeError:
-                    merged = None
-            if not isinstance(merged, dict):
-                merged = {}
+            merged = parse_json_dict(existing_metadata) or {}
             # Agent 执行链路：不允许模型通过 tool_metadata 篡改审批状态。
             # 说明：
             # - 新工具在创建时已强制写入 approval.status=draft；
@@ -197,41 +206,37 @@ def create_tool_record(payload: Any) -> dict:
                 merged.update(filtered)
             else:
                 merged.update(tool_metadata_obj)
-            update_tool(
-                tool_id=int(tool_id),
-                name=None,
-                description=None,
-                version=None,
-                metadata=merged,
-                change_notes=None,
-                updated_at=created_at,
+            _update_tool_partial(
+                tool_id=tool_id,
                 conn=conn,
+                metadata=merged,
+                updated_at=created_at,
             )
             tool_changed = True
 
         # 工具“灵魂存档”：尽力落盘工具文件（失败不阻塞工具调用统计）
         if tool_id is not None and tool_changed:
             try:
-                publish_tool_file(int(tool_id), conn=conn)
+                publish_tool_file(to_int(tool_id), conn=conn)
             except Exception:
                 # 不 raise：避免因为落盘失败导致工具调用链路整体失败
                 pass
 
         record_id, _ = create_tool_call_record(
             ToolCallRecordCreateParams(
-                tool_id=int(tool_id),
+                tool_id=to_int(tool_id),
                 task_id=data.get("task_id"),
                 skill_id=data.get("skill_id"),
                 run_id=data.get("run_id"),
-                reuse=int(reuse_value),
+                reuse=to_int(reuse_value),
                 reuse_status=reuse_status,
                 reuse_notes=data.get("reuse_notes"),
-                input=str(data.get("input") or ""),
-                output=str(data.get("output") or ""),
+                input=to_text(data.get("input")),
+                output=to_text(data.get("output")),
                 created_at=created_at,
             ),
             conn=conn,
         )
-        update_tool_last_used_at(tool_id=int(tool_id), last_used_at=created_at, conn=conn)
-        row = get_tool_call_record(record_id=int(record_id), conn=conn)
+        update_tool_last_used_at(tool_id=to_int(tool_id), last_used_at=created_at, conn=conn)
+        row = get_tool_call_record(record_id=to_int(record_id), conn=conn)
     return {"record": tool_call_from_row(row)}

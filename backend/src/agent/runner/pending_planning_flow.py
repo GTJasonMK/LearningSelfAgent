@@ -13,7 +13,11 @@ from backend.src.agent.runner.pending_planning_state import (
     build_waiting_followup_state,
 )
 from backend.src.agent.runner.planning_runner import run_do_planning_phase_with_stream
-from backend.src.constants import AGENT_KNOWLEDGE_SUFFICIENCY_KIND
+from backend.src.constants import (
+    AGENT_KNOWLEDGE_SUFFICIENCY_KIND,
+    AGENT_KNOWLEDGE_SUFFICIENCY_PROCEED_VALUE,
+)
+from backend.src.common.utils import parse_positive_int
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.services.tasks.task_run_lifecycle import enqueue_postprocess_thread, mark_run_failed
 
@@ -30,6 +34,97 @@ def _normalize_plan(
         plan_items=list(plan_items or []),
         plan_allows=[list(value or []) for value in (plan_allows or [])],
         plan_artifacts=list(plan_artifacts or []),
+    )
+
+
+def _normalize_user_input_text(value: str) -> str:
+    return "".join(str(value or "").strip().lower().split())
+
+
+def _looks_like_proceed_choice_value(value: str) -> bool:
+    """
+    判定 choice.value 是否表达“按当前信息继续”语义。
+    """
+    text = _normalize_user_input_text(str(value or ""))
+    if not text:
+        return False
+    canonical = _normalize_user_input_text(str(AGENT_KNOWLEDGE_SUFFICIENCY_PROCEED_VALUE or ""))
+    if canonical and text == canonical:
+        return True
+    return text in {
+        "proceed",
+        "proceedwithassumptions",
+        "proceedwithcurrentinfo",
+        "continuewithassumptions",
+        "continuewithcurrentinfo",
+    }
+
+
+def _is_proceed_with_current_info_answer(*, user_input: str, paused: dict) -> bool:
+    """
+    识别“按当前信息继续执行”的用户选择语义。
+
+    目的：
+    - 用户已经明确接受“先按已知信息推进并在结果中列假设”时，
+      避免再次进入 ask_user 循环；
+    - 保持判定尽量基于 choices/value（结构化），文本关键词仅作兜底。
+    """
+    normalized_input = _normalize_user_input_text(str(user_input or ""))
+    if not normalized_input:
+        return False
+
+    direct_markers = (
+        "按当前已知信息继续执行",
+        "按当前信息继续",
+        "继续执行并明确列出关键假设",
+        "按已有信息继续",
+    )
+    if any(_normalize_user_input_text(marker) in normalized_input for marker in direct_markers):
+        return True
+
+    choices = paused.get("choices") if isinstance(paused, dict) else None
+    if _looks_like_proceed_choice_value(normalized_input):
+        return True
+
+    if not isinstance(choices, list):
+        return False
+
+    for item in choices:
+        if not isinstance(item, dict):
+            continue
+        value_text = _normalize_user_input_text(str(item.get("value") or ""))
+        if not value_text:
+            continue
+        if value_text != normalized_input:
+            continue
+        if _looks_like_proceed_choice_value(value_text):
+            return True
+        label_text = str(item.get("label") or "")
+        if ("按当前" in label_text) or ("继续" in label_text):
+            return True
+    return False
+
+
+def _ensure_single_feedback_tail(
+    *,
+    plan_titles: List[str],
+    plan_items: List[dict],
+    plan_allows: List[List[str]],
+) -> None:
+    """
+    统一规范“确认满意度”步骤：
+    - 无论规划结果中是否出现同名步骤，都只保留一个；
+    - 且该步骤必须位于计划尾部。
+    """
+    from backend.src.agent.runner.feedback import canonicalize_task_feedback_steps
+
+    canonicalize_task_feedback_steps(
+        plan_titles=plan_titles,
+        plan_items=plan_items,
+        plan_allows=plan_allows,
+        keep_single_tail=True,
+        feedback_asked=False,
+        max_steps=None,
     )
 
 
@@ -231,6 +326,13 @@ async def resume_pending_planning_after_user_input(
             "resume_step_order": int(agent_state.get("step_order") or 1),
         }
 
+    force_proceed_with_assumptions = _is_proceed_with_current_info_answer(
+        user_input=user_input_text,
+        paused=paused if isinstance(paused, dict) else {},
+    )
+    if force_proceed_with_assumptions and isinstance(agent_state, dict):
+        agent_state["knowledge_sufficiency_override"] = "proceed_with_assumptions"
+
     # 复用“用户补充”信息进入新一轮检索/规划：保持 audit 可读（不覆盖原始标题）
     message_for_planning = str(message or "").strip() or ""
     message_for_planning = (message_for_planning + "\n\n用户补充：" + user_input_text).strip()
@@ -357,6 +459,18 @@ async def resume_pending_planning_after_user_input(
     need_user_prompt = bool(enriched.get("need_user_prompt"))
     user_prompt_question = str(enriched.get("user_prompt_question") or "").strip()
 
+    if need_user_prompt and user_prompt_question and force_proceed_with_assumptions:
+        need_user_prompt = False
+        user_prompt_question = ""
+        yield_func(sse_json({"delta": f"{STREAM_TAG_EXEC} 已按你的选择继续执行，将基于当前信息推进并明确关键假设。\n"}))
+        safe_debug(
+            task_id,
+            run_id,
+            message="agent.knowledge_sufficiency.force_proceed",
+            data={"user_input": user_input_text},
+            level="info",
+        )
+
     if need_user_prompt and user_prompt_question:
         from backend.src.agent.runner.react_step_executor import handle_user_prompt_action
 
@@ -420,16 +534,33 @@ async def resume_pending_planning_after_user_input(
     skills_hint = str(enriched.get("skills_hint") or skills_hint or "(无)")
     solutions_for_prompt = list(enriched.get("solutions_for_prompt") or solutions or [])
     draft_solution_id = enriched.get("draft_solution_id")
+    draft_solution_id_value = parse_positive_int(draft_solution_id, default=None)
     solutions_hint = str(enriched.get("solutions_hint") or "(无)")
     tools_hint = str(enriched.get("tools_hint") or "(无)")
 
     planning_max_steps = int(AGENT_MAX_STEPS_UNLIMITED)
+    planning_max_steps_value = int(planning_max_steps)
 
     append_feedback = append_task_feedback_step_func
     if append_feedback is None:
         from backend.src.agent.runner.feedback import append_task_feedback_step as _append
 
         append_feedback = _append
+
+    def ensure_feedback_tail(*, titles: List[str], items: List[dict], allows: List[List[str]]) -> None:
+        # 兼容旧注入（单测/运行时 patch）：先按旧逻辑尝试 append，再做规范化收敛。
+        if callable(append_feedback):
+            append_feedback(
+                plan_titles=titles,
+                plan_items=items,
+                plan_allows=allows,
+                max_steps=None,
+            )
+        _ensure_single_feedback_tail(
+            plan_titles=titles,
+            plan_items=items,
+            plan_allows=allows,
+        )
 
     if pending_mode == "think":
         from backend.src.agent.think import (
@@ -475,7 +606,7 @@ async def resume_pending_planning_after_user_input(
                 skills_hint=skills_hint,
                 solutions_hint=solutions_hint,
                 tools_hint=tools_hint,
-                max_steps=int(planning_max_steps),
+                max_steps=planning_max_steps_value,
                 llm_call_func=_llm_call,
                 yield_progress=_collect_progress,
                 planner_hints=None,
@@ -544,11 +675,10 @@ async def resume_pending_planning_after_user_input(
             allow = plan_allows_gen[i] if i < len(plan_allows_gen) else []
             plan_items_gen.append({"id": int(i) + 1, "title": title, "brief": brief, "allow": allow, "status": "pending"})
 
-        append_feedback(
-            plan_titles=plan_titles_gen,
-            plan_items=plan_items_gen,
-            plan_allows=plan_allows_gen,
-            max_steps=None,
+        ensure_feedback_tail(
+            titles=plan_titles_gen,
+            items=plan_items_gen,
+            allows=plan_allows_gen,
         )
 
         merged_titles = [pending_prompt_title] + plan_titles_gen
@@ -605,7 +735,7 @@ async def resume_pending_planning_after_user_input(
             domain_ids=list(domain_ids or []),
             skills=list(skills or []),
             solutions=list(solutions_for_prompt or []),
-            draft_solution_id=draft_solution_id if isinstance(draft_solution_id, int) else None,
+            draft_solution_id=draft_solution_id_value,
             step_order=int(resume_step_order),
             extra_state=extra_state,
         )
@@ -651,7 +781,7 @@ async def resume_pending_planning_after_user_input(
                 workdir=workdir,
                 model=model,
                 parameters=parameters,
-                max_steps=int(planning_max_steps),
+                max_steps=planning_max_steps_value,
                 tools_hint=tools_hint,
                 skills_hint=skills_hint,
                 solutions_hint=solutions_hint,
@@ -688,7 +818,7 @@ async def resume_pending_planning_after_user_input(
                 workdir=workdir,
                 model=model,
                 parameters=parameters,
-                max_steps=int(planning_max_steps),
+                max_steps=planning_max_steps_value,
                 tools_hint=tools_hint,
                 skills_hint=skills_hint,
                 solutions_hint=solutions_hint,
@@ -727,11 +857,10 @@ async def resume_pending_planning_after_user_input(
     plan_artifacts_new = list(plan_result.plan_artifacts or [])
     plan_items_gen = list(plan_result.plan_items or [])
 
-    append_feedback(
-        plan_titles=plan_titles_gen,
-        plan_items=plan_items_gen,
-        plan_allows=plan_allows_gen,
-        max_steps=None,
+    ensure_feedback_tail(
+        titles=plan_titles_gen,
+        items=plan_items_gen,
+        allows=plan_allows_gen,
     )
 
     merged_titles = [pending_prompt_title] + plan_titles_gen
@@ -767,7 +896,7 @@ async def resume_pending_planning_after_user_input(
         domain_ids=list(domain_ids or []),
         skills=list(skills or []),
         solutions=list(solutions_for_prompt or []),
-        draft_solution_id=draft_solution_id if isinstance(draft_solution_id, int) else None,
+        draft_solution_id=draft_solution_id_value,
         step_order=int(resume_step_order),
     )
 

@@ -1,9 +1,15 @@
 import json
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.src.actions.registry import normalize_action_type
-from backend.src.common.utils import extract_json_object, now_iso, parse_json_list, truncate_text
+from backend.src.common.utils import (
+    action_type_from_step_detail,
+    bump_semver_patch,
+    extract_json_object,
+    now_iso,
+    parse_json_list,
+    truncate_text,
+)
 from backend.src.constants import AGENT_TASK_FEEDBACK_STEP_TITLE, DEFAULT_SKILL_VERSION
 from backend.src.repositories.skills_repo import (
     SkillCreateParams,
@@ -16,21 +22,6 @@ from backend.src.repositories.task_steps_repo import list_task_steps_for_run
 from backend.src.repositories.tool_call_records_repo import list_tool_calls_with_tool_name_by_run
 from backend.src.services.skills.skills_publish import publish_skill_file
 from backend.src.storage import get_connection
-
-
-def _bump_patch_version(version: Optional[str]) -> str:
-    """
-    最小版本策略：语义化版本 x.y.z 的 patch + 1；不符合则回退 DEFAULT_SKILL_VERSION。
-
-    说明：
-    - Solution 也走同一套“可追溯版本”策略，避免每次覆盖都写回 0.1.0。
-    """
-    value = str(version or "").strip()
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", value)
-    if not m:
-        return str(DEFAULT_SKILL_VERSION or "0.1.0")
-    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return f"{major}.{minor}.{patch + 1}"
 
 
 def _coerce_int_list(value: Any, limit: int = 32) -> List[int]:
@@ -53,18 +44,7 @@ def _coerce_int_list(value: Any, limit: int = 32) -> List[int]:
 
 
 def _extract_action_type_from_step_detail(detail_text: Optional[str]) -> Optional[str]:
-    raw = str(detail_text or "").strip()
-    if not raw:
-        return None
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(obj, dict):
-        t = obj.get("type") or (obj.get("action") or {}).get("type")
-        if t:
-            return str(t).strip() or None
-    return None
+    return action_type_from_step_detail(detail_text)
 
 
 def _infer_action_type_from_title(title: Optional[str]) -> Optional[str]:
@@ -307,7 +287,10 @@ def autogen_solution_from_run(
     # - draft：覆盖并升级（与 docs/agent 对齐）
     # - approved：默认跳过；force=True 则覆盖更新（避免重复插入）
     if existing_id is not None and (bool(force) or existing_is_draft_like):
-        next_version = _bump_patch_version(str(existing_row["version"] or DEFAULT_SKILL_VERSION))
+        next_version = bump_semver_patch(
+            str(existing_row["version"] or DEFAULT_SKILL_VERSION),
+            default_version=str(DEFAULT_SKILL_VERSION or "0.1.0"),
+        )
         updated = update_skill(
             skill_id=int(existing_id),
             name=name,

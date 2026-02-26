@@ -2,6 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter
 
+from backend.src.api.utils import clamp_page_limit
 from backend.src.common.utils import error_response
 from backend.src.constants import (
     DEFAULT_PAGE_LIMIT,
@@ -9,13 +10,15 @@ from backend.src.constants import (
     ERROR_MESSAGE_INVALID_STATUS,
     HTTP_STATUS_BAD_REQUEST,
     SQL_BOOL_TRUE,
-    TOOL_REUSE_STATUS_FAIL,
-    TOOL_REUSE_STATUS_PASS,
     TOOL_REUSE_STATUS_UNKNOWN,
 )
-from backend.src.repositories.tool_call_records_repo import (
+from backend.src.services.knowledge.knowledge_query import (
     summarize_skill_reuse,
     summarize_tool_reuse,
+)
+from backend.src.services.tools.tool_records import (
+    empty_tool_reuse_status_counts,
+    is_valid_tool_reuse_status,
 )
 
 router = APIRouter()
@@ -29,12 +32,8 @@ def tool_reuse_summary(
     reuse_status: Optional[str] = None,
     limit: int = DEFAULT_PAGE_LIMIT,
 ) -> dict:
-    allowed_statuses = {
-        TOOL_REUSE_STATUS_PASS,
-        TOOL_REUSE_STATUS_FAIL,
-        TOOL_REUSE_STATUS_UNKNOWN,
-    }
-    if reuse_status is not None and reuse_status not in allowed_statuses:
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
+    if not is_valid_tool_reuse_status(reuse_status, allow_none=True):
         return error_response(
             ERROR_CODE_INVALID_REQUEST,
             ERROR_MESSAGE_INVALID_STATUS,
@@ -47,27 +46,18 @@ def tool_reuse_summary(
         reuse_status=reuse_status,
         unknown_status_value=TOOL_REUSE_STATUS_UNKNOWN,
         reuse_true_value=SQL_BOOL_TRUE,
-        limit=int(limit),
+        limit=int(safe_limit),
     )
     total_calls = summary_row["calls"] if summary_row else 0
     total_reuse_calls = summary_row["reuse_calls"] if summary_row else 0
-    summary_status = {
-        TOOL_REUSE_STATUS_PASS: 0,
-        TOOL_REUSE_STATUS_FAIL: 0,
-        TOOL_REUSE_STATUS_UNKNOWN: 0,
-    }
+    summary_status = empty_tool_reuse_status_counts()
     for row in status_rows:
         summary_status[row["status"]] = row["calls"]
     tool_status_map = {}
     for row in tool_status_rows:
-        tool_status_map.setdefault(
-            row["tool_id"],
-            {
-                TOOL_REUSE_STATUS_PASS: 0,
-                TOOL_REUSE_STATUS_FAIL: 0,
-                TOOL_REUSE_STATUS_UNKNOWN: 0,
-            },
-        )[row["status"]] = row["calls"]
+        tool_status_map.setdefault(row["tool_id"], empty_tool_reuse_status_counts())[
+            row["status"]
+        ] = row["calls"]
     by_tool = []
     for row in tool_rows:
         calls = row["calls"]
@@ -80,11 +70,7 @@ def tool_reuse_summary(
                 "reuse_rate": (reuse_calls / calls) if calls else 0,
                 "reuse_status": tool_status_map.get(
                     row["tool_id"],
-                    {
-                        TOOL_REUSE_STATUS_PASS: 0,
-                        TOOL_REUSE_STATUS_FAIL: 0,
-                        TOOL_REUSE_STATUS_UNKNOWN: 0,
-                    },
+                    empty_tool_reuse_status_counts(),
                 ),
             }
         )
@@ -107,12 +93,13 @@ def skill_reuse_summary(
     reuse_status: Optional[str] = None,
     limit: int = DEFAULT_PAGE_LIMIT,
 ) -> dict:
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
     total_row, rows = summarize_skill_reuse(
         task_id=task_id,
         run_id=run_id,
         tool_id=tool_id,
         reuse_status=reuse_status,
-        limit=int(limit),
+        limit=int(safe_limit),
     )
     total_calls = total_row["calls"]
     total_reuse_calls = total_row["reuse_calls"]

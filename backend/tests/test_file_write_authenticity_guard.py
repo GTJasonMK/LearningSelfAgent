@@ -69,6 +69,23 @@ class TestFileWriteAuthenticityGuard(unittest.TestCase):
         self.assertIsInstance(result, dict)
         mocked_write.assert_called_once()
 
+    def test_rejects_empty_business_csv_write(self):
+        from backend.src.actions.handlers.file_write import execute_file_write
+
+        with patch("backend.src.actions.handlers.file_write.write_text_file") as mocked_write:
+            result, error_message = execute_file_write(
+                {
+                    "path": "artifacts/business.csv",
+                    "content": "",
+                },
+                context={"enforce_csv_artifact_quality": True},
+            )
+
+        self.assertIsNone(result)
+        self.assertIsNotNone(error_message)
+        self.assertIn("空 CSV", str(error_message))
+        mocked_write.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

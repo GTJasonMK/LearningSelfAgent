@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Generator, List, Optional
 
 from backend.src.agent.core.plan_structure import PlanStructure
+from backend.src.agent.contracts.stream_events import build_need_input_payload, generate_prompt_token
 from backend.src.agent.support import _truncate_observation, apply_next_step_patch
 from backend.src.agent.runner.feedback import (
     append_task_feedback_step,
@@ -12,7 +13,8 @@ from backend.src.agent.runner.feedback import (
     task_feedback_need_input_kind,
 )
 from backend.src.agent.runner.plan_events import sse_plan, sse_plan_delta
-from backend.src.common.utils import now_iso
+from backend.src.agent.runner.react_state_manager import resolve_executor
+from backend.src.common.utils import coerce_int, now_iso, parse_optional_int
 from backend.src.constants import (
     AGENT_MAX_STEPS_UNLIMITED,
     AGENT_REACT_REPLAN_MAX_ATTEMPTS,
@@ -27,15 +29,16 @@ from backend.src.constants import (
     STREAM_TAG_OK,
     TASK_OUTPUT_TYPE_USER_PROMPT,
 )
-from backend.src.repositories.task_outputs_repo import create_task_output
-from backend.src.repositories.task_steps_repo import (
+from backend.src.services.agent_review.review_records import get_agent_review
+from backend.src.services.llm.llm_client import sse_json
+from backend.src.services.tasks.task_queries import (
+    create_task_output,
     TaskStepCreateParams,
     create_task_step,
     mark_task_step_done,
+    update_task,
+    update_task_run,
 )
-from backend.src.repositories.task_runs_repo import update_task_run
-from backend.src.repositories.tasks_repo import update_task
-from backend.src.services.llm.llm_client import sse_json
 
 
 @dataclass
@@ -50,6 +53,12 @@ class TaskFeedbackOutcome:
     run_status: Optional[str] = None
     next_idx: Optional[int] = None
     plan_changed: bool = False
+
+
+def _read_attempt_counter(agent_state: Dict, key: str) -> int:
+    if not isinstance(agent_state, dict):
+        return 0
+    return coerce_int(agent_state.get(key) or 0, default=0)
 
 
 def maybe_apply_review_gate_before_feedback(
@@ -85,7 +94,6 @@ def maybe_apply_review_gate_before_feedback(
     review_summary = ""
     review_next_actions = ""
     try:
-        from backend.src.repositories.agent_reviews_repo import get_agent_review as repo_get_agent_review
         from backend.src.services.tasks.task_postprocess import ensure_agent_review_record
 
         yield sse_json({"delta": f"{STREAM_TAG_EXEC} 评估任务完成度…\n"})
@@ -96,7 +104,7 @@ def maybe_apply_review_gate_before_feedback(
             force=True,
         )
         if review_id:
-            review_row = repo_get_agent_review(review_id=int(review_id))
+            review_row = get_agent_review(review_id=int(review_id))
         if review_row:
             review_status = str(review_row["status"] or "").strip()
             review_summary = str(review_row["summary"] or "").strip()
@@ -121,14 +129,9 @@ def maybe_apply_review_gate_before_feedback(
             agent_state["review_gate_attempts"] = 0
         return False
 
-    review_gate_attempts = 0
-    if isinstance(agent_state, dict):
-        try:
-            review_gate_attempts = int(agent_state.get("review_gate_attempts") or 0)
-        except (TypeError, ValueError):
-            review_gate_attempts = 0
+    review_gate_attempts = _read_attempt_counter(agent_state, "review_gate_attempts")
 
-    repair_budget = int(AGENT_REACT_REPLAN_MAX_ATTEMPTS or 0)
+    repair_budget = coerce_int(AGENT_REACT_REPLAN_MAX_ATTEMPTS or 0, default=0)
     if repair_budget > 0 and review_gate_attempts >= repair_budget:
         safe_write_debug(
             task_id=int(task_id),
@@ -280,6 +283,20 @@ def maybe_apply_review_gate_before_feedback(
                         },
                         level="info",
                     )
+                else:
+                    # 裁剪后仍失败：容量不足，跳过修复步骤插入
+                    safe_write_debug(
+                        task_id=int(task_id),
+                        run_id=int(run_id),
+                        message="agent.review_gate.repair_trimmed_still_failed",
+                        data={
+                            "review_id": int(review_id) if review_id else None,
+                            "allowed_inserts": int(allowed_inserts),
+                            "patch_err": str(patch_err),
+                        },
+                        level="info",
+                    )
+                    return False
 
         if patch_err and "超出 max_steps" in str(patch_err):
             reached_limit = False
@@ -323,7 +340,7 @@ def maybe_apply_review_gate_before_feedback(
             level="info",
         )
         if isinstance(agent_state, dict):
-            agent_state["review_gate_attempts"] = int(review_gate_attempts) + 1
+            agent_state["review_gate_attempts"] = review_gate_attempts + 1
 
         yield sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload())
         try:
@@ -334,7 +351,7 @@ def maybe_apply_review_gate_before_feedback(
                 agent_state=agent_state,
                 updated_at=updated_at,
             )
-        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
+        except Exception as exc:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -403,7 +420,7 @@ def handle_task_feedback_step(
                 content=question,
                 created_at=created_at,
             )
-        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
+        except Exception as exc:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -428,6 +445,13 @@ def handle_task_feedback_step(
             "kind": task_feedback_need_input_kind(),
             "choices": choices,
         }
+        agent_state["paused"]["prompt_token"] = generate_prompt_token(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            step_order=int(step_order),
+            question=question,
+            created_at=created_at,
+        )
         agent_state["step_order"] = step_order
         agent_state["task_feedback_asked"] = True
 
@@ -441,7 +465,7 @@ def handle_task_feedback_step(
                 updated_at=updated_at,
             )
             update_task(task_id=int(task_id), status=STATUS_WAITING, updated_at=updated_at)
-        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
+        except Exception as exc:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -451,14 +475,17 @@ def handle_task_feedback_step(
             )
 
         yield sse_json(
-            {
-                "type": "need_input",
-                "task_id": task_id,
-                "run_id": run_id,
-                "question": question,
-                "kind": task_feedback_need_input_kind(),
-                "choices": choices,
-            }
+            build_need_input_payload(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                question=question,
+                kind=task_feedback_need_input_kind(),
+                choices=choices,
+                prompt_token=agent_state.get("paused", {}).get("prompt_token")
+                if isinstance(agent_state.get("paused"), dict)
+                else None,
+                session_key=str(agent_state.get("session_key") or "") if isinstance(agent_state, dict) else "",
+            )
         )
         yield sse_json({"delta": f"{STREAM_TAG_ASK} {question}\n"})
         return TaskFeedbackOutcome(run_status=RUN_STATUS_WAITING)
@@ -477,22 +504,7 @@ def handle_task_feedback_step(
         ensure_ascii=False,
     )
 
-    executor_value = None
-    assignments = agent_state.get("executor_assignments") if isinstance(agent_state, dict) else None
-    if isinstance(assignments, list):
-        for a in assignments:
-            if not isinstance(a, dict):
-                continue
-            raw_order = a.get("step_order")
-            try:
-                order_value = int(raw_order)
-            except (TypeError, ValueError):
-                continue
-            if order_value != int(step_order):
-                continue
-            ev = str(a.get("executor") or "").strip()
-            executor_value = ev or None
-            break
+    executor_value = resolve_executor(agent_state, step_order)
 
     step_id, _created, _updated = create_task_step(
         TaskStepCreateParams(
@@ -514,16 +526,10 @@ def handle_task_feedback_step(
     )
 
     finished_at = now_iso()
-    try:
-        result_value = json.dumps(
-            {"satisfied": bool(satisfied), "answer": answer},
-            ensure_ascii=False,
-        )
-    except (TypeError, ValueError):
-        result_value = json.dumps(
-            {"satisfied": bool(satisfied), "answer": str(answer)},
-            ensure_ascii=False,
-        )
+    result_value = json.dumps(
+        {"satisfied": bool(satisfied), "answer": str(answer)},
+        ensure_ascii=False,
+    )
     mark_task_step_done(step_id=int(step_id), result=result_value, finished_at=finished_at)
 
     plan_struct.set_step_status(idx, "done")
@@ -544,6 +550,7 @@ def handle_task_feedback_step(
 
     # 满意：run 结束（不再追加步骤）
     if satisfied:
+        persist_ok = True
         try:
             updated_at = now_iso()
             update_task_run(
@@ -552,21 +559,22 @@ def handle_task_feedback_step(
                 agent_state=agent_state,
                 updated_at=updated_at,
             )
-        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
+        except Exception as exc:
+            persist_ok = False
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
                 message="agent.task_feedback.state.persist_failed",
                 data={"where": "satisfied", "step_order": int(step_order), "error": str(exc)},
-                level="warning",
+                level="error",
             )
+        if not persist_ok:
+            # 持久化失败时不能返回 DONE，否则 DB 中 run 状态可能仍为 WAITING，导致前后端状态分裂。
+            return TaskFeedbackOutcome(run_status=RUN_STATUS_FAILED)
         return TaskFeedbackOutcome(run_status=RUN_STATUS_DONE)
 
     # 不满意：进入 Replan（重新规划剩余步骤），避免反复 insert_steps 造成冗余
-    try:
-        replan_attempts = int(agent_state.get("replan_attempts") or 0)
-    except (TypeError, ValueError):
-        replan_attempts = 0
+    replan_attempts = _read_attempt_counter(agent_state, "replan_attempts")
     done_count = int(step_order)
     remaining_limit = None
     if isinstance(max_steps_limit, int) and max_steps_limit > 0:
@@ -580,7 +588,8 @@ def handle_task_feedback_step(
         )
         return TaskFeedbackOutcome(run_status=RUN_STATUS_FAILED)
 
-    if replan_attempts >= int(AGENT_REACT_REPLAN_MAX_ATTEMPTS or 0):
+    replan_budget = coerce_int(AGENT_REACT_REPLAN_MAX_ATTEMPTS or 0, default=0)
+    if replan_attempts >= replan_budget:
         yield sse_json({"delta": f"{STREAM_TAG_FAIL} 已收到反馈，但重新规划次数已达上限。\n"})
         return TaskFeedbackOutcome(run_status=RUN_STATUS_FAILED)
 
@@ -613,19 +622,21 @@ def handle_task_feedback_step(
     )
 
     if not replan_result:
-        yield sse_json({"delta": f"{STREAM_TAG_FAIL} 重新规划失败，无法继续。\\n"})
+        yield sse_json({"delta": f"{STREAM_TAG_FAIL} 重新规划失败，无法继续。\n"})
         return TaskFeedbackOutcome(run_status=RUN_STATUS_FAILED)
 
     plan_struct.replace_from(replan_result.plan_struct)
 
-    # append_task_feedback_step 仍使用 legacy 列表接口（后续可进一步收编）
+    # replan 后检查是否已含 feedback 步骤（run_replan_and_merge 内部可能已追加），避免重复插入。
     new_titles, new_items, new_allows, new_artifacts = plan_struct.to_legacy_lists()
-    append_task_feedback_step(
-        plan_titles=new_titles,
-        plan_items=new_items,
-        plan_allows=new_allows,
-        max_steps=int(max_steps_limit) if isinstance(max_steps_limit, int) else None,
-    )
+    has_feedback_already = any(is_task_feedback_step_title(t) for t in new_titles)
+    if not has_feedback_already:
+        append_task_feedback_step(
+            plan_titles=new_titles,
+            plan_items=new_items,
+            plan_allows=new_allows,
+            max_steps=parse_optional_int(max_steps_limit, default=None),
+        )
     feedback_plan = PlanStructure.from_legacy(
         plan_titles=new_titles,
         plan_items=new_items,
@@ -643,7 +654,7 @@ def handle_task_feedback_step(
             agent_state=agent_state,
             updated_at=updated_at,
         )
-    except (TypeError, ValueError, RuntimeError, KeyError) as exc:
+    except Exception as exc:
         safe_write_debug(
             task_id=int(task_id),
             run_id=int(run_id),

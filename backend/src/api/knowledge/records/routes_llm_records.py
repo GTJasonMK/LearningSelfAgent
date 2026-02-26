@@ -4,17 +4,19 @@ from fastapi import APIRouter
 
 from backend.src.api.schemas import LLMRecordCreate
 from backend.src.common.serializers import llm_record_from_row
-from backend.src.api.utils import ensure_write_permission
-from backend.src.common.utils import error_response, now_iso
+from backend.src.api.knowledge.records.route_common import record_not_found_response
+from backend.src.api.utils import (
+    clamp_non_negative_int,
+    clamp_page_limit,
+    require_write_permission,
+)
+from backend.src.common.utils import now_iso
 from backend.src.constants import (
     DEFAULT_PAGE_LIMIT,
     DEFAULT_PAGE_OFFSET,
-    ERROR_CODE_NOT_FOUND,
-    ERROR_MESSAGE_RECORD_NOT_FOUND,
-    HTTP_STATUS_NOT_FOUND,
     LLM_STATUS_SUCCESS,
 )
-from backend.src.repositories.llm_records_repo import (
+from backend.src.services.knowledge.knowledge_query import (
     create_llm_record as create_llm_record_repo,
     get_llm_record as get_llm_record_repo,
     list_llm_records as list_llm_records_repo,
@@ -30,7 +32,14 @@ def list_llm_records(
     offset: int = DEFAULT_PAGE_OFFSET,
     limit: int = DEFAULT_PAGE_LIMIT,
 ) -> dict:
-    rows = list_llm_records_repo(task_id=task_id, run_id=run_id, offset=offset, limit=limit)
+    safe_offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
+    rows = list_llm_records_repo(
+        task_id=task_id,
+        run_id=run_id,
+        offset=safe_offset,
+        limit=safe_limit,
+    )
     return {"items": [llm_record_from_row(row) for row in rows]}
 
 
@@ -38,19 +47,13 @@ def list_llm_records(
 def get_llm_record(record_id: int):
     row = get_llm_record_repo(record_id=record_id)
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_RECORD_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return record_not_found_response()
     return {"record": llm_record_from_row(row)}
 
 
 @router.post("/records/llm")
+@require_write_permission
 def create_llm_record(payload: LLMRecordCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     created_at = now_iso()
     record_id = create_llm_record_repo(
         prompt=payload.prompt,

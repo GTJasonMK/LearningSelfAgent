@@ -1,4 +1,5 @@
 import os
+import importlib.util
 import tempfile
 import unittest
 
@@ -7,11 +8,15 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     httpx = None
 
+HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+
 
 class TestAgentRunsSnapshot(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         if httpx is None:
             self.skipTest("httpx 未安装，跳过需要 ASGI 客户端的测试")
+        if not HAS_FASTAPI:
+            self.skipTest("fastapi 未安装，跳过需要 ASGI 客户端的测试")
 
         import backend.src.storage as storage
 
@@ -146,6 +151,55 @@ class TestAgentRunsSnapshot(unittest.IsolatedAsyncioTestCase):
         last_error = counters.get("last_error") or {}
         self.assertEqual(int(last_error.get("step_order") or 0), 1)
         self.assertIn("boom", str(last_error.get("error") or ""))
+
+    async def test_agent_run_events_endpoint_supports_replay(self):
+        from backend.src.common.utils import now_iso
+        from backend.src.main import create_app
+        from backend.src.repositories.task_run_events_repo import create_task_run_event
+        from backend.src.services.tasks.task_run_lifecycle import create_task_and_run_records_for_agent
+
+        task_id, run_id = create_task_and_run_records_for_agent(message="events", created_at=now_iso())
+        create_task_run_event(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            session_key="sess_e",
+            event_id="sess_e:1:1:run_status",
+            event_type="run_status",
+            payload={
+                "type": "run_status",
+                "event_id": "sess_e:1:1:run_status",
+                "status": "running",
+            },
+        )
+        create_task_run_event(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            session_key="sess_e",
+            event_id="sess_e:1:2:need_input",
+            event_type="need_input",
+            payload={
+                "type": "need_input",
+                "event_id": "sess_e:1:2:need_input",
+                "question": "继续吗？",
+            },
+        )
+
+        app = create_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            full_resp = await client.get(f"/api/agent/runs/{int(run_id)}/events")
+            self.assertEqual(full_resp.status_code, 200)
+            full_items = (full_resp.json() or {}).get("items") or []
+            self.assertEqual(len(full_items), 2)
+
+            delta_resp = await client.get(
+                f"/api/agent/runs/{int(run_id)}/events",
+                params={"after_event_id": "sess_e:1:1:run_status"},
+            )
+            self.assertEqual(delta_resp.status_code, 200)
+            delta_items = (delta_resp.json() or {}).get("items") or []
+            self.assertEqual(len(delta_items), 1)
+            self.assertEqual(str((delta_items[0] or {}).get("event_type") or ""), "need_input")
 
 
 if __name__ == "__main__":

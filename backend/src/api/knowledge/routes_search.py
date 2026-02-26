@@ -2,6 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter
 
+from backend.src.api.utils import clamp_page_limit
 from backend.src.common.serializers import (
     graph_edge_from_row,
     graph_node_from_row,
@@ -17,17 +18,20 @@ from backend.src.constants import (
     SOURCE_MEMORY,
     SOURCE_SKILLS,
 )
-from backend.src.repositories.graph_repo import list_graph_edges_for_node_ids, search_graph_nodes_like
-from backend.src.repositories.memory_repo import search_memory_fts_or_like
-from backend.src.repositories.search_records_repo import create_search_record
-from backend.src.repositories.skills_repo import search_skills_fts_or_like
+from backend.src.services.knowledge.knowledge_query import (
+    create_search_record,
+    list_graph_edges_for_node_ids,
+    search_graph_nodes_like,
+    search_memory_fts_or_like,
+    search_skills_fts_or_like,
+)
 
 router = APIRouter()
 
 
 @router.get("/search")
 def unified_search(q: str, limit: Optional[int] = None) -> dict:
-    effective_limit = int(limit) if limit is not None and int(limit) > 0 else DEFAULT_PAGE_LIMIT
+    effective_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
     memory_rows = search_memory_fts_or_like(q=str(q or ""), limit=effective_limit)
     skills_rows = search_skills_fts_or_like(q=str(q or ""), limit=effective_limit)
     graph_rows = search_graph_nodes_like(q=str(q or ""), limit=effective_limit)

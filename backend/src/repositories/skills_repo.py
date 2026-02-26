@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import dump_json_list, now_iso
 from backend.src.services.search.fts_search import build_fts_or_query, fts_table_exists
 from backend.src.repositories.repo_conn import provide_connection
 
@@ -39,8 +39,6 @@ class SkillCreateParams:
     status: Optional[str] = "approved"  # draft / approved / deprecated
     source_task_id: Optional[int] = None
     source_run_id: Optional[int] = None
-
-
 def list_skills(*, conn: Optional[sqlite3.Connection] = None) -> List[sqlite3.Row]:
     sql = "SELECT * FROM skills_items ORDER BY id ASC"
     with provide_connection(conn) as inner:
@@ -75,16 +73,16 @@ def create_skill(params: SkillCreateParams, *, conn: Optional[sqlite3.Connection
         params.description,
         params.scope,
         params.category,
-        json.dumps(list(params.tags or []), ensure_ascii=False),
-        json.dumps(list(params.triggers or []), ensure_ascii=False),
-        json.dumps(list(params.aliases or []), ensure_ascii=False),
+        dump_json_list(params.tags),
+        dump_json_list(params.triggers),
+        dump_json_list(params.aliases),
         params.source_path,
-        json.dumps(list(params.prerequisites or []), ensure_ascii=False),
-        json.dumps(list(params.inputs or []), ensure_ascii=False),
-        json.dumps(list(params.outputs or []), ensure_ascii=False),
-        json.dumps(list(params.steps or []), ensure_ascii=False),
-        json.dumps(list(params.failure_modes or []), ensure_ascii=False),
-        json.dumps(list(params.validation or []), ensure_ascii=False),
+        dump_json_list(params.prerequisites),
+        dump_json_list(params.inputs),
+        dump_json_list(params.outputs),
+        dump_json_list(params.steps),
+        dump_json_list(params.failure_modes),
+        dump_json_list(params.validation),
         params.version,
         params.task_id,
         params.domain_id,
@@ -142,69 +140,58 @@ def update_skill(
     """
     fields: List[str] = []
     params: List[Any] = []
-    if name is not None:
-        fields.append("name = ?")
-        params.append(name)
-    if description is not None:
-        fields.append("description = ?")
-        params.append(description)
-    if scope is not None:
-        fields.append("scope = ?")
-        params.append(scope)
-    if category is not None:
-        fields.append("category = ?")
-        params.append(category)
-    if tags is not None:
-        fields.append("tags = ?")
-        params.append(json.dumps(list(tags), ensure_ascii=False))
-    if triggers is not None:
-        fields.append("triggers = ?")
-        params.append(json.dumps(list(triggers), ensure_ascii=False))
-    if aliases is not None:
-        fields.append("aliases = ?")
-        params.append(json.dumps(list(aliases), ensure_ascii=False))
-    if source_path is not None:
-        fields.append("source_path = ?")
-        params.append(source_path)
-    if prerequisites is not None:
-        fields.append("prerequisites = ?")
-        params.append(json.dumps(list(prerequisites), ensure_ascii=False))
-    if inputs is not None:
-        fields.append("inputs = ?")
-        params.append(json.dumps(list(inputs), ensure_ascii=False))
-    if outputs is not None:
-        fields.append("outputs = ?")
-        params.append(json.dumps(list(outputs), ensure_ascii=False))
-    if steps is not None:
-        fields.append("steps = ?")
-        params.append(json.dumps(list(steps), ensure_ascii=False))
-    if failure_modes is not None:
-        fields.append("failure_modes = ?")
-        params.append(json.dumps(list(failure_modes), ensure_ascii=False))
-    if validation is not None:
-        fields.append("validation = ?")
-        params.append(json.dumps(list(validation), ensure_ascii=False))
-    if version is not None:
-        fields.append("version = ?")
-        params.append(version)
-    if task_id is not None:
-        fields.append("task_id = ?")
-        params.append(int(task_id))
-    if domain_id is not None:
-        fields.append("domain_id = ?")
-        params.append(str(domain_id))
-    if skill_type is not None:
-        fields.append("skill_type = ?")
-        params.append(str(skill_type))
-    if status is not None:
-        fields.append("status = ?")
-        params.append(str(status))
-    if source_task_id is not None:
-        fields.append("source_task_id = ?")
-        params.append(int(source_task_id))
-    if source_run_id is not None:
-        fields.append("source_run_id = ?")
-        params.append(int(source_run_id))
+    plain_updates: List[Tuple[str, Optional[Any]]] = [
+        ("name", name),
+        ("description", description),
+        ("scope", scope),
+        ("category", category),
+        ("source_path", source_path),
+        ("version", version),
+    ]
+    for column, value in plain_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(value)
+
+    json_updates: List[Tuple[str, Optional[Sequence[Any]]]] = [
+        ("tags", tags),
+        ("triggers", triggers),
+        ("aliases", aliases),
+        ("prerequisites", prerequisites),
+        ("inputs", inputs),
+        ("outputs", outputs),
+        ("steps", steps),
+        ("failure_modes", failure_modes),
+        ("validation", validation),
+    ]
+    for column, value in json_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(dump_json_list(value))
+
+    int_updates: List[Tuple[str, Optional[int]]] = [
+        ("task_id", task_id),
+        ("source_task_id", source_task_id),
+        ("source_run_id", source_run_id),
+    ]
+    for column, value in int_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(int(value))
+
+    str_updates: List[Tuple[str, Optional[str]]] = [
+        ("domain_id", domain_id),
+        ("skill_type", skill_type),
+        ("status", status),
+    ]
+    for column, value in str_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(str(value))
 
     with provide_connection(conn) as inner:
         existing = get_skill(skill_id=skill_id, conn=inner)

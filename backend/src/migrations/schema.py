@@ -78,6 +78,17 @@ def get_schema_sql() -> str:
         updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS task_run_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        run_id INTEGER NOT NULL,
+        session_key TEXT,
+        event_id TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS expectations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         goal TEXT NOT NULL,

@@ -16,8 +16,11 @@ from backend.src.constants import (
     STREAM_TAG_RESULT,
     TASK_OUTPUT_TYPE_DEBUG,
 )
+from backend.src.common.utils import extract_json_object
 from backend.src.repositories.memory_repo import find_memory_item_id_by_task_and_tag_like
 from backend.src.repositories.task_outputs_repo import list_task_outputs_for_run
+from backend.src.repositories.task_runs_repo import get_task_run
+from backend.src.services.common.coerce import to_int
 from backend.src.services.memory.memory_items import create_memory_item as create_memory_item_service
 
 logger = logging.getLogger(__name__)
@@ -51,7 +54,7 @@ def write_task_result_memory_if_missing(
 
     # 去重检查
     existed_id = find_memory_item_id_by_task_and_tag_like(
-        task_id=int(task_id),
+        task_id=to_int(task_id),
         tag_like=f"%run:{run_id}%",
     )
     if existed_id:
@@ -61,8 +64,8 @@ def write_task_result_memory_if_missing(
     rows = output_rows
     if rows is None:
         fetched = list_task_outputs_for_run(
-            task_id=int(task_id),
-            run_id=int(run_id),
+            task_id=to_int(task_id),
+            run_id=to_int(run_id),
             limit=20,
             order="DESC",
         )
@@ -103,6 +106,17 @@ def write_task_result_memory_if_missing(
     if title_value and picked != title_value:
         memory_text = f"任务：{title_value}\n结果：{picked}"
 
+    # 增加 mode 标签（docs/agent 约定：便于后续按 do/think 过滤与溯源）
+    mode_tag = "mode:do"
+    try:
+        run_row = get_task_run(run_id=to_int(run_id))
+        state_obj = extract_json_object(run_row["agent_state"] or "") if run_row else None
+        mode = str(state_obj.get("mode") or "").strip().lower() if isinstance(state_obj, dict) else ""
+        if mode == "think":
+            mode_tag = "mode:think"
+    except Exception:
+        mode_tag = "mode:do"
+
     # 创建记忆项（统一走 services 层，确保 DB 与 backend/prompt/memory 强一致落盘）
     result = create_memory_item_service(
         {
@@ -113,8 +127,9 @@ def write_task_result_memory_if_missing(
                 MEMORY_TAG_TASK_RESULT,
                 f"task:{task_id}",
                 f"run:{run_id}",
+                mode_tag,
             ],
-            "task_id": int(task_id),
+            "task_id": to_int(task_id),
         }
     )
     item = result.get("item") if isinstance(result, dict) else None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, List, Optional, Tuple
 
+from backend.src.common.utils import dedupe_keep_order
 from backend.src.constants import (
     SKILL_TAG_ALLOWED_KEY_PREFIXES,
     SKILL_TAG_INT_KEY_PREFIXES,
@@ -16,14 +17,7 @@ _KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def _dedupe_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for it in items:
-        if it in seen:
-            continue
-        seen.add(it)
-        out.append(it)
-    return out
+    return [str(it) for it in dedupe_keep_order(list(items or []))]
 
 
 def normalize_skill_tags(

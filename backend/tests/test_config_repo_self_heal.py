@@ -15,6 +15,9 @@ class TestConfigRepoSelfHeal(unittest.TestCase):
             self.assertIn("api_key", cfg)
             self.assertIn("base_url", cfg)
             self.assertIn("model", cfg)
+            self.assertEqual(cfg.get("provider"), "rightcode")
+            self.assertEqual(cfg.get("base_url"), "https://right.codes/codex/v1")
+            self.assertEqual(cfg.get("model"), "gpt-5.2")
 
             allowed_paths, allowed_ops, disabled_actions, disabled_tools = fetch_permissions_store(conn=conn)
             self.assertTrue(str(allowed_paths).strip().startswith("["))

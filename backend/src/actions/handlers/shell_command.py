@@ -1,54 +1,50 @@
-import json
 import os
 import re
-import shlex
 from typing import List, Optional, Set, Tuple
 
+from backend.src.common.python_code import (
+    can_compile_python_source,
+    has_risky_inline_control_flow,
+    normalize_python_c_source,
+)
 from backend.src.common.path_utils import normalize_windows_abs_path_on_posix
+from backend.src.common.task_error_codes import format_task_error
+from backend.src.actions.handlers.common_utils import (
+    load_json_object,
+    parse_command_tokens,
+    resolve_path_with_workdir,
+)
 from backend.src.constants import (
     AGENT_EXPERIMENT_DIR_REL,
     ERROR_MESSAGE_COMMAND_FAILED,
+    ERROR_MESSAGE_PERMISSION_DENIED,
     SHELL_COMMAND_AUTO_REWRITE_COMPLEX_PYTHON_C_DEFAULT,
     SHELL_COMMAND_DISALLOW_COMPLEX_PYTHON_C_DEFAULT,
     SHELL_COMMAND_REQUIRE_FILE_WRITE_BINDING_DEFAULT,
 )
+
+# python -c 代码复杂度判断阈值（字符数）
+_COMPLEX_PYTHON_C_CODE_LENGTH_THRESHOLD = 220
 from backend.src.repositories.task_steps_repo import list_task_steps_for_run
+from backend.src.services.permissions.permissions_store import has_exec_permission
 from backend.src.services.execution.shell_command import run_shell_command
 
 
-def _load_json_object(value: object) -> Optional[dict]:
-    if isinstance(value, dict):
-        return dict(value)
-    if not isinstance(value, str):
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return None
-    return dict(parsed) if isinstance(parsed, dict) else None
+def _detect_unsupported_shell_operator(command: object) -> str:
+    """
+    shell_command 仅支持“单条命令 + 参数”语义，不支持 shell 连接符。
 
-
-def _parse_command_args(command: object) -> List[str]:
-    if isinstance(command, list):
-        return [str(item) for item in command if str(item).strip()]
-    if isinstance(command, str):
-        text = str(command).strip()
-        if not text:
-            return []
-        args = shlex.split(text, posix=os.name != "nt")
-        if os.name != "nt":
-            return [str(item) for item in args]
-        cleaned: List[str] = []
-        for item in args:
-            token = str(item)
-            if len(token) >= 2 and ((token[0] == token[-1] == '"') or (token[0] == token[-1] == "'")):
-                token = token[1:-1]
-            cleaned.append(token)
-        return cleaned
-    return []
+    背景：
+    - 当前执行器走 subprocess(argv)；`&&/||/;` 不会被当作 shell 语法执行，
+      而会污染脚本参数，触发误导性的参数契约错误。
+    - 提前在编排层报错，可促使模型拆成多个步骤，避免进入“伪重试循环”。
+    """
+    tokens = parse_command_tokens(command)
+    for token in tokens:
+        value = str(token or "").strip()
+        if value in {"&&", "||", ";", "|"}:
+            return value
+    return ""
 
 
 def _is_python_executable(token: str) -> bool:
@@ -62,7 +58,7 @@ def _looks_like_script_path(token: str) -> bool:
 
 
 def _extract_script_candidates(command: object) -> List[str]:
-    args = _parse_command_args(command)
+    args = parse_command_tokens(command)
     if not args:
         return []
     head = str(args[0] or "").strip()
@@ -81,7 +77,7 @@ def _extract_script_candidates(command: object) -> List[str]:
 
 
 def _extract_python_c_code(command: object) -> str:
-    args = _parse_command_args(command)
+    args = parse_command_tokens(command)
     if len(args) < 3:
         return ""
     head = str(args[0] or "").strip()
@@ -96,7 +92,7 @@ def _is_complex_python_c_code(code: str) -> bool:
     text = str(code or "").strip()
     if not text:
         return False
-    if len(text) >= 220:
+    if len(text) >= _COMPLEX_PYTHON_C_CODE_LENGTH_THRESHOLD:
         return True
 
     lowered = text.lower()
@@ -109,17 +105,6 @@ def _is_complex_python_c_code(code: str) -> bool:
     return False
 
 
-def _can_compile_python_code(code: str) -> bool:
-    source = str(code or "").strip()
-    if not source:
-        return False
-    try:
-        compile(source, "<auto_python_c>", "exec")
-        return True
-    except Exception:
-        return False
-
-
 def _normalize_python_c_script_source(code: str) -> str:
     """
     把模型常见的“单行复杂 python -c”转换为更稳定的脚本文本。
@@ -129,50 +114,7 @@ def _normalize_python_c_script_source(code: str) -> str:
     - `if ...: with ...` 这类非法同一行复合语句；
     - 兜底把分号拆行，降低 SyntaxError 概率。
     """
-    source = str(code or "").strip()
-    if not source:
-        return source
-    if _can_compile_python_code(source):
-        return source
-
-    rewritten = re.sub(
-        r";\s*(?=(with|for|if|try|while|def|class|async\s+def|elif|else|except|finally)\b)",
-        "\n",
-        source,
-    )
-    rewritten = re.sub(r":\s*(?=(with|for|if|try|while|def|class|async\s+def)\b)", ":\n    ", rewritten)
-    rewritten = re.sub(r"\n[ \t]+(?=(elif|else|except|finally)\b)", "\n", rewritten)
-    return rewritten
-
-
-def _has_risky_inline_control_flow(code: str) -> bool:
-    """
-    检测高风险“单行复合控制流”：
-    - 这类 python -c 常由模型压缩生成，自动改写极易引入语义漂移；
-    - 例如：`for ...: ...; if ...: ...; ...`。
-    """
-    text = str(code or "").strip()
-    if not text:
-        return False
-    if ";" not in text:
-        return False
-    if "\n" in text:
-        return False
-
-    # 同一行出现多个控制块头，且通过分号串联，风险高。
-    block_headers = re.findall(r"\b(if|for|while|with|try|except|finally|elif|else)\b[^:]*:", text)
-    if len(block_headers) >= 2:
-        return True
-
-    # 循环体里继续嵌套控制流，自动改写很容易错缩进。
-    if re.search(
-        r"\b(for|while)\b[^:]*:\s*[^;]+;\s*(if|for|while|with|try|except|finally|elif|else)\b",
-        text,
-        re.IGNORECASE,
-    ):
-        return True
-
-    return False
+    return normalize_python_c_source(code, compile_name="<auto_python_c>")
 
 
 def _resolve_workspace_dir(workdir: str, context: Optional[dict]) -> str:
@@ -219,7 +161,7 @@ def _maybe_rewrite_complex_python_c_payload(
     if not bool(auto_rewrite):
         return payload, None, None
 
-    if _has_risky_inline_control_flow(code):
+    if has_risky_inline_control_flow(code):
         return (
             payload,
             None,
@@ -229,7 +171,7 @@ def _maybe_rewrite_complex_python_c_payload(
             ),
         )
 
-    args = _parse_command_args(payload.get("command"))
+    args = parse_command_tokens(payload.get("command"))
     if len(args) < 3:
         return payload, None, None
 
@@ -249,7 +191,7 @@ def _maybe_rewrite_complex_python_c_payload(
     script_name = f"_auto_python_c_t{int(task_id)}_r{int(run_id)}_s{step_id}.py"
     script_path = os.path.abspath(os.path.join(workspace_dir, script_name))
     normalized_code = _normalize_python_c_script_source(code)
-    if not _can_compile_python_code(normalized_code):
+    if not can_compile_python_source(normalized_code, filename="<auto_python_c>"):
         return (
             payload,
             None,
@@ -306,20 +248,6 @@ def _enforce_python_c_policy(payload: dict, context: Optional[dict]) -> Optional
     return None
 
 
-def _resolve_path(raw_path: str, workdir: str) -> str:
-    path_text = normalize_windows_abs_path_on_posix(str(raw_path or "").strip())
-    if not path_text:
-        return ""
-    if os.path.isabs(path_text):
-        return os.path.abspath(path_text)
-    base = normalize_windows_abs_path_on_posix(str(workdir or "").strip())
-    if not base:
-        base = os.getcwd()
-    if not os.path.isabs(base):
-        base = os.path.abspath(base)
-    return os.path.abspath(os.path.join(base, path_text))
-
-
 def _collect_written_script_paths(
     *,
     task_id: int,
@@ -352,20 +280,20 @@ def _collect_written_script_paths(
         if status != "done":
             continue
 
-        detail_obj = _load_json_object(row_data.get("detail"))
+        detail_obj = load_json_object(row_data.get("detail"))
         action_type = str(detail_obj.get("type") or "").strip().lower() if isinstance(detail_obj, dict) else ""
         if action_type not in {"file_write", "file_append"}:
             continue
 
         payload_obj = detail_obj.get("payload") if isinstance(detail_obj, dict) else None
-        result_obj = _load_json_object(row_data.get("result"))
+        result_obj = load_json_object(row_data.get("result"))
 
         path_text = ""
         if isinstance(result_obj, dict):
             path_text = str(result_obj.get("path") or "").strip()
         if not path_text and isinstance(payload_obj, dict):
             path_text = str(payload_obj.get("path") or "").strip()
-        resolved = _resolve_path(path_text, workdir)
+        resolved = resolve_path_with_workdir(path_text, workdir)
         if not resolved:
             continue
         paths.add(os.path.normcase(resolved))
@@ -411,14 +339,14 @@ def _enforce_script_dependency(
     raw_auto_bound = (context or {}).get("shell_dependency_auto_bind_paths")
     if isinstance(raw_auto_bound, list):
         for item in raw_auto_bound:
-            resolved_auto = _resolve_path(str(item or "").strip(), workdir)
+            resolved_auto = resolve_path_with_workdir(str(item or "").strip(), workdir)
             if resolved_auto:
                 auto_bound_paths.add(os.path.normcase(resolved_auto))
 
     missing_paths: List[str] = []
     unbound_paths: List[str] = []
     for candidate in candidates:
-        absolute_path = _resolve_path(candidate, workdir)
+        absolute_path = resolve_path_with_workdir(candidate, workdir)
         if not absolute_path:
             continue
         if not os.path.exists(absolute_path):
@@ -536,7 +464,7 @@ def _maybe_attach_context_stdin_before_run(
     if not parse_text:
         return patched, 0
 
-    args = _parse_command_args(patched.get("command"))
+    args = parse_command_tokens(patched.get("command"))
     if not args:
         return patched, 0
 
@@ -564,7 +492,7 @@ def _build_retry_payload_with_default_url(
     if not _is_validation_step_title(step_row):
         return None, ""
 
-    args = _parse_command_args(payload.get("command"))
+    args = parse_command_tokens(payload.get("command"))
     if len(args) != 2:
         return None, ""
     if not _is_python_executable(str(args[0] or "")):
@@ -582,7 +510,8 @@ def _build_retry_payload_with_default_url(
     if not default_url:
         default_url = str((context or {}).get("latest_external_url") or "").strip()
     if not default_url:
-        default_url = "https://example.com"
+        # 去硬编码：不再注入固定公网地址，避免把“参数缺失”伪装成“抓取成功”。
+        return None, ""
 
     patched = dict(payload)
     command_raw = payload.get("command")
@@ -597,6 +526,58 @@ def _build_retry_payload_with_default_url(
     return None, ""
 
 
+_WARNING_ONLY_LINE_RE = re.compile(r"(?:^warning:|deprecationwarning)", re.IGNORECASE)
+
+
+def _build_shell_failure_detail(*, stdout: str, stderr: str, returncode: object) -> str:
+    """
+    生成 shell 失败摘要：优先保留真实错误信息，避免 warning 噪声遮蔽。
+    """
+    lines: List[str] = []
+    for chunk in (str(stderr or ""), str(stdout or "")):
+        for raw in chunk.splitlines():
+            text = str(raw or "").strip()
+            if text:
+                lines.append(text)
+
+    if not lines:
+        return str(returncode) if returncode is not None else ""
+
+    def _is_warning_only(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return True
+        if _WARNING_ONLY_LINE_RE.search(value):
+            return True
+        if value.startswith("^"):
+            return True
+        return False
+
+    candidates = [line for line in lines if not _is_warning_only(line)] or list(lines)
+    # 优先返回“最终异常行”（例如 ValueError/TypeError），避免只拿到 Traceback 头信息。
+    exception_line_re = re.compile(r"^[A-Za-z_][\w.]+(?:Error|Exception):\s+.+$")
+    for line in reversed(candidates):
+        if exception_line_re.match(str(line or "").strip()):
+            return line
+
+    priority_markers = (
+        "error",
+        "failed",
+        "exception",
+        "traceback",
+        "not found",
+        "missing",
+        "denied",
+        "timeout",
+    )
+    for line in candidates:
+        lowered = str(line).lower()
+        if any(marker in lowered for marker in priority_markers):
+            return line
+
+    return candidates[0]
+
+
 
 def execute_shell_command(
     task_id: int,
@@ -607,6 +588,7 @@ def execute_shell_command(
     context: Optional[dict] = None,
 ) -> Tuple[Optional[dict], Optional[str]]:
     ctx: dict = context if isinstance(context, dict) else {}
+    payload = dict(payload or {})
 
     command = payload.get("command")
     if isinstance(command, str):
@@ -618,11 +600,30 @@ def execute_shell_command(
     else:
         raise ValueError("shell_command.command 不能为空")
 
+    operator = _detect_unsupported_shell_operator(command)
+    if operator:
+        raise ValueError(
+            format_task_error(
+                code="shell_operators_not_supported",
+                message=(
+                    f"{ERROR_MESSAGE_COMMAND_FAILED}: shell_command 不支持连接符 `{operator}`；"
+                    "请拆分为多个 shell_command 步骤，或改用脚本文件执行。"
+                ),
+            )
+        )
+
+    # 权限门禁前置：先校验 execute 权限，再进行任何自动落盘（如 python -c 重写脚本）。
+    # 避免“权限被拒绝但仍写入 _auto_python_c_*.py”的副作用。
+    workdir = str(payload.get("workdir") or "").strip() or os.getcwd()
+    payload["workdir"] = workdir
+    if not has_exec_permission(workdir):
+        raise ValueError(ERROR_MESSAGE_PERMISSION_DENIED)
+
     payload, _rewritten_script_path, rewrite_error = _maybe_rewrite_complex_python_c_payload(
         task_id=int(task_id),
         run_id=int(run_id),
         step_row=step_row,
-        payload=dict(payload),
+        payload=payload,
         context=ctx,
     )
     if rewrite_error:
@@ -672,6 +673,13 @@ def execute_shell_command(
             )
             if isinstance(retry_payload, dict):
                 retry_trigger = "missing_url"
+            else:
+                raise ValueError(
+                    format_task_error(
+                        code="missing_url_input",
+                        message=f"{ERROR_MESSAGE_COMMAND_FAILED}: 缺少 URL 输入，且当前上下文无可复用来源 URL",
+                    )
+                )
 
         if not isinstance(retry_payload, dict):
             retry_reason = _extract_missing_input_failure_reason(result)
@@ -707,7 +715,55 @@ def execute_shell_command(
         stdout = str(result.get("stdout") or "").strip()
         stderr = str(result.get("stderr") or "").strip()
         rc = result.get("returncode")
-        detail = stderr or stdout or (str(rc) if rc is not None else "")
+        detail = _build_shell_failure_detail(stdout=stdout, stderr=stderr, returncode=rc)
         detail = detail.strip()
+
+        # 检测 Python 依赖缺失（ModuleNotFoundError / ImportError）
+        combined = f"{stderr}\n{stdout}"
+        dep_match = re.search(
+            r"(?:ModuleNotFoundError|ImportError):\s*No module named\s+['\"]?(\S+?)['\"]?\s*$",
+            combined,
+            re.MULTILINE,
+        )
+        if dep_match:
+            module_name = dep_match.group(1).strip("'\"")
+            raise ValueError(
+                format_task_error(
+                    code="dependency_missing",
+                    message=f"{ERROR_MESSAGE_COMMAND_FAILED}: 缺少依赖 {module_name}（{dep_match.group(0).strip()}）",
+                )
+            )
+
+        combined_lower = combined.lower()
+        # DNS 解析失败：这类错误通常与当前环境网络能力相关，应提示换源/重试而非盲目重复同命令。
+        if any(
+            marker in combined_lower
+            for marker in (
+                "could not resolve host",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "nodename nor servname provided",
+            )
+        ):
+            raise ValueError(
+                format_task_error(
+                    code="dns_resolution_failed",
+                    message=f"{ERROR_MESSAGE_COMMAND_FAILED}: DNS 解析失败（{detail or '无法解析目标域名'}）",
+                )
+            )
+
+        # 参数契约错配（脚本定义与命令传参不一致）：常见于位置参数/命名参数混用。
+        if (
+            re.search(r"invalid isoformat string:\s*['\"]--[a-z0-9_-]+", combined, re.IGNORECASE)
+            or "unrecognized arguments" in combined_lower
+            or "the following arguments are required" in combined_lower
+        ):
+            raise ValueError(
+                format_task_error(
+                    code="script_arg_contract_mismatch",
+                    message=f"{ERROR_MESSAGE_COMMAND_FAILED}: 脚本参数契约不匹配（{detail or '请检查脚本入参与命令是否一致'}）",
+                )
+            )
+
         raise ValueError(f"{ERROR_MESSAGE_COMMAND_FAILED}:{detail}" if detail else ERROR_MESSAGE_COMMAND_FAILED)
     return result, None

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import coerce_int, now_iso
 from backend.src.constants import (
     STEP_STATUS_DONE,
     STEP_STATUS_FAILED,
@@ -13,6 +13,34 @@ from backend.src.constants import (
     STEP_STATUS_SKIPPED,
 )
 from backend.src.repositories.repo_conn import provide_connection
+
+
+def _list_task_steps_rows(
+    *,
+    task_id: int,
+    run_id: Optional[int],
+    limit: Optional[int],
+    offset: Optional[int],
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[sqlite3.Row]:
+    where = ["task_id = ?"]
+    params: List[Any] = [int(task_id)]
+    if run_id is not None:
+        where.append("run_id = ?")
+        params.append(int(run_id))
+    sql = (
+        "SELECT * FROM task_steps "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY step_order IS NULL, step_order ASC, id ASC"
+    )
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    if offset is not None:
+        sql += " OFFSET ?"
+        params.append(int(offset))
+    with provide_connection(conn) as inner:
+        return list(inner.execute(sql, params).fetchall())
 
 
 @dataclass(frozen=True)
@@ -51,49 +79,39 @@ def create_task_step(
     """
     created = params.created_at or now_iso()
     updated = params.updated_at or created
+    task_id_value = int(params.task_id)
+    run_id_value = int(params.run_id) if params.run_id is not None else None
+    attempts_value = int(params.attempts) if params.attempts is not None else None
+    step_order_value = int(params.step_order) if params.step_order is not None else None
+    base_params: List[Any] = [
+        task_id_value,
+        run_id_value,
+        params.title,
+        params.status,
+        params.detail,
+        params.result,
+        params.error,
+        attempts_value,
+        params.started_at,
+        params.finished_at,
+        step_order_value,
+        created,
+        updated,
+    ]
 
     sql = (
         "INSERT INTO task_steps "
         "(task_id, run_id, title, status, executor, detail, result, error, attempts, started_at, finished_at, step_order, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-    sql_params = (
-        int(params.task_id),
-        int(params.run_id) if params.run_id is not None else None,
-        params.title,
-        params.status,
-        str(params.executor) if params.executor is not None else None,
-        params.detail,
-        params.result,
-        params.error,
-        int(params.attempts) if params.attempts is not None else None,
-        params.started_at,
-        params.finished_at,
-        int(params.step_order) if params.step_order is not None else None,
-        created,
-        updated,
-    )
+    sql_params = tuple(base_params[:4] + [str(params.executor) if params.executor is not None else None] + base_params[4:])
 
     legacy_sql = (
         "INSERT INTO task_steps "
         "(task_id, run_id, title, status, detail, result, error, attempts, started_at, finished_at, step_order, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-    legacy_params = (
-        int(params.task_id),
-        int(params.run_id) if params.run_id is not None else None,
-        params.title,
-        params.status,
-        params.detail,
-        params.result,
-        params.error,
-        int(params.attempts) if params.attempts is not None else None,
-        params.started_at,
-        params.finished_at,
-        int(params.step_order) if params.step_order is not None else None,
-        created,
-        updated,
-    )
+    legacy_params = tuple(base_params)
 
     with provide_connection(conn) as inner:
         try:
@@ -121,7 +139,7 @@ def count_task_steps_by_status(*, status: str, conn: Optional[sqlite3.Connection
     params = (str(status or ""),)
     with provide_connection(conn) as inner:
         row = inner.execute(sql, params).fetchone()
-    return int(row["count"]) if row else 0
+    return coerce_int(row["count"] if row else 0, default=0)
 
 
 def count_task_steps_running_for_run(
@@ -135,7 +153,7 @@ def count_task_steps_running_for_run(
     params = (int(task_id), int(run_id), str(running_status or ""))
     with provide_connection(conn) as inner:
         row = inner.execute(sql, params).fetchone()
-    return int(row["count"]) if row else 0
+    return coerce_int(row["count"] if row else 0, default=0)
 
 
 def get_max_step_order_for_run_by_status(
@@ -149,7 +167,7 @@ def get_max_step_order_for_run_by_status(
     params = (int(task_id), int(run_id), str(status or ""))
     with provide_connection(conn) as inner:
         row = inner.execute(sql, params).fetchone()
-    return int(row["max_order"] or 0) if row else 0
+    return coerce_int((row["max_order"] if row else 0) or 0, default=0)
 
 
 def get_last_non_planned_step_for_run(
@@ -183,10 +201,14 @@ def reset_all_running_steps_to_planned(
     updated_at: str,
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
-    sql = "UPDATE task_steps SET status = ?, updated_at = ? WHERE status = ?"
-    params = (str(to_status or ""), str(updated_at or ""), str(from_status or ""))
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
+    _reset_running_steps(
+        from_status=from_status,
+        to_status=to_status,
+        updated_at=updated_at,
+        task_id=None,
+        run_id=None,
+        conn=conn,
+    )
 
 
 def reset_running_steps_to_planned_for_run(
@@ -198,16 +220,14 @@ def reset_running_steps_to_planned_for_run(
     updated_at: str,
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
-    sql = "UPDATE task_steps SET status = ?, updated_at = ? WHERE task_id = ? AND run_id = ? AND status = ?"
-    params = (
-        str(to_status or ""),
-        str(updated_at or ""),
-        int(task_id),
-        int(run_id),
-        str(from_status or ""),
+    _reset_running_steps(
+        from_status=from_status,
+        to_status=to_status,
+        updated_at=updated_at,
+        task_id=int(task_id),
+        run_id=int(run_id),
+        conn=conn,
     )
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
 
 
 def list_task_steps(
@@ -218,20 +238,13 @@ def list_task_steps(
     limit: int,
     conn: Optional[sqlite3.Connection] = None,
 ) -> list[sqlite3.Row]:
-    where = ["task_id = ?"]
-    params = [int(task_id)]
-    if run_id is not None:
-        where.append("run_id = ?")
-        params.append(int(run_id))
-    params.extend([int(limit), int(offset)])
-    sql = (
-        "SELECT * FROM task_steps "
-        f"WHERE {' AND '.join(where)} "
-        "ORDER BY step_order IS NULL, step_order ASC, id ASC "
-        "LIMIT ? OFFSET ?"
+    return _list_task_steps_rows(
+        task_id=int(task_id),
+        run_id=int(run_id) if run_id is not None else None,
+        limit=int(limit),
+        offset=int(offset),
+        conn=conn,
     )
-    with provide_connection(conn) as inner:
-        return list(inner.execute(sql, params).fetchall())
 
 
 def list_task_steps_for_task(
@@ -242,10 +255,13 @@ def list_task_steps_for_task(
     """
     按 step_order/id 顺序返回某个 task 的全部步骤（不分页），用于执行链路。
     """
-    sql = "SELECT * FROM task_steps WHERE task_id = ? ORDER BY step_order IS NULL, step_order ASC, id ASC"
-    params = (int(task_id),)
-    with provide_connection(conn) as inner:
-        return list(inner.execute(sql, params).fetchall())
+    return _list_task_steps_rows(
+        task_id=int(task_id),
+        run_id=None,
+        limit=None,
+        offset=None,
+        conn=conn,
+    )
 
 
 def list_task_steps_for_run(
@@ -257,14 +273,13 @@ def list_task_steps_for_run(
     """
     按 step_order/id 顺序返回某个 task/run 的全部步骤（不分页），用于后处理/回放。
     """
-    sql = (
-        "SELECT * FROM task_steps "
-        "WHERE task_id = ? AND run_id = ? "
-        "ORDER BY step_order IS NULL, step_order ASC, id ASC"
+    return _list_task_steps_rows(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        limit=None,
+        offset=None,
+        conn=conn,
     )
-    params = (int(task_id), int(run_id))
-    with provide_connection(conn) as inner:
-        return list(inner.execute(sql, params).fetchall())
 
 
 def update_task_step(
@@ -283,23 +298,20 @@ def update_task_step(
     """
     通用更新：字段为 None 表示不修改；返回更新后的行。
     """
-    fields = []
-    params = []
-    if title is not None:
-        fields.append("title = ?")
-        params.append(title)
-    if status is not None:
-        fields.append("status = ?")
-        params.append(status)
-    if detail is not None:
-        fields.append("detail = ?")
-        params.append(detail)
-    if result is not None:
-        fields.append("result = ?")
-        params.append(result)
-    if error is not None:
-        fields.append("error = ?")
-        params.append(error)
+    fields: List[str] = []
+    params: List[Any] = []
+    plain_updates: Sequence[Tuple[str, Optional[str]]] = [
+        ("title", title),
+        ("status", status),
+        ("detail", detail),
+        ("result", result),
+        ("error", error),
+    ]
+    for column, value in plain_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(value)
     if step_order is not None:
         fields.append("step_order = ?")
         params.append(int(step_order))
@@ -359,12 +371,15 @@ def mark_task_step_done(
     """
     标记步骤为 done，并写入 result/finished_at/updated_at。
     """
-    updated = updated_at or finished_at or now_iso()
-    sql = "UPDATE task_steps SET status = ?, result = ?, finished_at = ?, updated_at = ? WHERE id = ?"
-    params = (STEP_STATUS_DONE, result, finished_at, updated, int(step_id))
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
-        return updated
+    return _mark_task_step_finished(
+        step_id=step_id,
+        status=STEP_STATUS_DONE,
+        value_column="result",
+        value=result,
+        finished_at=finished_at,
+        updated_at=updated_at,
+        conn=conn,
+    )
 
 
 def mark_task_step_failed(
@@ -378,12 +393,15 @@ def mark_task_step_failed(
     """
     标记步骤为 failed，并写入 error/finished_at/updated_at。
     """
-    updated = updated_at or finished_at or now_iso()
-    sql = "UPDATE task_steps SET status = ?, error = ?, finished_at = ?, updated_at = ? WHERE id = ?"
-    params = (STEP_STATUS_FAILED, error, finished_at, updated, int(step_id))
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
-        return updated
+    return _mark_task_step_finished(
+        step_id=step_id,
+        status=STEP_STATUS_FAILED,
+        value_column="error",
+        value=error,
+        finished_at=finished_at,
+        updated_at=updated_at,
+        conn=conn,
+    )
 
 
 def mark_task_step_skipped(
@@ -397,9 +415,50 @@ def mark_task_step_skipped(
     """
     标记步骤为 skipped（用于 on_failure=skip），并写入 error/finished_at/updated_at。
     """
-    updated = updated_at or finished_at or now_iso()
-    sql = "UPDATE task_steps SET status = ?, error = ?, finished_at = ?, updated_at = ? WHERE id = ?"
-    params = (STEP_STATUS_SKIPPED, error, finished_at, updated, int(step_id))
+    return _mark_task_step_finished(
+        step_id=step_id,
+        status=STEP_STATUS_SKIPPED,
+        value_column="error",
+        value=error,
+        finished_at=finished_at,
+        updated_at=updated_at,
+        conn=conn,
+    )
+
+
+def _reset_running_steps(
+    *,
+    from_status: str,
+    to_status: str,
+    updated_at: str,
+    task_id: Optional[int],
+    run_id: Optional[int],
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    where = ["status = ?"]
+    params: List[Any] = [str(to_status or ""), str(updated_at or "")]
+    if task_id is not None and run_id is not None:
+        where.insert(0, "task_id = ? AND run_id = ?")
+        params.extend([int(task_id), int(run_id)])
+    params.append(str(from_status or ""))
+    sql = f"UPDATE task_steps SET status = ?, updated_at = ? WHERE {' AND '.join(where)}"
     with provide_connection(conn) as inner:
         inner.execute(sql, params)
-        return updated
+
+
+def _mark_task_step_finished(
+    *,
+    step_id: int,
+    status: str,
+    value_column: str,
+    value: Optional[str],
+    finished_at: str,
+    updated_at: Optional[str],
+    conn: Optional[sqlite3.Connection] = None,
+) -> str:
+    updated = updated_at or finished_at or now_iso()
+    sql = f"UPDATE task_steps SET status = ?, {value_column} = ?, finished_at = ?, updated_at = ? WHERE id = ?"
+    params = (str(status or ""), value, finished_at, updated, int(step_id))
+    with provide_connection(conn) as inner:
+        inner.execute(sql, params)
+    return updated

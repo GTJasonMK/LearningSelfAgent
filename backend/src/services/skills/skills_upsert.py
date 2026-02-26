@@ -1,8 +1,12 @@
-import json
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.src.common.utils import coerce_str_list, now_iso, parse_json_list
+from backend.src.common.utils import (
+    bump_semver_patch,
+    coerce_str_list,
+    dedupe_keep_order,
+    now_iso,
+    parse_json_list,
+)
 from backend.src.constants import (
     DEFAULT_SKILL_VERSION,
     SKILL_CATEGORY_CHOICES,
@@ -19,6 +23,18 @@ from backend.src.repositories.skills_repo import (
 from backend.src.services.knowledge.skill_tag_policy import normalize_skill_tags
 from backend.src.storage import get_connection
 
+_SKILL_LIST_FIELDS = (
+    "tags",
+    "triggers",
+    "aliases",
+    "prerequisites",
+    "inputs",
+    "outputs",
+    "steps",
+    "failure_modes",
+    "validation",
+)
+
 
 def _coerce_any_list(value: Any, max_items: int = 64) -> List[Any]:
     """
@@ -31,43 +47,52 @@ def _coerce_any_list(value: Any, max_items: int = 64) -> List[Any]:
     return [value]
 
 
-def _dedupe_keep_order(items: List[Any]) -> List[Any]:
-    """
-    以 JSON 序列化后的字符串做去重 key，保证：
-    - str/dict/list 都可去重
-    - 保留原顺序（先旧后新）
-    """
-    seen = set()
-    out: List[Any] = []
-    for item in items:
-        try:
-            key = json.dumps(item, ensure_ascii=False, sort_keys=True)
-        except TypeError:
-            key = str(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
-
-
-def _bump_patch_version(version: Optional[str]) -> str:
-    """
-    最小版本策略：语义化版本 x.y.z 的 patch + 1；不符合则回退 DEFAULT_SKILL_VERSION。
-    """
-    value = str(version or "").strip()
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", value)
-    if not m:
-        return DEFAULT_SKILL_VERSION
-    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return f"{major}.{minor}.{patch + 1}"
-
-
 def _normalize_category(category: Optional[str]) -> str:
     value = str(category or "").strip()
     if value in set(SKILL_CATEGORY_CHOICES):
         return value
     return SKILL_DEFAULT_CATEGORY
+
+
+def _skill_type_where_params(skill_type_value: str) -> Tuple[str, List[Any]]:
+    if skill_type_value == "methodology":
+        return "(skill_type = 'methodology' OR skill_type IS NULL)", []
+    return "skill_type = ?", [skill_type_value]
+
+
+def _select_skill_id_by_where(
+    conn,
+    *,
+    where_prefix: str,
+    where_params: List[Any],
+    skill_type_value: str,
+) -> Optional[int]:
+    skill_type_where, skill_type_params = _skill_type_where_params(skill_type_value)
+    row = conn.execute(
+        f"SELECT id FROM skills_items WHERE {where_prefix} AND {skill_type_where} ORDER BY id ASC LIMIT 1",
+        (*where_params, *skill_type_params),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def _normalize_skill_list_fields(values: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+    """
+    对技能 list 字段做统一去重，避免 create/update 路径重复实现。
+    """
+    out: Dict[str, List[Any]] = {}
+    for field in _SKILL_LIST_FIELDS:
+        out[field] = dedupe_keep_order(list(values.get(field) or []))
+    return out
+
+
+def _merge_skill_row_list_fields(row, incoming: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+    """
+    合并 DB 旧值与请求新值，并统一去重。
+    """
+    merged: Dict[str, List[Any]] = {}
+    for field in _SKILL_LIST_FIELDS:
+        merged[field] = dedupe_keep_order(parse_json_list(row[field]) + list(incoming.get(field) or []))
+    return merged
 
 
 def _find_existing_skill_id(
@@ -88,59 +113,42 @@ def _find_existing_skill_id(
     domain_value = str(domain_id or "").strip() or None
     with get_connection() as conn:
         if scope_value:
-            if skill_type_value == "methodology":
-                row = conn.execute(
-                    "SELECT id FROM skills_items WHERE scope = ? AND (skill_type = 'methodology' OR skill_type IS NULL) ORDER BY id ASC LIMIT 1",
-                    (scope_value,),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT id FROM skills_items WHERE scope = ? AND skill_type = ? ORDER BY id ASC LIMIT 1",
-                    (scope_value, skill_type_value),
-                ).fetchone()
-            if row:
-                return int(row["id"])
+            found_id = _select_skill_id_by_where(
+                conn,
+                where_prefix="scope = ?",
+                where_params=[scope_value],
+                skill_type_value=skill_type_value,
+            )
+            if found_id is not None:
+                return found_id
 
         # 兼容旧策略：优先 name + category
-        if skill_type_value == "methodology":
-            row = conn.execute(
-                "SELECT id FROM skills_items WHERE name = ? AND category = ? AND (skill_type = 'methodology' OR skill_type IS NULL) ORDER BY id ASC LIMIT 1",
-                (name, category),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT id FROM skills_items WHERE name = ? AND category = ? AND skill_type = ? ORDER BY id ASC LIMIT 1",
-                (name, category, skill_type_value),
-            ).fetchone()
-        if row:
-            return int(row["id"])
+        found_id = _select_skill_id_by_where(
+            conn,
+            where_prefix="name = ? AND category = ?",
+            where_params=[name, category],
+            skill_type_value=skill_type_value,
+        )
+        if found_id is not None:
+            return found_id
 
         # 新策略：同名技能更倾向于“版本合并”，避免不同 category 产生重复知识
         if domain_value:
-            if skill_type_value == "methodology":
-                row = conn.execute(
-                    "SELECT id FROM skills_items WHERE name = ? AND domain_id = ? AND (skill_type = 'methodology' OR skill_type IS NULL) ORDER BY id ASC LIMIT 1",
-                    (name, domain_value),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT id FROM skills_items WHERE name = ? AND domain_id = ? AND skill_type = ? ORDER BY id ASC LIMIT 1",
-                    (name, domain_value, skill_type_value),
-                ).fetchone()
-            if row:
-                return int(row["id"])
+            found_id = _select_skill_id_by_where(
+                conn,
+                where_prefix="name = ? AND domain_id = ?",
+                where_params=[name, domain_value],
+                skill_type_value=skill_type_value,
+            )
+            if found_id is not None:
+                return found_id
 
-        if skill_type_value == "methodology":
-            row = conn.execute(
-                "SELECT id FROM skills_items WHERE name = ? AND (skill_type = 'methodology' OR skill_type IS NULL) ORDER BY id ASC LIMIT 1",
-                (name,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT id FROM skills_items WHERE name = ? AND skill_type = ? ORDER BY id ASC LIMIT 1",
-                (name, skill_type_value),
-            ).fetchone()
-        return int(row["id"]) if row else None
+        return _select_skill_id_by_where(
+            conn,
+            where_prefix="name = ?",
+            where_params=[name],
+            skill_type_value=skill_type_value,
+        )
 
 
 def upsert_skill_from_agent_payload(
@@ -214,6 +222,19 @@ def upsert_skill_from_agent_payload(
 
     # tags 规范化（避免 LLM 输出污染 tags 索引）
     tags, _issues = normalize_skill_tags(tags, strict_keys=False)
+    incoming_lists = _normalize_skill_list_fields(
+        {
+            "tags": tags,
+            "triggers": triggers,
+            "aliases": aliases,
+            "prerequisites": prerequisites,
+            "inputs": inputs,
+            "outputs": outputs,
+            "steps": steps,
+            "failure_modes": failure_modes,
+            "validation": validation,
+        }
+    )
 
     existing_id = _find_existing_skill_id(
         name=name,
@@ -230,16 +251,16 @@ def upsert_skill_from_agent_payload(
                 description=description,
                 scope=scope,
                 category=category,
-                tags=_dedupe_keep_order(tags),
-                triggers=_dedupe_keep_order(triggers),
-                aliases=_dedupe_keep_order(aliases),
+                tags=incoming_lists["tags"],
+                triggers=incoming_lists["triggers"],
+                aliases=incoming_lists["aliases"],
                 source_path=None,
-                prerequisites=_dedupe_keep_order(prerequisites),
-                inputs=_dedupe_keep_order(inputs),
-                outputs=_dedupe_keep_order(outputs),
-                steps=_dedupe_keep_order(steps),
-                failure_modes=_dedupe_keep_order(failure_modes),
-                validation=_dedupe_keep_order(validation),
+                prerequisites=incoming_lists["prerequisites"],
+                inputs=incoming_lists["inputs"],
+                outputs=incoming_lists["outputs"],
+                steps=incoming_lists["steps"],
+                failure_modes=incoming_lists["failure_modes"],
+                validation=incoming_lists["validation"],
                 version=str(skill.get("version") or DEFAULT_SKILL_VERSION).strip() or DEFAULT_SKILL_VERSION,
                 task_id=task_id,
                 created_at=created_at,
@@ -260,18 +281,13 @@ def upsert_skill_from_agent_payload(
         "description": description or (row["description"] or None),
         "scope": scope or (row["scope"] or None),
         "category": category or (row["category"] or SKILL_DEFAULT_CATEGORY),
-        "tags": _dedupe_keep_order(parse_json_list(row["tags"]) + tags),
-        "triggers": _dedupe_keep_order(parse_json_list(row["triggers"]) + triggers),
-        "aliases": _dedupe_keep_order(parse_json_list(row["aliases"]) + aliases),
-        "prerequisites": _dedupe_keep_order(parse_json_list(row["prerequisites"]) + prerequisites),
-        "inputs": _dedupe_keep_order(parse_json_list(row["inputs"]) + inputs),
-        "outputs": _dedupe_keep_order(parse_json_list(row["outputs"]) + outputs),
-        "steps": _dedupe_keep_order(parse_json_list(row["steps"]) + steps),
-        "failure_modes": _dedupe_keep_order(parse_json_list(row["failure_modes"]) + failure_modes),
-        "validation": _dedupe_keep_order(parse_json_list(row["validation"]) + validation),
+        **_merge_skill_row_list_fields(row, incoming_lists),
     }
 
-    next_version = _bump_patch_version(row["version"] or DEFAULT_SKILL_VERSION)
+    next_version = bump_semver_patch(
+        row["version"] or DEFAULT_SKILL_VERSION,
+        default_version=DEFAULT_SKILL_VERSION,
+    )
     existing_task_id = row["task_id"]
     if existing_task_id is None and task_id is not None:
         existing_task_id = task_id

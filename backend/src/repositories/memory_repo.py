@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from typing import Any, List, Optional, Sequence, Tuple
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import dump_json_list, now_iso
 from backend.src.services.search.fts_search import build_fts_or_query, fts_table_exists
 from backend.src.repositories.repo_conn import provide_connection
 
@@ -23,7 +22,7 @@ def create_memory_item(
     创建 memory_items 记录并返回 (item_id, created_at)。
     """
     created = created_at or now_iso()
-    tags_value = json.dumps(list(tags or []), ensure_ascii=False)
+    tags_value = dump_json_list(tags)
     sql = "INSERT INTO memory_items (content, created_at, memory_type, tags, task_id, uid) VALUES (?, ?, ?, ?, ?, ?)"
     params = (content, created, memory_type, tags_value, task_id, uid)
     with provide_connection(conn) as inner:
@@ -152,15 +151,18 @@ def update_memory_item(
     """
     fields: List[str] = []
     params: List[Any] = []
-    if content is not None:
-        fields.append("content = ?")
-        params.append(content)
-    if memory_type is not None:
-        fields.append("memory_type = ?")
-        params.append(memory_type)
+    plain_updates = [
+        ("content", content),
+        ("memory_type", memory_type),
+    ]
+    for column, value in plain_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(value)
     if tags is not None:
         fields.append("tags = ?")
-        params.append(json.dumps(list(tags), ensure_ascii=False))
+        params.append(dump_json_list(tags))
     if task_id is not None:
         fields.append("task_id = ?")
         params.append(int(task_id))

@@ -6,7 +6,9 @@ import { applyText } from "./ui.js";
 import { PET_INPUT_HISTORY_LIMIT, PET_PLAN_HIDE_DELAY_MS, UI_POLL_INTERVAL_MS, UI_TEXT } from "./constants.js";
 import * as api from "./api.js";
 import {
-  extractResultPayloadText,
+  buildNoVisibleResultText,
+  extractVisibleResultText,
+  normalizeResultText,
   parseSlashCommand
 } from "./agent_text.js";
 import { createStore } from "./store.js";
@@ -14,15 +16,34 @@ import { buildPetChatContextMessages, writePetChatMessage } from "./pet_chat_sto
 import { PetAnimator, PET_STATES } from "./pet-animator.js";
 import { BUBBLE_TYPES, PetBubble } from "./pet-bubble.js";
 import { streamSse } from "./streaming.js";
-import { createStreamController, isStreamActive, startStream, stopStream } from "./stream_controller.js";
+import { createStreamController, isStreamActive, startStream, stopStream, abortStream } from "./stream_controller.js";
 import { PollManager } from "./poll_manager.js";
 import { buildInputHistoryFromChatItems, createInputHistoryManager, mergeInputHistoryWithBackend } from "./input_history.js";
 import { getPetDomRefs } from "./dom_refs.js";
-import { emitAgentEvent } from "./agent_events.js";
+import { AGENT_EVENT_NAME, emitAgentEvent, initAgentEventBridge } from "./agent_events.js";
+import { bindPetImageFallback } from "./pet_image.js";
+import { isTerminalRunStatus, normalizeRunStatusValue } from "./run_status.js";
+import {
+  buildRunSyncingHint,
+  buildTaskFeedbackAckText,
+  extractRunLastError,
+  formatRunStatusDebugLabel
+} from "./run_messages.js";
+import { pickLatestTaskRunMeta } from "./run_fallback.js";
+import {
+  markNeedInputPromptHandled,
+  normalizeNeedInputChoices,
+  pruneNeedInputRecentRecords,
+  renderNeedInputQuestionThenChoices,
+  resolvePendingResumeFromRunDetail,
+  shouldSuppressNeedInputPrompt
+} from "./need_input.js";
 
 // 初始化
 document.title = UI_TEXT.PET_TITLE;
 applyText();
+// 接收主进程转发的跨窗口结构化事件（panel <-> pet 双向同步）
+initAgentEventBridge();
 
 // 获取元素（集中在 dom_refs.js，减少散落的 querySelector）
 const {
@@ -40,12 +61,18 @@ const {
   planSlotEls
 } = getPetDomRefs();
 
+// 图片加载兜底：主图失效时自动回退到其他可用形态，避免桌宠整块消失。
+bindPetImageFallback(imageEl);
+
 // 说明：用户要求把规划栏/气泡/输入框放回同一个渲染窗口。
 // 透明区域通过“像素级命中检测”继续保持穿透，避免错误遮挡鼠标点击。
 const bubble = new PetBubble(bubbleEl);
+const NEED_INPUT_RECENT_TTL_MS = 20000;
+const AGENT_EVENT_SOURCE_PET = "pet";
 // 桌宠关键会话状态：集中管理，避免散落的全局变量在并发/拖拽时漂移
 const petSession = createStore({
-  pendingResume: null, // {runId, taskId?, question, kind?, choices?}
+  pendingResume: null, // {runId, taskId?, question, kind?, choices?, promptToken?, sessionKey?}
+  needInputRecentRecords: [], // [{runId, fingerprint, at}]，用于抑制已处理提示的回放/轮询抖动
   lastRun: null, // {runId, taskId?}
   // P1：把关键状态从“顶层全局变量”收敛进 store，减少并发/拖拽/输入历史造成的隐式耦合
   streaming: false,
@@ -90,49 +117,215 @@ async function refreshPetInputHistoryFromBackend(throttleMs = 3000) {
   }
 }
 
-function normalizeNeedInputChoices(rawChoices) {
-  if (!Array.isArray(rawChoices)) return [];
-  const out = [];
-  for (const rawItem of rawChoices) {
-    if (typeof rawItem === "string") {
-      const text = String(rawItem || "").trim();
-      if (!text) continue;
-      out.push({ label: text, value: text });
-      if (out.length >= 12) break;
-      continue;
-    }
-    if (!rawItem || typeof rawItem !== "object") continue;
-    const label = String(rawItem?.label || "").trim();
-    if (!label) continue;
-    const value = String(rawItem?.value != null ? rawItem.value : label).trim();
-    if (!value) continue;
-    out.push({ label, value });
-    if (out.length >= 12) break;
-  }
-  return out;
-}
-
 function setPendingAgentResume(payload) {
   const runId = Number(payload?.run_id);
-  if (!Number.isFinite(runId) || runId <= 0) return;
-  const rawChoices = payload?.choices;
+  if (!Number.isFinite(runId) || runId <= 0) return { pending: null, changed: false };
+  const rawPromptToken = String(payload?.prompt_token || payload?.promptToken || "").trim();
+  const promptToken = rawPromptToken ? rawPromptToken.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 96) : "";
+  const rawSessionKey = String(payload?.session_key || payload?.sessionKey || "").trim();
+  const sessionKey = rawSessionKey ? rawSessionKey.replace(/[^a-zA-Z0-9._:-]/g, "").slice(0, 128) : "";
+
+  const next = {
+    runId,
+    taskId: Number(payload?.task_id) || null,
+    question: String(payload?.question || "").trim(),
+    kind: String(payload?.kind || "").trim() || null,
+    choices: normalizeNeedInputChoices(payload?.choices),
+    promptToken: promptToken || null,
+    sessionKey: sessionKey || null
+  };
+
+  const session = petSession.getState();
+  const prev = session.pendingResume;
+  const isSamePending = !!prev
+    && Number(prev.runId) === Number(next.runId)
+    && Number(prev.taskId || 0) === Number(next.taskId || 0)
+    && String(prev.question || "") === String(next.question || "")
+    && String(prev.kind || "") === String(next.kind || "")
+    && String(prev.promptToken || "") === String(next.promptToken || "")
+    && String(prev.sessionKey || "") === String(next.sessionKey || "")
+    && JSON.stringify(Array.isArray(prev.choices) ? prev.choices : [])
+      === JSON.stringify(Array.isArray(next.choices) ? next.choices : []);
+  if (isSamePending) return { pending: prev, changed: false };
+
+  const recentRecords = pruneNeedInputRecentRecords(session.needInputRecentRecords, { ttlMs: NEED_INPUT_RECENT_TTL_MS });
+  if (shouldSuppressNeedInputPrompt(next, recentRecords, { ttlMs: NEED_INPUT_RECENT_TTL_MS })) {
+    petSession.setState({ needInputRecentRecords: recentRecords }, { reason: "need_input_suppress_refresh" });
+    return { pending: prev || null, changed: false, suppressed: true };
+  }
+
   petSession.setState(
     {
-      pendingResume: {
-        runId,
-        taskId: Number(payload?.task_id) || null,
-        question: String(payload?.question || "").trim(),
-        kind: String(payload?.kind || "").trim() || null,
-        choices: normalizeNeedInputChoices(rawChoices)
-      }
+      pendingResume: next,
+      needInputRecentRecords: recentRecords
     },
     { reason: "need_input" }
   );
+  return { pending: next, changed: true, suppressed: false };
 }
 
-function clearPendingAgentResume() {
-  petSession.setState({ pendingResume: null }, { reason: "clear_need_input" });
+function markNeedInputHandled(payload) {
+  petSession.setState(
+    (prev) => ({
+      ...prev,
+      needInputRecentRecords: markNeedInputPromptHandled(
+        payload,
+        prev?.needInputRecentRecords,
+        { ttlMs: NEED_INPUT_RECENT_TTL_MS }
+      )
+    }),
+    { reason: "need_input_handled" }
+  );
 }
+
+function emitNeedInputResolvedEvent(pending, reason = "resolved") {
+  const runId = Number(pending?.runId);
+  if (!Number.isFinite(runId) || runId <= 0) return;
+  emitAgentEvent(
+    {
+      type: "need_input_resolved",
+      run_id: runId,
+      task_id: Number(pending?.taskId) || null,
+      prompt_token: String(pending?.promptToken || "").trim() || null,
+      session_key: String(pending?.sessionKey || "").trim() || null,
+      question: String(pending?.question || "").trim() || null,
+      reason: String(reason || "").trim() || null,
+      _source: AGENT_EVENT_SOURCE_PET
+    },
+    { broadcast: true }
+  );
+}
+
+function hideNeedInputChoicesUi() {
+  // 清理 need_input/pendingResume 时必须强制收敛全部按钮态（包含 task_feedback 的是/否按钮）。
+  // 否则在跨窗口 resume 或 run_status 继续事件下，可能出现“pending 已清空但选择框残留”。
+  resetTaskFeedbackUi();
+}
+
+function clearPendingAgentResume(options = {}) {
+  const pending = petSession.getState().pendingResume;
+  petSession.setState(
+    (prev) => ({
+      ...prev,
+      pendingResume: null,
+      needInputRecentRecords: markNeedInputPromptHandled(
+        pending,
+        prev?.needInputRecentRecords,
+        { ttlMs: NEED_INPUT_RECENT_TTL_MS }
+      )
+    }),
+    { reason: options?.reason || "clear_need_input" }
+  );
+  hideNeedInputChoicesUi();
+  if (pending && options?.emit !== false) {
+    emitNeedInputResolvedEvent(pending, options?.reason || "clear_need_input");
+  }
+  refreshHitAfterUiChange();
+}
+
+function clearPendingAgentResumeForRun(runId, options = {}) {
+  const pending = petSession.getState().pendingResume;
+  if (!pending) return;
+  const targetRunId = Number(runId);
+  if (Number.isFinite(targetRunId) && targetRunId > 0 && Number(pending.runId) !== targetRunId) return;
+  clearPendingAgentResume(options);
+}
+
+function applyRemoteRunCreated(obj) {
+  const runId = Number(obj?.run_id);
+  const taskId = Number(obj?.task_id);
+  if (!Number.isFinite(runId) || runId <= 0) return;
+  setLastAgentRun({
+    run_id: runId,
+    task_id: Number.isFinite(taskId) && taskId > 0 ? taskId : null
+  });
+}
+
+function applyRemoteRunStatus(obj) {
+  const status = normalizeRunStatusValue(obj?.status);
+  const runId = Number(obj?.run_id);
+  const taskId = Number(obj?.task_id);
+  if (Number.isFinite(runId) && runId > 0) {
+    setLastAgentRun({
+      run_id: runId,
+      task_id: Number.isFinite(taskId) && taskId > 0 ? taskId : null
+    });
+  }
+  if (!status || status === "waiting") return;
+  if (Number.isFinite(runId) && runId > 0) {
+    clearPendingAgentResumeForRun(runId, { reason: "run_status_remote_continue", emit: false });
+    return;
+  }
+  if (isTerminalRunStatus(status)) {
+    clearPendingAgentResume({ reason: "run_status_remote_terminal", emit: false });
+  }
+}
+
+function applyRemoteNeedInput(obj) {
+  const applied = setPendingAgentResume(obj);
+  if (applied?.suppressed) {
+    const runId = Number(obj?.run_id);
+    if (Number.isFinite(runId) && runId > 0) {
+      clearPendingAgentResumeForRun(runId, { reason: "need_input_remote_suppressed", emit: false });
+    }
+    return;
+  }
+  if (!applied?.changed) return;
+
+  setLastAgentRun(obj);
+  const question = String(obj?.question || "").trim();
+  if (question) {
+    renderNeedInputQuestionThenChoices({
+      question,
+      payload: {
+        ...obj,
+        choices: applied?.pending?.choices || obj?.choices
+      },
+      renderQuestion: (text) => bubbleSet(text, BUBBLE_TYPES.INFO),
+      renderChoices: (payload) => showNeedInputChoicesUi(payload),
+    });
+  } else {
+    bubbleSet("需要你补充信息后才能继续执行。", BUBBLE_TYPES.WARNING);
+  }
+  showChat();
+  schedulePetContentSizeReport();
+}
+
+try {
+  window.addEventListener(
+    AGENT_EVENT_NAME,
+    (event) => {
+      const obj = event?.detail;
+      const source = String(obj?._source || "").trim();
+      if (source === AGENT_EVENT_SOURCE_PET) return;
+      if (!obj || typeof obj !== "object") return;
+      if (obj.type === "run_created") {
+        applyRemoteRunCreated(obj);
+        return;
+      }
+      if (obj.type === "run_status") {
+        applyRemoteRunStatus(obj);
+        return;
+      }
+      if (obj.type === "need_input") {
+        applyRemoteNeedInput(obj);
+        return;
+      }
+      if (obj.type !== "need_input_resolved") return;
+      const runId = Number(obj.run_id);
+      if (!Number.isFinite(runId) || runId <= 0) return;
+      markNeedInputHandled({
+        runId,
+        question: obj.question,
+        kind: obj.kind,
+        promptToken: obj.prompt_token,
+        sessionKey: obj.session_key
+      });
+      clearPendingAgentResumeForRun(runId, { reason: "need_input_remote_resolved", emit: false });
+    },
+    { passive: true }
+  );
+} catch (e) {}
 
 function setLastAgentRun(payload) {
   const runId = Number(payload?.run_id);
@@ -156,6 +349,7 @@ function resetTaskFeedbackUi() {
   if (bubbleActionsEl) bubbleActionsEl.classList.add("is-hidden");
   if (bubbleYesEl) bubbleYesEl.classList.add("is-hidden");
   if (bubbleNoEl) bubbleNoEl.classList.add("is-hidden");
+  if (bubbleEl) bubbleEl.classList.remove("has-actions");
   if (bubbleYesEl) bubbleYesEl.onclick = null;
   if (bubbleNoEl) bubbleNoEl.onclick = null;
 }
@@ -183,11 +377,13 @@ function bubbleClear() {
 function showTaskFeedbackUi() {
   if (!bubbleActionsEl || !bubbleYesEl || !bubbleNoEl) return;
   petSession.setState({ taskFeedbackPending: true }, { reason: "task_feedback_show" });
+  if (bubbleEl) bubbleEl.classList.add("has-actions");
   bubbleActionsEl.classList.remove("is-hidden");
   bubbleYesEl.classList.remove("is-hidden");
   bubbleNoEl.classList.remove("is-hidden");
 
   bubbleYesEl.onclick = async () => {
+    if (resumeInFlight) return;
     // 若后端正在 waiting（need_input），则“是”会触发一次 resume，用于真正结束 run
     const pending = petSession.getState().pendingResume;
     if (pending?.runId) {
@@ -202,10 +398,24 @@ function showTaskFeedbackUi() {
       return;
     }
 
-    // 兼容：没有 waiting run 时，仍允许仅在 UI 上标记满意
-    const current = String(bubbleContentEl?.textContent || "").trimEnd();
+    const fallbackRunId = Number(petSession.getState().lastRun?.runId);
+    if (Number.isFinite(fallbackRunId) && fallbackRunId > 0) {
+      const recovered = await ensurePendingResumeFromBackend(fallbackRunId);
+      if (recovered.waiting) {
+        refreshHitAfterUiChange();
+        return;
+      }
+      resetTaskFeedbackUi();
+      bubbleSet(
+        `无法确认满意度：run#${fallbackRunId} 当前状态为${formatRunStatusDebugLabel(recovered.status)}。请等待进入确认阶段后再提交。`,
+        BUBBLE_TYPES.WARNING
+      );
+      refreshHitAfterUiChange();
+      return;
+    }
+
     resetTaskFeedbackUi();
-    bubbleSet(`${current}\n\n已标记：满意。任务已完成。`, BUBBLE_TYPES.SUCCESS);
+    bubbleSet("无法确认满意度：当前没有处于等待确认的任务。", BUBBLE_TYPES.WARNING);
     refreshHitAfterUiChange();
   };
 
@@ -239,6 +449,13 @@ function showNeedInputChoicesUi(payload) {
 
   const choices = normalizeNeedInputChoices(payload?.choices);
 
+  // 从 task_feedback 切到普通 need_input 时，先收敛反馈态，避免残留按钮/点击回调叠在新选项上。
+  if (petSession.getState().taskFeedbackPending) {
+    petSession.setState({ taskFeedbackPending: false }, { reason: "task_feedback_leave" });
+  }
+  if (bubbleYesEl) bubbleYesEl.onclick = null;
+  if (bubbleNoEl) bubbleNoEl.onclick = null;
+
   // 清空旧的动态按钮
   const nodes = bubbleActionsEl.querySelectorAll(".pet-bubble-action-dynamic");
   for (const el of Array.from(nodes)) {
@@ -246,6 +463,7 @@ function showNeedInputChoicesUi(payload) {
   }
 
   bubbleActionsEl.classList.remove("is-hidden");
+  if (bubbleEl) bubbleEl.classList.add("has-actions");
   if (bubbleYesEl) bubbleYesEl.classList.add("is-hidden");
   if (bubbleNoEl) bubbleNoEl.classList.add("is-hidden");
 
@@ -259,14 +477,17 @@ function showNeedInputChoicesUi(payload) {
     }
   }
 
+  let choiceSubmitting = false;
   for (const c of choices) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "pet-bubble-action pet-bubble-action-dynamic";
     btn.textContent = String(c?.label || "").trim() || "选项";
     btn.onclick = async () => {
+      if (choiceSubmitting || resumeInFlight) return;
       const pending = petSession.getState().pendingResume;
       if (!pending?.runId) return;
+      choiceSubmitting = true;
       // 禁用所有动态按钮，避免重复提交
       for (const node of Array.from(bubbleActionsEl.querySelectorAll(".pet-bubble-action-dynamic"))) {
         try { node.disabled = true; } catch (e) {}
@@ -277,8 +498,10 @@ function showNeedInputChoicesUi(payload) {
       } catch (e) {
         bubbleSet("继续执行失败：请稍后重试或在输入框手动回复。", BUBBLE_TYPES.ERROR);
         focusCustomInput();
+      } finally {
+        choiceSubmitting = false;
+        refreshHitAfterUiChange();
       }
-      refreshHitAfterUiChange();
     };
     bubbleActionsEl.appendChild(btn);
   }
@@ -401,7 +624,8 @@ function planApplyDelta(payload) {
     }
     if (idx < 0 || idx >= currentPlanItems.length) continue;
 
-    const base = currentPlanItems[idx] && typeof currentPlanItems[idx] === "object" ? currentPlanItems[idx] : {};
+    const orig = currentPlanItems[idx] && typeof currentPlanItems[idx] === "object" ? currentPlanItems[idx] : {};
+    const base = { ...orig };
     if (ch.status != null) base.status = ch.status;
     if (ch.brief != null) base.brief = ch.brief;
     if (ch.title != null) base.title = ch.title;
@@ -432,7 +656,7 @@ const animator = new PetAnimator(imageEl || petEl);
 // 桌宠对话上下文（保留少量轮次即可）
 const MAX_CHAT_MESSAGES = 12;
 const chatStream = createStreamController();
-
+let resumeInFlight = false;
 function setChatStreaming(next) {
   petSession.setState({ streaming: !!next }, { reason: next ? "stream_start" : "stream_end" });
 }
@@ -484,7 +708,8 @@ function isHitOnPetImage(clientX, clientY) {
     return false;
   }
   if (!mask.ready) {
-    return false;
+    // 兜底：遮罩尚未构建时允许按矩形命中，避免桌宠在资源加载失败/延迟时完全不可点击。
+    return true;
   }
   const x = Math.floor((clientX - rect.left) / rect.width * mask.width);
   const y = Math.floor((clientY - rect.top) / rect.height * mask.height);
@@ -606,7 +831,7 @@ async function updateAgentPlanFromBackend() {
     if (!session.debugPlanEnabled && !session.streaming) hidePlan();
     // 清理可能残留的等待输入状态（避免用户看到旧问题但无法 resume）
     // 注意：流式过程中由 SSE 自己维护 need_input，不应被轮询覆盖。
-    if (!session.streaming && session.pendingResume) clearPendingAgentResume();
+    if (!session.streaming && session.pendingResume) clearPendingAgentResume({ reason: "run_not_current" });
     lastPolledPlanRunId = null;
     lastPolledPlanSignature = "";
     return;
@@ -640,18 +865,28 @@ async function updateAgentPlanFromBackend() {
   const paused = detail?.agent_state?.paused;
   const question = String(paused?.question || "").trim();
   if (status === "waiting" && question) {
-    const pending = session.pendingResume;
-    if (!pending || Number(pending.runId) !== runId) {
-      const payload = { run_id: runId, task_id: detail?.run?.task_id, question, kind: paused?.kind, choices: paused?.choices };
-      setPendingAgentResume(payload);
+    const payload = {
+      run_id: runId,
+      task_id: detail?.run?.task_id,
+      question,
+      kind: paused?.kind,
+      choices: paused?.choices,
+      prompt_token: paused?.prompt_token,
+      session_key: paused?.session_key || detail?.agent_state?.session_key
+    };
+    const applied = setPendingAgentResume(payload);
+    if (applied.changed) {
       bubbleSet(question, BUBBLE_TYPES.INFO);
-      showNeedInputChoicesUi(payload);
+      showNeedInputChoicesUi({
+        ...payload,
+        choices: applied?.pending?.choices
+      });
       showChat();
     }
   } else {
     const pending = session.pendingResume;
     if (pending && Number(pending.runId) === runId) {
-      clearPendingAgentResume();
+      clearPendingAgentResume({ reason: "run_status_poll_continue" });
     }
   }
 }
@@ -661,9 +896,10 @@ async function updateAgentPlanFromBackend() {
  */
 async function updateFromBackend() {
   try {
-    const [health, summary] = await Promise.all([
+    const [health, summary, currentRunResp] = await Promise.all([
       api.fetchHealth(),
-      api.fetchTasksSummary()
+      api.fetchTasksSummary(),
+      api.fetchCurrentAgentRun().catch(() => null)
     ]);
 
     const session = petSession.getState();
@@ -675,6 +911,10 @@ async function updateFromBackend() {
     const backendOk = health.status === "ok";
     const hasRunningTask = summary.current && summary.current !== UI_TEXT.NONE;
     const hasPendingResume = !!session.pendingResume;
+    const latestRun = currentRunResp?.run || null;
+    const latestRunStatus = normalizeRunStatusValue(latestRun?.status);
+    const latestRunId = Number(latestRun?.run_id);
+    const runSuffix = Number.isFinite(latestRunId) && latestRunId > 0 ? `（run#${latestRunId}）` : "";
 
     // 确定新状态
     let newStatus;
@@ -708,9 +948,22 @@ async function updateFromBackend() {
         case "idle":
           animator.setState(PET_STATES.IDLE);
           if (lastStatus === "working") {
-            animator.playAnimation(PET_STATES.SUCCESS);
             if (!isStreaming && !taskFeedbackPending && !suppressAutoCompletionBubble && !hasPendingResume) {
-              bubbleShow("任务完成!", BUBBLE_TYPES.SUCCESS, 0);
+              if (latestRunStatus === "failed") {
+                animator.playAnimation(PET_STATES.ERROR);
+                bubbleShow(`任务失败${runSuffix}：请查看执行日志并修复后重试。`, BUBBLE_TYPES.ERROR, 0);
+              } else if (latestRunStatus === "stopped") {
+                bubbleShow(`任务已停止${runSuffix}。`, BUBBLE_TYPES.WARNING, 0);
+              } else if (latestRunStatus === "done") {
+                animator.playAnimation(PET_STATES.SUCCESS);
+                bubbleShow(`任务完成${runSuffix}!`, BUBBLE_TYPES.SUCCESS, 0);
+              } else {
+                bubbleShow(
+                  `任务已结束${runSuffix}${latestRunStatus ? `（${formatRunStatusDebugLabel(latestRunStatus)}）` : ""}。`,
+                  BUBBLE_TYPES.INFO,
+                  0
+                );
+              }
             }
             // 无论是否展示“任务完成”，到 idle 后都清掉一次性抑制标记
             if (session.suppressAutoCompletionBubble) {
@@ -870,6 +1123,7 @@ function petHelpText() {
     "/help - 显示帮助",
     "/chat <内容> - 纯聊天（仅调用 LLM）",
     "/do <指令> - 指令执行（生成任务 steps 并执行）",
+    "/think <指令> - 深度编排执行（多模型协作规划）",
     "/eval [run_id] [补充说明] - 评估 Agent（默认评估最近一次 /do 的 run）",
     "/task <标题> - 创建任务",
     "/run <任务ID> - 流式执行任务 steps",
@@ -878,8 +1132,8 @@ function petHelpText() {
     "/panel - 打开主面板",
     "/debugplan - 切换“规划栏示例”调试模式（用于调位置/样式）",
     "",
-    "不带 / 默认让 LLM 自动判断：普通对话走 /chat；需要执行任务/查外部信息走 /do。",
-    "想强制指定：用 /chat 或 /do。"
+    "不带 / 默认让 LLM 自动判断：普通对话走 /chat；执行类任务走 /do 或 /think。",
+    "想强制指定：用 /chat、/do 或 /think。"
   ].join("\n");
 }
 
@@ -977,13 +1231,21 @@ function initDebugPlanFromUrlOrStorage() {
 
 async function streamAndShow(makeRequest, options = {}) {
   const displayMode = String(options.displayMode || "full").trim().toLowerCase();
+  const enableAgentReplay = options.enableAgentReplay === true;
+  const expectedRunIdValue = Number(options.expectedRunId);
+  const expectedRunId = Number.isFinite(expectedRunIdValue) && expectedRunIdValue > 0
+    ? expectedRunIdValue
+    : null;
+  let streamRunId = null;
+  let streamTaskId = null;
+  let streamRunStatus = "";
 
   // 取消上一次流式请求（并发保护：旧请求的 finally 不应覆盖新请求状态）
   const { seq: mySeq, controller } = startStream(chatStream);
   setChatStreaming(true);
 
   // 新的执行链路开始：清空“等待用户输入”的续跑状态（后续若需要会由 need_input 事件重新设置）
-  clearPendingAgentResume();
+  clearPendingAgentResume({ reason: "stream_start" });
 
   // 新的一次流式会话开始：清空规划栏（由后端 plan 事件重新填充）
   if (planHideTimer) {
@@ -1012,22 +1274,75 @@ async function streamAndShow(makeRequest, options = {}) {
       },
       onRunCreated: (obj) => {
         if (!isStreamActive(chatStream, mySeq)) return;
+        emitAgentEvent(
+          { ...(obj || {}), type: "run_created", _source: AGENT_EVENT_SOURCE_PET },
+          { broadcast: true }
+        );
         setLastAgentRun(obj);
+        const rid = Number(obj?.run_id);
+        if (Number.isFinite(rid) && rid > 0) streamRunId = rid;
+        const tid = Number(obj?.task_id);
+        if (Number.isFinite(tid) && tid > 0) streamTaskId = tid;
+      },
+      onRunStatus: (obj) => {
+        if (!isStreamActive(chatStream, mySeq)) return;
+        emitAgentEvent(
+          { ...(obj || {}), type: "run_status", _source: AGENT_EVENT_SOURCE_PET },
+          { broadcast: true }
+        );
+        const status = normalizeRunStatusValue(obj?.status);
+        if (status) streamRunStatus = status;
+        const rid = Number(obj?.run_id);
+        const tid = Number(obj?.task_id);
+        if (Number.isFinite(rid) && rid > 0) {
+          streamRunId = rid;
+          setLastAgentRun({ run_id: rid, task_id: Number.isFinite(tid) && tid > 0 ? tid : null });
+        }
+        if (status && status !== "waiting") {
+          const pending = petSession.getState().pendingResume;
+          const pendingRunId = Number(pending?.runId);
+          if (Number.isFinite(rid) && rid > 0) {
+            if (pending && pendingRunId === rid) {
+              clearPendingAgentResume({ reason: "run_status_continue" });
+            }
+          } else if (isTerminalRunStatus(status)) {
+            // 兜底：极少数情况下 run_status 事件缺少 run_id，终态时仍应清理残留选择框。
+            clearPendingAgentResume({ reason: "run_status_terminal_fallback" });
+          }
+        }
       },
       onNeedInput: (obj) => {
         if (!isStreamActive(chatStream, mySeq)) return;
-        setPendingAgentResume(obj);
+        emitAgentEvent(
+          { ...(obj || {}), type: "need_input", _source: AGENT_EVENT_SOURCE_PET },
+          { broadcast: true }
+        );
+        const applied = setPendingAgentResume(obj);
+        if (applied?.suppressed || !applied?.changed) return;
         setLastAgentRun(obj);
+        const rid = Number(obj?.run_id);
+        if (Number.isFinite(rid) && rid > 0) streamRunId = rid;
+        const tid = Number(obj?.task_id);
+        if (Number.isFinite(tid) && tid > 0) streamTaskId = tid;
         const question = String(obj?.question || "").trim();
         if (question) {
-          bubbleSet(question, BUBBLE_TYPES.INFO);
-          showNeedInputChoicesUi(obj);
+          renderNeedInputQuestionThenChoices({
+            question,
+            payload: {
+              ...obj,
+              choices: applied?.pending?.choices || obj?.choices
+            },
+            renderQuestion: (text) => bubbleSet(text, BUBBLE_TYPES.INFO),
+            renderChoices: (payload) => showNeedInputChoicesUi(payload),
+          });
           // 需要用户补充信息属于“对话的一部分”：落库后世界页/状态页可一致回放。
-          writePetChatMessage("assistant", question, {
-            task_id: Number(obj?.task_id) || null,
-            run_id: Number(obj?.run_id) || null,
-            metadata: { mode: "need_input" }
-          }).catch(() => {});
+          if (applied.changed) {
+            writePetChatMessage("assistant", question, {
+              task_id: Number(obj?.task_id) || null,
+              run_id: Number(obj?.run_id) || null,
+              metadata: { mode: "need_input" }
+            }).catch(() => {});
+          }
         } else {
           bubbleSet("需要你补充信息后才能继续执行。", BUBBLE_TYPES.WARNING);
         }
@@ -1045,6 +1360,13 @@ async function streamAndShow(makeRequest, options = {}) {
       onEvent: (obj) => {
         // 复用现有 SSE：把关键结构化事件转发给主面板（跨窗口同步）
         if (!isStreamActive(chatStream, mySeq)) return;
+        if (obj?.type === "replay_applied") {
+          const n = Number(obj?.applied);
+          if (Number.isFinite(n) && n > 0) {
+            bubbleShow(`连接已恢复，已从事件日志补齐 ${n} 条事件。`, BUBBLE_TYPES.INFO, 1500);
+          }
+          return;
+        }
         if (obj?.type === "memory_item" || obj?.type === "agent_stage" || obj?.type === "plan" || obj?.type === "plan_delta") {
           emitAgentEvent(obj, { broadcast: true });
         }
@@ -1052,7 +1374,24 @@ async function streamAndShow(makeRequest, options = {}) {
       onReviewDelta: (obj) => {
         const reviewText = formatReviewToText(obj);
         return reviewText ? `${reviewText}\n` : "";
-      }
+      },
+      replayFetch: enableAgentReplay
+        ? (runId, afterEventId, signal) => api.fetchAgentRunEvents(
+          runId,
+          {
+            after_event_id: afterEventId || undefined,
+            limit: 200
+          },
+          signal
+        )
+        : undefined,
+      getReplayRunId: enableAgentReplay
+        ? () => {
+          if (Number.isFinite(expectedRunId) && expectedRunId > 0) return expectedRunId;
+          const ridFromStream = Number(streamRunId);
+          return Number.isFinite(ridFromStream) && ridFromStream > 0 ? ridFromStream : null;
+        }
+        : undefined
     }
   );
 
@@ -1062,8 +1401,72 @@ async function streamAndShow(makeRequest, options = {}) {
     if (!petSession.getState().pendingResume) scheduleHidePlan();
   }
 
-  if (hadError) return "";
-  return transcript;
+  if (hadError) {
+    return { transcript: "", hadError: true, runId: streamRunId, taskId: streamTaskId, runStatus: streamRunStatus };
+  }
+  return { transcript, hadError: false, runId: streamRunId, taskId: streamTaskId, runStatus: streamRunStatus };
+}
+
+function resolveRunIdForPostRun(streamResult) {
+  const ridFromStream = Number(streamResult?.runId);
+  if (Number.isFinite(ridFromStream) && ridFromStream > 0) return ridFromStream;
+  const ridFromState = Number(petSession.getState().lastRun?.runId);
+  if (Number.isFinite(ridFromState) && ridFromState > 0) return ridFromState;
+  return null;
+}
+
+async function resolveLatestRunForTask(taskId) {
+  const tid = Number(taskId);
+  if (!Number.isFinite(tid) || tid <= 0) {
+    return { runId: null, taskId: null, status: "" };
+  }
+  try {
+    const resp = await api.fetchTaskRuns(tid);
+    const latest = pickLatestTaskRunMeta(resp?.items);
+    if (!Number.isFinite(Number(latest?.runId)) || Number(latest?.runId) <= 0) {
+      return { runId: null, taskId: tid, status: "" };
+    }
+    return {
+      runId: Number(latest.runId),
+      taskId: Number(latest.taskId) || tid,
+      status: String(latest.status || "").trim()
+    };
+  } catch (error) {
+    return { runId: null, taskId: tid, status: "" };
+  }
+}
+
+async function showRunSyncingHintFromBackend() {
+  const current = await api.fetchCurrentAgentRun().catch(() => null);
+  const run = current?.run || null;
+  bubbleSet(buildRunSyncingHint(run), BUBBLE_TYPES.INFO);
+}
+
+async function buildNoVisibleResultWithDebug(runStatus, runId) {
+  const rid = Number(runId);
+  let status = normalizeRunStatusValue(runStatus);
+  let lastError = null;
+
+  if (Number.isFinite(rid) && rid > 0) {
+    const detail = await api.fetchAgentRunDetail(rid).catch(() => null);
+    if (!status) {
+      status = normalizeRunStatusValue(detail?.run?.status);
+    }
+    lastError = extractRunLastError(detail);
+  }
+
+  return buildNoVisibleResultText(status, {
+    runId: Number.isFinite(rid) && rid > 0 ? rid : null,
+    lastError
+  });
+}
+
+function feedbackAckBubbleType(status) {
+  const normalized = normalizeRunStatusValue(status);
+  if (normalized === "done") return BUBBLE_TYPES.SUCCESS;
+  if (normalized === "failed") return BUBBLE_TYPES.ERROR;
+  if (normalized === "stopped" || normalized === "cancelled") return BUBBLE_TYPES.WARNING;
+  return BUBBLE_TYPES.INFO;
 }
 
 async function handleChatMode(message) {
@@ -1076,26 +1479,25 @@ async function handleChatMode(message) {
     UI_TEXT.PET_SYSTEM_PROMPT || "",
     MAX_CHAT_MESSAGES
   );
-  const finalText = await streamAndShow(
+  const streamResult = await streamAndShow(
     (signal) => api.streamPetChat({ messages: ctx }, signal),
     { displayMode: "full" }
   );
+  const finalText = String(streamResult?.transcript || "");
   if (!finalText) return;
 
   bubbleSet(finalText, BUBBLE_TYPES.INFO);
   await writePetChatMessage("assistant", finalText, { metadata: { mode: "chat" } });
 }
 
-function showDoFeedbackUi(visibleText) {
+function showDoResultUi(visibleText) {
   // 任务结果已展示：抑制轮询的“任务完成!”提示，避免覆盖最终回答
-  petSession.setState({ suppressAutoCompletionBubble: true }, { reason: "do_feedback_show" });
-  const prompt = UI_TEXT.PET_TASK_FEEDBACK_PROMPT || "你对本次任务的执行满意吗？";
-  bubbleSet(`${visibleText}\n\n${prompt}`, BUBBLE_TYPES.INFO);
-  showTaskFeedbackUi();
+  petSession.setState({ suppressAutoCompletionBubble: true }, { reason: "do_result_show" });
+  bubbleSet(String(visibleText || "").trim(), BUBBLE_TYPES.INFO);
 }
 
 async function persistDoAssistantMessage(visible, extra = {}) {
-  const visibleForStore = String(visible).replace(/^【结果】/g, "").trim();
+  const visibleForStore = normalizeResultText(visible);
   const content = visibleForStore || visible;
   if (!String(content || "").trim()) return;
 
@@ -1106,61 +1508,187 @@ async function persistDoAssistantMessage(visible, extra = {}) {
   });
 }
 
-async function handleDoMode(message) {
+async function ensurePendingResumeFromBackend(runId) {
+  const rid = Number(runId);
+  if (!Number.isFinite(rid) || rid <= 0) return { waiting: false, question: "", status: "" };
+
+  const detail = await api.fetchAgentRunDetail(rid).catch(() => null);
+  const resolved = resolvePendingResumeFromRunDetail(rid, detail, { requireQuestionForWaiting: false });
+  if (!resolved.waiting) {
+    return { waiting: false, question: "", status: resolved.status };
+  }
+  if (!resolved.pending) {
+    return { waiting: true, question: "", status: resolved.status };
+  }
+
+  const pending = petSession.getState().pendingResume;
+  const pendingRunId = Number(pending?.runId);
+  const shouldRefreshPending = !Number.isFinite(pendingRunId)
+    || pendingRunId !== rid
+    || String(pending?.question || "").trim() !== String(resolved.pending.question || "").trim()
+    || String(pending?.kind || "").trim() !== String(resolved.pending.kind || "").trim()
+    || String(pending?.promptToken || "").trim() !== String(resolved.pending.promptToken || "").trim()
+    || String(pending?.sessionKey || "").trim() !== String(resolved.pending.sessionKey || "").trim();
+  if (shouldRefreshPending) {
+    const payload = {
+      run_id: resolved.pending.runId,
+      task_id: resolved.pending.taskId,
+      question: resolved.pending.question,
+      kind: resolved.pending.kind,
+      choices: resolved.pending.choices,
+      prompt_token: resolved.pending.promptToken,
+      session_key: resolved.pending.sessionKey
+    };
+    const applied = setPendingAgentResume(payload);
+    if (applied?.suppressed || !applied?.changed) {
+      return { waiting: true, question: resolved.question, status: resolved.status };
+    }
+    renderNeedInputQuestionThenChoices({
+      question: String(resolved.question || ""),
+      payload: {
+        ...payload,
+        choices: applied?.pending?.choices || payload.choices
+      },
+      renderQuestion: (text) => bubbleSet(text, BUBBLE_TYPES.INFO),
+      renderChoices: (data) => showNeedInputChoicesUi(data),
+    });
+    showChat();
+    schedulePetContentSizeReport();
+  }
+  return { waiting: true, question: resolved.question, status: resolved.status };
+}
+
+async function handleDoMode(message, options = {}) {
   const text = String(message || "").trim();
   if (!text) return;
+  const requestedMode = String(options?.mode || "do").trim().toLowerCase();
+  const agentMode = requestedMode === "think" ? "think" : "do";
 
-  await writePetChatMessage("user", text, { metadata: { mode: "do" } });
-  const finalText = await streamAndShow(
-    (signal) => api.streamAgentCommand({ message: text }, signal),
-    { displayMode: "status" }
+  await writePetChatMessage("user", text, { metadata: { mode: agentMode } });
+  // 每次 /do 前清空 lastRun，避免缺失 run_created 事件时误用旧 run 触发错误反馈提示。
+  petSession.setState({ lastRun: null }, { reason: "do_reset_last_run" });
+  const streamResult = await streamAndShow(
+    (signal) => api.streamAgentCommand({ message: text, mode: agentMode }, signal),
+    { displayMode: "status", enableAgentReplay: true }
   );
-  const payload = extractResultPayloadText(finalText);
-  const visible = String(payload || "").replace(/^【结果】/g, "").trim();
+  const finalText = String(streamResult?.transcript || "");
+  const runId = resolveRunIdForPostRun(streamResult);
+  if (!Number.isFinite(runId) || runId <= 0) {
+    await showRunSyncingHintFromBackend();
+    return;
+  }
+  let runStatus = normalizeRunStatusValue(streamResult?.runStatus);
+  if (runStatus === "waiting") {
+    await ensurePendingResumeFromBackend(runId);
+    return;
+  }
+  if (!runStatus) {
+    const runState = await ensurePendingResumeFromBackend(runId);
+    if (runState.waiting) return;
+    runStatus = normalizeRunStatusValue(runState.status);
+  }
+  if (!isTerminalRunStatus(runStatus)) return;
+  clearPendingAgentResumeForRun(runId, { reason: "run_terminal" });
+
+  const lastRun = petSession.getState().lastRun;
+  const visible = extractVisibleResultText(finalText);
   if (!visible) {
-    const warn = "任务已结束，但未产出可展示结果（缺少【结果】输出）。";
+    const warn = await buildNoVisibleResultWithDebug(runStatus, runId);
     bubbleSet(warn, BUBBLE_TYPES.WARNING);
-    const lastRun = petSession.getState().lastRun;
     // 与世界页保持一致：异常也落库，便于回放与调试
     await writePetChatMessage("assistant", warn, {
       task_id: lastRun?.taskId || null,
       run_id: lastRun?.runId || null,
-      metadata: { mode: "do" }
+      metadata: { mode: agentMode }
     });
     return;
   }
 
-  const lastRun = petSession.getState().lastRun;
-  await persistDoAssistantMessage(visible, { task_id: lastRun?.taskId, run_id: lastRun?.runId });
-  showDoFeedbackUi(visible);
+  await persistDoAssistantMessage(visible, {
+    task_id: lastRun?.taskId,
+    run_id: lastRun?.runId,
+    metadata: { mode: agentMode }
+  });
+  showDoResultUi(visible);
 }
 
 async function handleResumeMode(message) {
   const text = String(message || "").trim();
   if (!text) return;
+  if (resumeInFlight) return;
 
   const pending = petSession.getState().pendingResume;
   if (!pending || !pending.runId) return;
+  const pendingKind = String(pending.kind || "").trim();
+  const isTaskFeedbackResume = pendingKind === "task_feedback";
 
   const resumeRunId = pending.runId;
   const resumeTaskId = pending.taskId;
-  clearPendingAgentResume();
+  resumeInFlight = true;
+  try {
+    clearPendingAgentResume({ reason: "resume_start" });
 
-  await writePetChatMessage("user", text, {
-    task_id: resumeTaskId,
-    run_id: resumeRunId,
-    metadata: { mode: "resume" }
-  });
-  const finalText = await streamAndShow(
-    (signal) => api.streamAgentResume({ run_id: resumeRunId, message: text }, signal),
-    { displayMode: "status" }
-  );
-  const payload = extractResultPayloadText(finalText);
-  const visible = String(payload || "").replace(/^【结果】/g, "").trim();
-  if (!visible) return;
+    await writePetChatMessage("user", text, {
+      task_id: resumeTaskId,
+      run_id: resumeRunId,
+      metadata: { mode: "resume" }
+    });
+    const streamResult = await streamAndShow(
+      (signal) => api.streamAgentResume(
+        {
+          run_id: resumeRunId,
+          message: text,
+          prompt_token: pending.promptToken || undefined,
+          session_key: pending.sessionKey || undefined
+        },
+        signal
+      ),
+      { displayMode: "status", enableAgentReplay: true, expectedRunId: resumeRunId }
+    );
+    const finalText = String(streamResult?.transcript || "");
+    let runStatus = normalizeRunStatusValue(streamResult?.runStatus);
+    if (runStatus === "waiting") {
+      await ensurePendingResumeFromBackend(resumeRunId);
+      return;
+    }
+    if (!runStatus) {
+      const runState = await ensurePendingResumeFromBackend(resumeRunId);
+      if (runState.waiting) return;
+      runStatus = normalizeRunStatusValue(runState.status);
+    }
+    if (!isTerminalRunStatus(runStatus)) return;
+    clearPendingAgentResumeForRun(resumeRunId, { reason: "run_terminal" });
 
-  await persistDoAssistantMessage(visible, { task_id: resumeTaskId, run_id: resumeRunId });
-  showDoFeedbackUi(visible);
+    // 反馈确认步骤由后端 need_input(task_feedback) 驱动；
+    // 这里不再二次弹“满意度选择”，避免状态漂移和重复消息。
+    if (isTaskFeedbackResume) {
+      const doneText = buildTaskFeedbackAckText(runStatus, resumeRunId);
+      bubbleSet(doneText, feedbackAckBubbleType(runStatus));
+      await writePetChatMessage("assistant", doneText, {
+        task_id: resumeTaskId || null,
+        run_id: resumeRunId || null,
+        metadata: { mode: "resume", kind: "task_feedback" }
+      });
+      return;
+    }
+
+    const visible = extractVisibleResultText(finalText);
+    if (!visible) {
+      const fallback = await buildNoVisibleResultWithDebug(runStatus, resumeRunId);
+      bubbleSet(fallback, BUBBLE_TYPES.WARNING);
+      await writePetChatMessage("assistant", fallback, {
+        task_id: resumeTaskId || null,
+        run_id: resumeRunId || null,
+        metadata: { mode: "resume" }
+      });
+      return;
+    }
+
+    await persistDoAssistantMessage(visible, { task_id: resumeTaskId, run_id: resumeRunId });
+    showDoResultUi(visible);
+  } finally {
+    resumeInFlight = false;
+  }
 }
 
 function parseEvalArgsOrShowUsage(args) {
@@ -1212,15 +1740,23 @@ const SLASH_COMMAND_HANDLERS = {
       bubbleSet("用法：/do 帮我写一条记忆：xxx", BUBBLE_TYPES.WARNING);
       return;
     }
-    await handleDoMode(args);
+    await handleDoMode(args, { mode: "do" });
+  },
+  think: async (args) => {
+    if (!args) {
+      bubbleSet("用法：/think 先分析再执行 xxx", BUBBLE_TYPES.WARNING);
+      return;
+    }
+    await handleDoMode(args, { mode: "think" });
   },
   eval: async (args) => {
     const parsed = parseEvalArgsOrShowUsage(args);
     if (!parsed) return;
-    const finalText = await streamAndShow(
+    const streamResult = await streamAndShow(
       (signal) => api.streamAgentEvaluate({ run_id: parsed.runId, message: parsed.note }, signal),
       { displayMode: "full" }
     );
+    const finalText = String(streamResult?.transcript || "");
     if (finalText) bubbleSet(finalText, BUBBLE_TYPES.INFO);
   },
   task: async (args) => {
@@ -1242,13 +1778,50 @@ const SLASH_COMMAND_HANDLERS = {
       bubbleSet("用法：/run 任务ID（数字）", BUBBLE_TYPES.WARNING);
       return;
     }
-    const finalText = await streamAndShow(
+    // 每次 /run 前清空 lastRun，避免 run_created 丢失时误判到历史 run。
+    petSession.setState({ lastRun: null }, { reason: "run_reset_last_run" });
+    const streamResult = await streamAndShow(
       (signal) => api.streamExecuteTask(id, {}, signal),
       { displayMode: "status" }
     );
-    const payload = extractResultPayloadText(finalText);
-    const visible = String(payload || "").replace(/^【结果】/g, "").trim();
-    if (visible) showDoFeedbackUi(visible);
+    const finalText = String(streamResult?.transcript || "");
+    let runId = resolveRunIdForPostRun(streamResult);
+    let runStatus = normalizeRunStatusValue(streamResult?.runStatus);
+    if ((!Number.isFinite(runId) || runId <= 0) || !runStatus) {
+      const fallback = await resolveLatestRunForTask(id);
+      if (!Number.isFinite(runId) || runId <= 0) {
+        runId = Number(fallback?.runId) || null;
+      }
+      if (!runStatus) {
+        runStatus = normalizeRunStatusValue(fallback?.status);
+      }
+      if (Number.isFinite(Number(runId)) && Number(runId) > 0) {
+        setLastAgentRun({ run_id: Number(runId), task_id: Number(fallback?.taskId) || id });
+      }
+    }
+    if (!Number.isFinite(runId) || runId <= 0) {
+      await showRunSyncingHintFromBackend();
+      return;
+    }
+    if (runStatus === "waiting") {
+      await ensurePendingResumeFromBackend(runId);
+      return;
+    }
+    if (!runStatus) {
+      const runState = await ensurePendingResumeFromBackend(runId);
+      if (runState.waiting) return;
+      runStatus = normalizeRunStatusValue(runState.status);
+    }
+    if (!isTerminalRunStatus(runStatus)) return;
+    clearPendingAgentResumeForRun(runId, { reason: "run_terminal" });
+
+    const visible = extractVisibleResultText(finalText);
+    if (!visible) {
+      const fallback = await buildNoVisibleResultWithDebug(runStatus, runId);
+      bubbleSet(fallback, BUBBLE_TYPES.WARNING);
+      return;
+    }
+    showDoResultUi(visible);
   },
   memory: async (args) => {
     if (!args) {
@@ -1303,7 +1876,7 @@ async function resolveRouteModeForMessage(text) {
   } catch (e) {
     mode = "";
   }
-  if (mode !== "chat" && mode !== "do") {
+  if (mode !== "chat" && mode !== "do" && mode !== "think") {
     mode = "chat";
   }
   return mode;
@@ -1325,8 +1898,8 @@ async function sendChatMessage(rawText) {
     return;
   }
 
-  // 默认：让后端 LLM 做一次“chat vs do”路由，避免普通对话也走 plan/ReAct 流程。
-  // 路由失败时默认走 chat（用户仍可用 /do 强制）。
+  // 默认：让后端 LLM 做一次“chat/do/think”路由。
+  // 路由失败时默认走 chat（用户仍可用 /do 或 /think 强制）。
   bubbleSet(UI_TEXT.PET_CHAT_SENDING || "...", BUBBLE_TYPES.INFO);
   const mode = await resolveRouteModeForMessage(text);
 
@@ -1335,7 +1908,7 @@ async function sendChatMessage(rawText) {
     return;
   }
 
-  await handleDoMode(text);
+  await handleDoMode(text, { mode });
 }
 
 // 双击打开面板（通过 IPC）
@@ -1397,5 +1970,12 @@ initDebugPlanFromUrlOrStorage();
 // 启动轮询
 startPolling();
 
-// 页面卸载时停止轮询
-window.addEventListener("beforeunload", stopPolling);
+// 页面卸载时清理资源：停止轮询、中断流式连接、清除定时器
+window.addEventListener("beforeunload", () => {
+  stopPolling();
+  abortStream(chatStream);
+  if (planHideTimer) {
+    clearTimeout(planHideTimer);
+    planHideTimer = null;
+  }
+});

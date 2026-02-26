@@ -188,8 +188,9 @@
   justify-self: start;
   align-self: start;
   /* 让气泡宽度随内容变化：短内容更紧凑，长内容自动换行且不无限变宽 */
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: stretch;
   width: fit-content;
   min-width: var(--pet-bubble-min-width);
   max-width: min(var(--pet-bubble-max-width), 100%);
@@ -213,6 +214,7 @@
   user-select: none;
   -webkit-user-select: none;
   cursor: default;
+  min-height: 0;
   z-index: 2;
   transform-origin: top left;
   transform: translate(var(--pet-bubble-offset-x), var(--pet-bubble-offset-y));
@@ -222,13 +224,26 @@
   padding: 10px 14px;
   /* 在 max-height 受限时，仅正文区域滚动，按钮固定在底部 */
   overflow: auto;
+  flex: 1 1 auto;
   min-height: 0;
+  position: relative;
+  z-index: 1;
   /* Markdown 渲染后由 HTML 控制换行；软换行由渲染器插入 <br> */
   white-space: normal;
   word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
   cursor: text;
+  min-height: 24px;
+}
+
+.pet-bubble.has-actions .pet-bubble-content {
+  /* 选项出现时，给正文底部留出呼吸空间，视觉上不与分隔线贴边。 */
+  padding-bottom: 8px;
+}
+
+.pet-bubble.has-actions {
+  min-height: 132px;
 }
 
 /* Markdown 基础样式（桌宠气泡） */
@@ -308,12 +323,18 @@
 
 .pet-bubble-actions {
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: stretch;
+  flex: 0 0 auto;
   gap: 8px;
   padding: 8px 10px 10px;
   border-top: 1px solid rgba(31, 28, 23, 0.12);
+  background: rgba(255, 255, 255, 0.92);
   user-select: none;
+  max-height: 180px;
+  overflow: auto;
+  position: relative;
+  z-index: 2;
 }
 
 .pet-bubble-actions.is-hidden {
@@ -325,13 +346,19 @@
 }
 
 .pet-bubble-action {
-  height: 26px;
-  padding: 0 10px;
+  width: 100%;
+  min-height: 30px;
+  padding: 6px 10px;
   border-radius: 10px;
   border: 1px solid rgba(31, 28, 23, 0.28);
   background: rgba(255, 255, 255, 0.45);
   color: var(--color_ink);
   cursor: pointer;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  text-align: left;
 }
 
 .pet-bubble-action:hover {

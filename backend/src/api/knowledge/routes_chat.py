@@ -5,7 +5,7 @@ from fastapi import APIRouter
 
 from backend.src.api.schemas import ChatMessageCreate
 from backend.src.common.serializers import chat_message_from_row
-from backend.src.api.utils import ensure_write_permission, error_response, now_iso
+from backend.src.api.utils import clamp_page_limit, error_response, now_iso, require_write_permission
 from backend.src.constants import (
     CHAT_MESSAGES_MAX_LIMIT,
     CHAT_ROLE_ASSISTANT,
@@ -18,7 +18,7 @@ from backend.src.constants import (
     ERROR_MESSAGE_CHAT_MESSAGE_MISSING,
     HTTP_STATUS_BAD_REQUEST,
 )
-from backend.src.repositories.chat_messages_repo import (
+from backend.src.services.knowledge.knowledge_query import (
     ChatMessageCreateParams,
     create_chat_message as create_chat_message_repo,
     get_chat_message as get_chat_message_repo,
@@ -32,11 +32,8 @@ router = APIRouter()
 
 
 @router.post("/chat/messages")
+@require_write_permission
 def create_chat_message(payload: ChatMessageCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
     role = str(payload.role or "").strip()
     if role not in {CHAT_ROLE_SYSTEM, CHAT_ROLE_USER, CHAT_ROLE_ASSISTANT}:
         return error_response(
@@ -77,10 +74,11 @@ def list_chat_messages(
     before_id: Optional[int] = None,
     after_id: Optional[int] = None,
 ) -> dict:
-    safe_limit = int(limit or DEFAULT_PAGE_LIMIT)
-    if safe_limit <= 0:
-        safe_limit = DEFAULT_PAGE_LIMIT
-    safe_limit = min(safe_limit, CHAT_MESSAGES_MAX_LIMIT)
+    safe_limit = clamp_page_limit(
+        limit,
+        default=DEFAULT_PAGE_LIMIT,
+        max_value=CHAT_MESSAGES_MAX_LIMIT,
+    )
 
     if after_id is not None:
         rows = list_chat_messages_after(after_id=int(after_id), limit=safe_limit)
@@ -104,10 +102,11 @@ def search_chat_messages(q: str, limit: int = DEFAULT_PAGE_LIMIT) -> dict:
             HTTP_STATUS_BAD_REQUEST,
         )
 
-    safe_limit = int(limit or DEFAULT_PAGE_LIMIT)
-    if safe_limit <= 0:
-        safe_limit = DEFAULT_PAGE_LIMIT
-    safe_limit = min(safe_limit, CHAT_MESSAGES_MAX_LIMIT)
+    safe_limit = clamp_page_limit(
+        limit,
+        default=DEFAULT_PAGE_LIMIT,
+        max_value=CHAT_MESSAGES_MAX_LIMIT,
+    )
 
     rows = search_chat_messages_like(query=query, limit=safe_limit)
     return {"items": [chat_message_from_row(row) for row in rows]}

@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 from typing import List, Optional
 
+from backend.src.common.utils import coerce_int
 from backend.src.constants import (
     AGENT_KNOWLEDGE_SUFFICIENCY_KIND,
+    AGENT_KNOWLEDGE_SUFFICIENCY_PROCEED_VALUE,
+    AGENT_KNOWLEDGE_SUFFICIENCY_ASK_CLARIFY_VALUE,
     AGENT_TASK_FEEDBACK_KIND,
     AGENT_USER_PROMPT_CHOICES_MAX,
 )
@@ -13,8 +16,8 @@ _YES_NO_CHOICES: List[dict] = [
 ]
 
 _KNOWLEDGE_SUFFICIENCY_CHOICES: List[dict] = [
-    {"label": "按当前信息继续", "value": "请按当前已知信息继续执行，并明确列出关键假设。"},
-    {"label": "先给我澄清问题", "value": "请先给我需要补充的关键问题列表，我再补充。"},
+    {"label": "按当前信息继续", "value": AGENT_KNOWLEDGE_SUFFICIENCY_PROCEED_VALUE},
+    {"label": "先给我澄清问题", "value": AGENT_KNOWLEDGE_SUFFICIENCY_ASK_CLARIFY_VALUE},
 ]
 
 _YES_NO_QUESTION_HINTS: tuple = (
@@ -32,7 +35,7 @@ def normalize_need_input_choices(raw_choices, *, limit: Optional[int] = None) ->
     if not isinstance(raw_choices, list):
         return []
 
-    max_items = int(limit or AGENT_USER_PROMPT_CHOICES_MAX or 12)
+    max_items = coerce_int(limit or AGENT_USER_PROMPT_CHOICES_MAX or 12, default=12)
     if max_items <= 0:
         max_items = 12
 

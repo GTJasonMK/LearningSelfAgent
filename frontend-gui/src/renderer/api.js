@@ -1,9 +1,32 @@
 import { API_BASE } from "./constants.js";
 
+async function extractResponseErrorMessage(response) {
+  const status = Number(response?.status || 0);
+  const base = `请求失败: ${status}`;
+  if (!response) return base;
+
+  let detail = "";
+  try {
+    const payload = await response.clone().json();
+    detail = String(payload?.error?.message || payload?.message || "").trim();
+  } catch (e) {}
+
+  if (!detail) {
+    try {
+      const text = String(await response.clone().text()).trim();
+      if (text && !text.startsWith("<!DOCTYPE")) {
+        detail = text.slice(0, 200);
+      }
+    } catch (e) {}
+  }
+
+  return detail ? `${base} - ${detail}` : base;
+}
+
 async function request(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, options);
   if (!response.ok) {
-    throw new Error(`请求失败: ${response.status}`);
+    throw new Error(await extractResponseErrorMessage(response));
   }
   return response.json();
 }
@@ -97,6 +120,18 @@ export async function fetchCurrentAgentRun() {
 
 export async function fetchAgentRunDetail(runId) {
   return request(`/agent/runs/${runId}`);
+}
+
+export async function fetchAgentRunEvents(runId, params = {}, signal) {
+  const suffix = buildQueryString({
+    after_event_id: params.after_event_id,
+    limit: params.limit
+  });
+  const response = await fetch(`${API_BASE}/agent/runs/${runId}/events${suffix}`, { signal });
+  if (!response.ok) {
+    throw new Error(await extractResponseErrorMessage(response));
+  }
+  return response.json();
 }
 
 export async function fetchAgentReviews(params = {}) {
@@ -398,6 +433,10 @@ export async function updateLlmConfig(payload) {
   return jsonRequest("PATCH", "/config/llm", payload);
 }
 
+export async function testLlmConfig(payload) {
+  return jsonRequest("POST", "/config/llm/test", payload || {});
+}
+
 export async function fetchConfig() {
   return request("/config");
 }
@@ -408,6 +447,10 @@ export async function updateConfig(payload) {
 
 export async function fetchPermissions() {
   return request("/permissions");
+}
+
+export async function fetchPermissionsMatrix() {
+  return request("/permissions/matrix");
 }
 
 export async function updatePermissions(payload) {

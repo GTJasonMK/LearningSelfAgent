@@ -2,13 +2,19 @@ import json
 import re
 from typing import Callable, Dict, List, Optional, Tuple
 
-from backend.src.actions.registry import normalize_action_type
+from backend.src.actions.registry import (
+    action_payload_keys_guide,
+    action_types_line,
+    normalize_action_type,
+)
 from backend.src.agent.support import (
     _extract_json_object,
     coerce_file_write_payload_path_from_title,
     _validate_action,
 )
+from backend.src.agent.core.context_budget import apply_context_budget_pipeline
 from backend.src.common.errors import AppError
+from backend.src.common.utils import now_iso
 from backend.src.constants import (
     ACTION_TYPE_FILE_APPEND,
     ACTION_TYPE_FILE_DELETE,
@@ -23,10 +29,59 @@ from backend.src.constants import (
     ACTION_TYPE_TASK_OUTPUT,
     ACTION_TYPE_TOOL_CALL,
     ACTION_TYPE_USER_PROMPT,
+    AGENT_EXPERIMENT_DIR_REL,
+    AGENT_REACT_STEP_PROMPT_TEMPLATE,
+    ASSISTANT_OUTPUT_STYLE_GUIDE,
     AGENT_SHELL_COMMAND_DEFAULT_TIMEOUT_MS,
     ERROR_MESSAGE_LLM_CALL_FAILED,
     TASK_OUTPUT_TYPE_TEXT,
 )
+
+
+def _extract_prefixed_value(title: str, prefix: str) -> str:
+    raw = str(title or "").strip()
+    if not raw:
+        return ""
+    m = re.match(rf"^{re.escape(str(prefix))}[:：]\s*(\"[^\"]+\"|'[^']+'|\S+)", raw)
+    if not m:
+        return ""
+    value = str(m.group(1) or "").strip()
+    if (value.startswith("\"") and value.endswith("\"")) or (value.startswith("'") and value.endswith("'")):
+        value = value[1:-1].strip()
+    return value
+
+
+def _looks_like_url(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    return bool(re.match(r"^https?://", raw, re.IGNORECASE))
+
+
+def _normalize_llm_parameters(raw_params: object) -> Optional[dict]:
+    if not isinstance(raw_params, dict):
+        return None
+
+    normalized: dict = {}
+    for key, value in raw_params.items():
+        key_text = str(key or "").strip()
+        if not key_text:
+            continue
+        if value is None:
+            continue
+        normalized[key_text] = value
+
+    if "max_tokens" not in normalized and "max_output_tokens" in normalized:
+        raw_value = normalized.get("max_output_tokens")
+        try:
+            max_tokens = int(raw_value) if raw_value is not None else None
+        except Exception:
+            max_tokens = None
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            normalized["max_tokens"] = max_tokens
+    normalized.pop("max_output_tokens", None)
+
+    return normalized or None
 
 
 def extract_llm_call_text(resp) -> Tuple[Optional[str], Optional[str]]:
@@ -121,6 +176,73 @@ def call_llm_for_text_with_id(
         return None, str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED, None
 
 
+def build_react_step_prompt(
+    *,
+    workdir: str,
+    message: str,
+    plan: str,
+    step_index: int,
+    step_title: str,
+    allowed_actions: str,
+    observations: str,
+    recent_source_failures: str,
+    graph: str,
+    tools: str,
+    skills: str,
+    memories: str,
+    now_utc: Optional[str] = None,
+    disallow_plan_patch: bool = False,
+    capability_hint: str = "",
+    budget_meta_sink: Optional[dict] = None,
+) -> str:
+    """
+    构建 ReAct step prompt（统一模板与运行时 action 契约注入）。
+
+    目的：
+    - 避免 react_loop_impl / think_parallel_loop 各自拼接导致字段约束漂移；
+    - payload 字段白名单统一来自 action registry，和执行器保持单一来源。
+    """
+    sections, budget_meta = apply_context_budget_pipeline(
+        {
+            "observations": str(observations),
+            "recent_source_failures": str(recent_source_failures),
+            "graph": str(graph),
+            "tools": str(tools),
+            "skills": str(skills),
+            "solutions": "",
+            "memories": str(memories),
+        }
+    )
+    if isinstance(budget_meta_sink, dict):
+        budget_meta_sink.clear()
+        budget_meta_sink.update(dict(budget_meta or {}))
+    prompt = AGENT_REACT_STEP_PROMPT_TEMPLATE.format(
+        now=str(now_utc or now_iso()),
+        workdir=str(workdir),
+        agent_workspace=AGENT_EXPERIMENT_DIR_REL,
+        message=str(message),
+        plan=str(plan),
+        step_index=int(step_index),
+        step_title=str(step_title),
+        allowed_actions=str(allowed_actions),
+        observations=str(sections.get("observations") or ""),
+        recent_source_failures=str(sections.get("recent_source_failures") or ""),
+        graph=str(sections.get("graph") or ""),
+        tools=str(sections.get("tools") or ""),
+        skills=str(sections.get("skills") or ""),
+        memories=str(sections.get("memories") or ""),
+        output_style=ASSISTANT_OUTPUT_STYLE_GUIDE,
+        action_types_line=action_types_line(),
+        action_payload_keys_guide=action_payload_keys_guide(),
+    )
+    if disallow_plan_patch:
+        prompt += "\n额外约束：当前为 Think 并行执行阶段，不支持 plan_patch。请不要输出 plan_patch 字段（或始终为 null）。\n"
+    capability_text = str(capability_hint or "").strip()
+    if capability_text:
+        prompt += f"\n额外约束：本步骤能力标签为「{capability_text}」，优先选择与该能力匹配的 action。\n"
+    return prompt
+
+
 def normalize_action_obj_for_execution(
     *,
     action_obj: dict,
@@ -158,30 +280,15 @@ def normalize_action_obj_for_execution(
 
     payload_obj = dict(payload_raw)
 
-    def _extract_prefixed_value(title: str, prefix: str) -> str:
-        raw = str(title or "").strip()
-        if not raw:
-            return ""
-        m = re.match(rf"^{re.escape(str(prefix))}[:：]\s*(\"[^\"]+\"|'[^']+'|\S+)", raw)
-        if not m:
-            return ""
-        value = str(m.group(1) or "").strip()
-        if (value.startswith("\"") and value.endswith("\"")) or (
-            value.startswith("'") and value.endswith("'")
-        ):
-            value = value[1:-1].strip()
-        return value
-
-    def _looks_like_url(value: str) -> bool:
-        raw = str(value or "").strip()
-        if not raw:
-            return False
-        return bool(re.match(r"^https?://", raw, re.IGNORECASE))
-
     if action_type == ACTION_TYPE_LLM_CALL:
         # 强制走后端默认配置，避免模型不匹配
         payload_obj.pop("model", None)
         payload_obj.pop("provider", None)
+        normalized_params = _normalize_llm_parameters(payload_obj.get("parameters"))
+        if isinstance(normalized_params, dict):
+            payload_obj["parameters"] = normalized_params
+        else:
+            payload_obj.pop("parameters", None)
 
     if action_type == ACTION_TYPE_SHELL_COMMAND:
         # workdir 在 Windows/WSL 下很容易被模型漏填；缺失会导致 _validate_action 直接失败
@@ -296,22 +403,6 @@ def normalize_action_obj_for_execution(
                 exec_spec.setdefault("timeout_ms", AGENT_SHELL_COMMAND_DEFAULT_TIMEOUT_MS)
                 meta["exec"] = exec_spec
             payload_obj["tool_metadata"] = meta
-
-        # web_fetch 自测兜底：优先使用稳定可达的样例 URL，避免把外部波动站点当作连通性基准。
-        tool_name = str(payload_obj.get("tool_name") or "").strip().lower()
-        title_text = str(step_title or "")
-        title_lower = title_text.lower()
-        is_self_test = (
-            "自测" in title_text
-            or "验证" in title_text
-            or "校验" in title_text
-            or "test" in title_lower
-            or "verify" in title_lower
-        )
-        if tool_name == "web_fetch" and is_self_test:
-            tool_input = str(payload_obj.get("input") or "").strip()
-            if not tool_input or tool_input.startswith("http://") or tool_input.startswith("https://"):
-                payload_obj["input"] = "https://example.com"
 
     action["payload"] = payload_obj
     action_obj["action"] = action

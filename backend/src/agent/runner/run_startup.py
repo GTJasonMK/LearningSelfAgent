@@ -5,6 +5,9 @@ from typing import Dict, List, Optional
 
 from backend.src.agent.core.run_context import AgentRunContext
 from backend.src.agent.runner.run_bootstrap import bootstrap_new_mode_run
+from backend.src.agent.runner.stream_status_event import build_run_status_sse
+from backend.src.agent.contracts.stream_events import coerce_session_key
+from backend.src.constants import RUN_STATUS_RUNNING
 from backend.src.services.llm.llm_client import sse_json
 
 
@@ -61,6 +64,16 @@ async def start_new_mode_run(
     )
 
     events: List[str] = [str(boot.run_created_event)]
+    session_key = coerce_session_key(boot.run_ctx.to_agent_state().get("session_key"))
+    events.append(
+        build_run_status_sse(
+            status=RUN_STATUS_RUNNING,
+            task_id=int(boot.task_id),
+            run_id=int(boot.run_id),
+            stage="retrieval",
+            session_key=session_key,
+        )
+    )
     if isinstance(boot.stage_event, str) and boot.stage_event:
         events.append(str(boot.stage_event))
 

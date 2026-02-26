@@ -6,7 +6,7 @@ resume 场景的模式执行适配器（do / think）。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, List, Optional
 
 from backend.src.agent.core.checkpoint_store import persist_checkpoint_async
 from backend.src.agent.core.plan_structure import PlanStructure
@@ -18,7 +18,11 @@ from backend.src.agent.runner.mode_think_runner import (
     run_think_mode_execution_from_config,
 )
 from backend.src.agent.runner.stream_task_events import iter_stream_task_events
-from backend.src.agent.runner.think_helpers import build_plan_briefs_from_items, create_llm_call_func
+from backend.src.agent.runner.think_helpers import (
+    build_plan_briefs_from_items,
+    create_llm_call_func,
+    create_step_llm_config_resolver,
+)
 from backend.src.agent.runner.think_parallel_loop import run_think_parallel_loop as default_run_think_parallel_loop
 from backend.src.agent.think import create_think_config_from_dict, get_default_think_config
 from backend.src.agent.think.think_execution import _infer_executor_from_allow
@@ -102,19 +106,11 @@ async def iter_resume_mode_execution_events(
             base_parameters=parameters,
         )
 
-        def _resolve_step_llm_config(step_order: int, title: str, allow: List[str]):
-            role = _infer_executor_from_allow(allow or [], title or "")
-            cfg = think_config.get_executor(role) or think_config.get_executor("executor_code")
-            resolved_model = model
-            overrides: Dict = {}
-            if cfg:
-                if isinstance(getattr(cfg, "model", None), str) and str(cfg.model).strip():
-                    resolved_model = str(cfg.model).strip()
-                if getattr(cfg, "temperature", None) is not None:
-                    overrides["temperature"] = float(cfg.temperature)
-                if getattr(cfg, "max_tokens", None) is not None:
-                    overrides["max_tokens"] = int(cfg.max_tokens)
-            return resolved_model, overrides
+        step_llm_config_resolver = create_step_llm_config_resolver(
+            base_model=model,
+            think_config=think_config,
+            role_resolver=lambda _step_order, title, allow: _infer_executor_from_allow(allow or [], title or ""),
+        )
 
         try:
             reflection_count = int(state_obj.get("reflection_count") or 0)
@@ -204,7 +200,7 @@ async def iter_resume_mode_execution_events(
                     observations=observations,
                     think_config=think_config,
                     llm_call_func=llm_call_func,
-                    step_llm_config_resolver=_resolve_step_llm_config,
+                    step_llm_config_resolver=step_llm_config_resolver,
                     yield_func=emit,
                     persist_reflection_plan_func=_persist_reflection_plan,
                     safe_write_debug=safe_write_debug,

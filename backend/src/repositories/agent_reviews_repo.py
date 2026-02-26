@@ -4,10 +4,18 @@ import json
 import sqlite3
 from typing import Any, List, Optional, Sequence
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import dump_json_list, now_iso
 from backend.src.repositories.repo_conn import provide_connection
 
-
+_LEGACY_UNSUPPORTED_PREFIXES = (
+    "pass_score",
+    "pass_threshold",
+    "distill_status",
+    "distill_score",
+    "distill_threshold",
+    "distill_notes",
+    "distill_evidence_refs",
+)
 def create_agent_review_record(
     *,
     task_id: int,
@@ -43,11 +51,11 @@ def create_agent_review_record(
         float(distill_score) if distill_score is not None else None,
         float(distill_threshold) if distill_threshold is not None else None,
         str(distill_notes) if distill_notes is not None else None,
-        json.dumps(list(distill_evidence_refs or []), ensure_ascii=False),
+        dump_json_list(distill_evidence_refs),
         summary,
-        json.dumps(list(issues or []), ensure_ascii=False),
-        json.dumps(list(next_actions or []), ensure_ascii=False),
-        json.dumps(list(skills or []), ensure_ascii=False),
+        dump_json_list(issues),
+        dump_json_list(next_actions),
+        dump_json_list(skills),
         created,
     )
     with provide_connection(conn) as inner:
@@ -71,9 +79,9 @@ def create_agent_review_record(
                     int(run_id),
                     status,
                     summary,
-                    json.dumps(list(issues or []), ensure_ascii=False),
-                    json.dumps(list(next_actions or []), ensure_ascii=False),
-                    json.dumps(list(skills or []), ensure_ascii=False),
+                    dump_json_list(issues),
+                    dump_json_list(next_actions),
+                    dump_json_list(skills),
                     created,
                 )
                 cursor = inner.execute(legacy_sql, legacy_params)
@@ -109,42 +117,41 @@ def update_agent_review_record(
     fields = []
     params: list[Any] = []
 
-    if status is not None:
-        fields.append("status = ?")
-        params.append(str(status))
-    if pass_score is not None:
-        fields.append("pass_score = ?")
-        params.append(float(pass_score))
-    if pass_threshold is not None:
-        fields.append("pass_threshold = ?")
-        params.append(float(pass_threshold))
-    if distill_status is not None:
-        fields.append("distill_status = ?")
-        params.append(str(distill_status))
-    if distill_score is not None:
-        fields.append("distill_score = ?")
-        params.append(float(distill_score))
-    if distill_threshold is not None:
-        fields.append("distill_threshold = ?")
-        params.append(float(distill_threshold))
-    if distill_notes is not None:
-        fields.append("distill_notes = ?")
-        params.append(str(distill_notes))
-    if distill_evidence_refs is not None:
-        fields.append("distill_evidence_refs = ?")
-        params.append(json.dumps(list(distill_evidence_refs or []), ensure_ascii=False))
-    if summary is not None:
-        fields.append("summary = ?")
-        params.append(str(summary))
-    if issues is not None:
-        fields.append("issues = ?")
-        params.append(json.dumps(list(issues or []), ensure_ascii=False))
-    if next_actions is not None:
-        fields.append("next_actions = ?")
-        params.append(json.dumps(list(next_actions or []), ensure_ascii=False))
-    if skills is not None:
-        fields.append("skills = ?")
-        params.append(json.dumps(list(skills or []), ensure_ascii=False))
+    str_updates = [
+        ("status", status),
+        ("distill_status", distill_status),
+        ("distill_notes", distill_notes),
+        ("summary", summary),
+    ]
+    for column, value in str_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(str(value))
+
+    float_updates = [
+        ("pass_score", pass_score),
+        ("pass_threshold", pass_threshold),
+        ("distill_score", distill_score),
+        ("distill_threshold", distill_threshold),
+    ]
+    for column, value in float_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(float(value))
+
+    json_list_updates = [
+        ("distill_evidence_refs", distill_evidence_refs),
+        ("issues", issues),
+        ("next_actions", next_actions),
+        ("skills", skills),
+    ]
+    for column, value in json_list_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(dump_json_list(value))
 
     with provide_connection(conn) as inner:
         if fields:
@@ -162,17 +169,7 @@ def update_agent_review_record(
                     filtered_params: list[Any] = []
                     for f, p in zip(fields, params[:-1]):
                         # 仅保留旧字段（status/summary/issues/next_actions/skills）
-                        if f.startswith(
-                            (
-                                "pass_score",
-                                "pass_threshold",
-                                "distill_status",
-                                "distill_score",
-                                "distill_threshold",
-                                "distill_notes",
-                                "distill_evidence_refs",
-                            )
-                        ):
+                        if f.startswith(_LEGACY_UNSUPPORTED_PREFIXES):
                             continue
                         filtered_fields.append(f)
                         filtered_params.append(p)

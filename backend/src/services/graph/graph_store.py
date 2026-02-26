@@ -5,29 +5,20 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from backend.src.common.utils import atomic_write_text, now_iso
+from backend.src.common.utils import (
+    atomic_write_text,
+    build_json_frontmatter_markdown,
+    coerce_int,
+    discover_markdown_files,
+    now_iso,
+    parse_positive_int,
+    parse_json_dict,
+)
 from backend.src.prompt.paths import graph_prompt_dir
 from backend.src.prompt.skill_files import parse_skill_markdown
 from backend.src.storage import get_connection
 
 logger = logging.getLogger(__name__)
-
-_FRONTMATTER_DELIM = "---"
-
-
-def _build_markdown(meta: Dict[str, Any], body: Optional[str] = None) -> str:
-    """
-    生成 graph Markdown（JSON frontmatter + 正文）。
-
-    说明：
-    - 使用 JSON frontmatter，避免强依赖 PyYAML；
-    - 正文通常为空，仅作为人工补充说明位置。
-    """
-    fm_text = json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True).strip()
-    body_text = str(body or "").rstrip()
-    lines = [_FRONTMATTER_DELIM, fm_text, _FRONTMATTER_DELIM, "", body_text, ""]
-    return "\n".join(lines)
-
 
 def graph_nodes_dir() -> Path:
     return graph_prompt_dir() / "nodes"
@@ -55,28 +46,6 @@ def graph_edge_file_path(edge_id: int) -> Path:
     return graph_edges_dir() / f"{int(edge_id)}.md"
 
 
-def _safe_int(value: Any) -> Optional[int]:
-    try:
-        x = int(value)
-    except Exception:
-        return None
-    return x if x > 0 else None
-
-
-def _safe_json_dict(value: Any) -> Optional[dict]:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            out = json.loads(value)
-            return out if isinstance(out, dict) else None
-        except json.JSONDecodeError:
-            return None
-    return None
-
-
 def publish_graph_node_file(node_id: int, *, conn=None, base_dir: Optional[Path] = None) -> Dict[str, Any]:
     """
     将 graph_nodes 的一条记录写入文件系统（backend/prompt/graph/nodes）。
@@ -94,13 +63,13 @@ def publish_graph_node_file(node_id: int, *, conn=None, base_dir: Optional[Path]
         "label": row["label"],
         "created_at": row["created_at"],
         "node_type": row["node_type"],
-        "attributes": _safe_json_dict(row["attributes"]) if row["attributes"] else None,
+        "attributes": parse_json_dict(row["attributes"]) if row["attributes"] else None,
         "task_id": row["task_id"],
         "evidence": row["evidence"],
     }
     path = _graph_nodes_dir(base_dir) / f"{int(node_id)}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, _build_markdown(meta=meta, body=""), encoding="utf-8")
+    atomic_write_text(path, build_json_frontmatter_markdown(meta=meta, body=""), encoding="utf-8")
     return {"ok": True, "path": str(path)}
 
 
@@ -127,24 +96,8 @@ def publish_graph_edge_file(edge_id: int, *, conn=None, base_dir: Optional[Path]
     }
     path = _graph_edges_dir(base_dir) / f"{int(edge_id)}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, _build_markdown(meta=meta, body=""), encoding="utf-8")
+    atomic_write_text(path, build_json_frontmatter_markdown(meta=meta, body=""), encoding="utf-8")
     return {"ok": True, "path": str(path)}
-
-
-def _discover_markdown_files(base_dir: Path) -> List[Path]:
-    if not base_dir.exists():
-        return []
-    files: List[Path] = []
-    for path in base_dir.rglob("*.md"):
-        if not path.is_file():
-            continue
-        name = path.name.lower()
-        if name in {"readme.md", "_readme.md"}:
-            continue
-        if any(part.startswith(".") for part in path.parts):
-            continue
-        files.append(path)
-    return sorted(files)
 
 
 def _parse_graph_file(path: Path, rel_root: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
@@ -193,9 +146,9 @@ def sync_graph_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
     edge_items: List[Dict[str, Any]] = []
 
     # --- nodes ---
-    for path in _discover_markdown_files(nodes_base):
+    for path in discover_markdown_files(nodes_base):
         # parse 失败也要尽量纳入 discovered（避免误删 DB）
-        stem_id = _safe_int(path.stem)
+        stem_id = parse_positive_int(path.stem, default=None)
         if stem_id:
             discovered_node_ids.add(stem_id)
         meta, _rel, err = _parse_graph_file(path, nodes_base)
@@ -204,15 +157,15 @@ def sync_graph_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
             continue
         if not meta:
             continue
-        node_id = _safe_int(meta.get("id")) or stem_id
+        node_id = parse_positive_int(meta.get("id"), default=None) or stem_id
         if not node_id:
             continue
         discovered_node_ids.add(int(node_id))
         node_items.append({"id": int(node_id), "meta": meta})
 
     # --- edges ---
-    for path in _discover_markdown_files(edges_base):
-        stem_id = _safe_int(path.stem)
+    for path in discover_markdown_files(edges_base):
+        stem_id = parse_positive_int(path.stem, default=None)
         if stem_id:
             discovered_edge_ids.add(stem_id)
         meta, _rel, err = _parse_graph_file(path, edges_base)
@@ -221,7 +174,7 @@ def sync_graph_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
             continue
         if not meta:
             continue
-        edge_id = _safe_int(meta.get("id")) or stem_id
+        edge_id = parse_positive_int(meta.get("id"), default=None) or stem_id
         if not edge_id:
             continue
         discovered_edge_ids.add(int(edge_id))
@@ -266,9 +219,9 @@ def sync_graph_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
                 continue
             created_at = str(meta.get("created_at") or "").strip() or now_iso()
             node_type = str(meta.get("node_type") or meta.get("type") or "").strip() or None
-            attributes = _safe_json_dict(meta.get("attributes"))
+            attributes = parse_json_dict(meta.get("attributes"))
             attributes_value = json.dumps(attributes, ensure_ascii=False) if attributes is not None else None
-            task_id = _safe_int(meta.get("task_id"))
+            task_id = parse_positive_int(meta.get("task_id"), default=None)
             evidence = str(meta.get("evidence") or "").strip() or None
 
             row = conn.execute("SELECT id, created_at FROM graph_nodes WHERE id = ? LIMIT 1", (node_id,)).fetchone()
@@ -292,18 +245,22 @@ def sync_graph_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
         for item in edge_items:
             edge_id = int(item["id"])
             meta = item["meta"]
-            source = _safe_int(meta.get("source"))
-            target = _safe_int(meta.get("target"))
+            source = parse_positive_int(meta.get("source"), default=None)
+            target = parse_positive_int(meta.get("target"), default=None)
             relation = str(meta.get("relation") or "").strip()
             if not source or not target or not relation:
+                continue
+            source_id = coerce_int(source, default=0)
+            target_id = coerce_int(target, default=0)
+            if source_id <= 0 or target_id <= 0:
                 continue
 
             # 若节点不存在，跳过（避免产生悬挂边）
             exists = conn.execute(
                 "SELECT COUNT(*) AS c FROM graph_nodes WHERE id IN (?, ?)",
-                (int(source), int(target)),
+                (source_id, target_id),
             ).fetchone()
-            if not exists or int(exists["c"] or 0) < 2:
+            if not exists or coerce_int(exists["c"], default=0) < 2:
                 continue
 
             created_at = str(meta.get("created_at") or "").strip() or now_iso()
@@ -317,7 +274,7 @@ def sync_graph_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
             row = conn.execute("SELECT id, created_at FROM graph_edges WHERE id = ? LIMIT 1", (edge_id,)).fetchone()
             if row:
                 fields = ["source = ?", "target = ?", "relation = ?", "confidence = ?", "evidence = ?"]
-                params2: List[Any] = [int(source), int(target), relation, confidence_value, evidence]
+                params2: List[Any] = [source_id, target_id, relation, confidence_value, evidence]
                 if created_at and created_at != str(row["created_at"] or ""):
                     fields.append("created_at = ?")
                     params2.append(created_at)
@@ -327,7 +284,7 @@ def sync_graph_from_files(base_dir: Optional[Path] = None, *, prune: bool = True
             else:
                 conn.execute(
                     "INSERT INTO graph_edges (id, source, target, relation, created_at, confidence, evidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (edge_id, int(source), int(target), relation, created_at, confidence_value, evidence),
+                    (edge_id, source_id, target_id, relation, created_at, confidence_value, evidence),
                 )
                 inserted_edges += 1
 

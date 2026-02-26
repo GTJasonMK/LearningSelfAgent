@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Optional, Sequence, Tuple
 
+from backend.src.common.sql import in_clause_placeholders, normalize_non_empty_texts
 from backend.src.common.utils import now_iso
 from backend.src.constants import (
     STATUS_CANCELLED,
@@ -12,6 +13,25 @@ from backend.src.constants import (
     STATUS_WAITING,
 )
 from backend.src.repositories.repo_conn import provide_connection
+
+
+def _stop_tasks(
+    *,
+    from_status: str,
+    to_status: str,
+    task_id: Optional[int],
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    where_clause = "status = ?"
+    params: list[object] = [str(to_status or "")]
+    if task_id is not None:
+        where_clause = "id = ? AND status = ?"
+        params.extend([int(task_id), str(from_status or "")])
+    else:
+        params.append(str(from_status or ""))
+    sql = f"UPDATE tasks SET status = ?, finished_at = NULL WHERE {where_clause}"
+    with provide_connection(conn) as inner:
+        inner.execute(sql, params)
 
 
 def create_task(
@@ -73,10 +93,12 @@ def stop_all_running_tasks(
     """
     批量把 tasks 从 running 类状态收敛到 stopped（任务未完成，不写 finished_at）。
     """
-    sql = "UPDATE tasks SET status = ?, finished_at = NULL WHERE status = ?"
-    params = (str(to_status or ""), str(from_status or ""))
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
+    _stop_tasks(
+        from_status=from_status,
+        to_status=to_status,
+        task_id=None,
+        conn=conn,
+    )
 
 
 def stop_task_if_running(
@@ -86,10 +108,12 @@ def stop_task_if_running(
     to_status: str,
     conn: Optional[sqlite3.Connection] = None,
 ) -> None:
-    sql = "UPDATE tasks SET status = ?, finished_at = NULL WHERE id = ? AND status = ?"
-    params = (str(to_status or ""), int(task_id), str(from_status or ""))
-    with provide_connection(conn) as inner:
-        inner.execute(sql, params)
+    _stop_tasks(
+        from_status=from_status,
+        to_status=to_status,
+        task_id=int(task_id),
+        conn=conn,
+    )
 
 
 def fetch_current_task_title_by_run_statuses(
@@ -101,10 +125,12 @@ def fetch_current_task_title_by_run_statuses(
     """
     以 task_runs.status 为准判断“当前任务”，避免 tasks.status 历史脏数据导致误判。
     """
-    items = [str(s) for s in (statuses or []) if str(s)]
+    items = normalize_non_empty_texts(statuses or [])
     if not items:
         return None
-    placeholders = ",".join(["?"] * len(items))
+    placeholders = in_clause_placeholders(items)
+    if not placeholders:
+        return None
     sql = (
         "SELECT t.title AS title "
         "FROM task_runs r "

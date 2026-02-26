@@ -83,6 +83,24 @@ def _fallback_brief_from_title(title: str, max_len: int = AGENT_PLAN_BRIEF_MAX_C
     return value
 
 
+def sanitize_plan_brief(value: str, *, fallback_title: str = "") -> str:
+    """
+    统一清洗 plan brief，保证 UI 文本稳定可读。
+
+    规则：
+    - 先 trim；为空时可回退到 title 兜底 brief；
+    - 移除空格与中英文冒号；
+    - 截断到 AGENT_PLAN_BRIEF_MAX_CHARS。
+    """
+    text = str(value or "").strip()
+    if not text and fallback_title:
+        text = _fallback_brief_from_title(fallback_title)
+    text = text.replace(" ", "").replace("：", "").replace(":", "")
+    if len(text) > AGENT_PLAN_BRIEF_MAX_CHARS:
+        text = text[:AGENT_PLAN_BRIEF_MAX_CHARS]
+    return text
+
+
 def extract_file_write_target_path(step_title: str) -> str:
     """
     从步骤标题中提取 file_write 的目标路径。
@@ -558,13 +576,7 @@ def apply_next_step_patch(
     }
 
     def _sanitize_brief(value: str) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        text = text.replace(" ", "").replace("：", "").replace(":", "")
-        if len(text) > AGENT_PLAN_BRIEF_MAX_CHARS:
-            text = text[:AGENT_PLAN_BRIEF_MAX_CHARS]
-        return text
+        return sanitize_plan_brief(value)
 
     def _normalize_action_type(value: str) -> Optional[str]:
         normalized = normalize_action_type(str(value or ""))

@@ -11,6 +11,47 @@ from __future__ import annotations
 from backend.src.common.utils import as_bool, parse_json_list, parse_json_value
 
 
+def skill_json_fields_from_row(row) -> dict:
+    """
+    统一解析 skills_items 中的 JSON 列字段。
+    """
+    return {
+        "tags": parse_json_list(row["tags"]),
+        "triggers": parse_json_list(row["triggers"]),
+        "aliases": parse_json_list(row["aliases"]),
+        "prerequisites": parse_json_list(row["prerequisites"]),
+        "inputs": parse_json_list(row["inputs"]),
+        "outputs": parse_json_list(row["outputs"]),
+        "steps": parse_json_list(row["steps"]),
+        "failure_modes": parse_json_list(row["failure_modes"]),
+        "validation": parse_json_list(row["validation"]),
+    }
+
+
+def skill_content_from_row(row) -> dict:
+    """
+    技能主体字段（不含 id/created_at/task_id/Phase2 溯源字段）。
+    """
+    json_fields = skill_json_fields_from_row(row)
+    return {
+        "name": row["name"],
+        "description": row["description"],
+        "scope": row["scope"],
+        "category": row["category"],
+        "tags": json_fields["tags"],
+        "triggers": json_fields["triggers"],
+        "aliases": json_fields["aliases"],
+        "source_path": row["source_path"],
+        "prerequisites": json_fields["prerequisites"],
+        "inputs": json_fields["inputs"],
+        "outputs": json_fields["outputs"],
+        "steps": json_fields["steps"],
+        "failure_modes": json_fields["failure_modes"],
+        "validation": json_fields["validation"],
+        "version": row["version"],
+    }
+
+
 def task_from_row(row) -> dict:
     return {
         "id": row["id"],
@@ -158,24 +199,11 @@ def memory_from_row(row) -> dict:
 
 
 def skill_from_row(row) -> dict:
+    content = skill_content_from_row(row)
     return {
         "id": row["id"],
-        "name": row["name"],
         "created_at": row["created_at"],
-        "description": row["description"],
-        "scope": row["scope"],
-        "category": row["category"],
-        "tags": parse_json_list(row["tags"]),
-        "triggers": parse_json_list(row["triggers"]),
-        "aliases": parse_json_list(row["aliases"]),
-        "source_path": row["source_path"],
-        "prerequisites": parse_json_list(row["prerequisites"]),
-        "inputs": parse_json_list(row["inputs"]),
-        "outputs": parse_json_list(row["outputs"]),
-        "steps": parse_json_list(row["steps"]),
-        "failure_modes": parse_json_list(row["failure_modes"]),
-        "validation": parse_json_list(row["validation"]),
-        "version": row["version"],
+        **content,
         "task_id": row["task_id"],
         # Phase 2：Solution/Skill 统一字段（docs/agent 依赖）
         "domain_id": row["domain_id"],

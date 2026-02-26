@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import threading
+
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+from backend.src.common.task_error_codes import format_task_error
 
 from backend.src.actions.handlers.file_append import execute_file_append
 from backend.src.actions.handlers.file_delete import execute_file_delete
@@ -58,6 +62,22 @@ class ActionTypeSpec:
     validate_payload: Callable[[dict], Optional[str]]
 
 
+def _require_nonempty_string(value: object, error_message: str) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return error_message
+    return None
+
+
+def _validate_optional_string_field(payload: dict, key: str, error_message: str) -> Optional[str]:
+    if key in payload and payload.get(key) is not None and not isinstance(payload.get(key), str):
+        return error_message
+    return None
+
+
+def _validate_required_path_field(payload: dict, action_name: str) -> Optional[str]:
+    return _require_nonempty_string(payload.get("path"), f"{action_name}.path 不能为空")
+
+
 def _validate_llm_call(payload: dict) -> Optional[str]:
     if not str(payload.get("prompt") or "").strip() and payload.get("template_id") is None:
         return "llm_call.prompt 不能为空"
@@ -65,27 +85,20 @@ def _validate_llm_call(payload: dict) -> Optional[str]:
 
 
 def _validate_memory_write(payload: dict) -> Optional[str]:
-    content = payload.get("content")
-    if not isinstance(content, str) or not content.strip():
-        return "memory_write.content 不能为空"
-    return None
+    return _require_nonempty_string(payload.get("content"), "memory_write.content 不能为空")
 
 
 def _validate_task_output(payload: dict) -> Optional[str]:
     # content 允许为空：执行阶段会尝试用 last_llm_response 补齐；如仍为空则由 react_loop 强制重问。
-    if "content" in payload and payload.get("content") is not None and not isinstance(payload.get("content"), str):
-        return "task_output.content 必须是字符串"
-    return None
+    return _validate_optional_string_field(payload, "content", "task_output.content 必须是字符串")
 
 
 def _validate_tool_call(payload: dict) -> Optional[str]:
-    tool_input = payload.get("input")
-    if not isinstance(tool_input, str) or not tool_input.strip():
-        return "tool_call.input 不能为空"
+    input_error = _require_nonempty_string(payload.get("input"), "tool_call.input 不能为空")
+    if input_error:
+        return input_error
     # output 允许为空：执行器会在运行时尝试执行工具并填充 output
-    if "output" in payload and payload.get("output") is not None and not isinstance(payload.get("output"), str):
-        return "tool_call.output 必须是字符串"
-    return None
+    return _validate_optional_string_field(payload, "output", "tool_call.output 必须是字符串")
 
 
 def _validate_shell_command(payload: dict) -> Optional[str]:
@@ -109,64 +122,64 @@ def _validate_shell_command(payload: dict) -> Optional[str]:
 
 
 def _validate_file_write(payload: dict) -> Optional[str]:
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        return "file_write.path 不能为空"
+    path_error = _validate_required_path_field(payload, "file_write")
+    if path_error:
+        return path_error
     # content 允许为空/缺失：执行器会把 None 视为 ""，但若提供则必须是字符串类型
-    if "content" in payload and payload.get("content") is not None and not isinstance(payload.get("content"), str):
-        return "file_write.content 必须是字符串"
-    return None
+    return _validate_optional_string_field(payload, "content", "file_write.content 必须是字符串")
 
 
 def _validate_file_read(payload: dict) -> Optional[str]:
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        return "file_read.path 不能为空"
-    return None
+    return _validate_required_path_field(payload, "file_read")
 
 
 def _validate_http_request(payload: dict) -> Optional[str]:
-    url = payload.get("url")
-    if not isinstance(url, str) or not url.strip():
-        return "http_request.url 不能为空"
+    url_error = _require_nonempty_string(payload.get("url"), "http_request.url 不能为空")
+    if url_error:
+        return url_error
+    fallback_urls = payload.get("fallback_urls")
+    if fallback_urls is not None:
+        if isinstance(fallback_urls, str):
+            if not fallback_urls.strip():
+                return "http_request.fallback_urls 不能为空字符串"
+        elif isinstance(fallback_urls, list):
+            if not fallback_urls:
+                return "http_request.fallback_urls 不能为空数组"
+            for idx, item in enumerate(fallback_urls):
+                if not isinstance(item, str) or not item.strip():
+                    return f"http_request.fallback_urls[{idx}] 不能为空字符串"
+        else:
+            return "http_request.fallback_urls 必须是字符串或字符串数组"
+    strict_status_code = payload.get("strict_status_code")
+    if strict_status_code is not None and not isinstance(strict_status_code, bool):
+        return "http_request.strict_status_code 必须是布尔值"
     return None
 
 
 def _validate_file_append(payload: dict) -> Optional[str]:
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        return "file_append.path 不能为空"
+    path_error = _validate_required_path_field(payload, "file_append")
+    if path_error:
+        return path_error
     # content 允许为空/缺失：执行器会把 None 视为 ""，但若提供则必须是字符串类型
-    if "content" in payload and payload.get("content") is not None and not isinstance(payload.get("content"), str):
-        return "file_append.content 必须是字符串"
-    return None
+    return _validate_optional_string_field(payload, "content", "file_append.content 必须是字符串")
 
 
 def _validate_file_list(payload: dict) -> Optional[str]:
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        return "file_list.path 不能为空"
-    return None
+    return _validate_required_path_field(payload, "file_list")
 
 
 def _validate_file_delete(payload: dict) -> Optional[str]:
-    path = payload.get("path")
-    if not isinstance(path, str) or not path.strip():
-        return "file_delete.path 不能为空"
-    return None
+    return _validate_required_path_field(payload, "file_delete")
 
 
 def _validate_json_parse(payload: dict) -> Optional[str]:
-    text = payload.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return "json_parse.text 不能为空"
-    return None
+    return _require_nonempty_string(payload.get("text"), "json_parse.text 不能为空")
 
 
 def _validate_user_prompt(payload: dict) -> Optional[str]:
-    question = payload.get("question")
-    if not isinstance(question, str) or not question.strip():
-        return "user_prompt.question 不能为空"
+    question_error = _require_nonempty_string(payload.get("question"), "user_prompt.question 不能为空")
+    if question_error:
+        return question_error
 
     if "kind" in payload and payload.get("kind") is not None:
         kind = payload.get("kind")
@@ -340,18 +353,47 @@ def _exec_user_prompt(task_id: int, run_id: int, step_row: dict, payload: dict, 
 
 _SPECS: Dict[str, ActionTypeSpec] = {}
 _ALIASES: Dict[str, str] = {}
+_REGISTRY_FROZEN = False
+_REGISTRY_LOCK = threading.Lock()
+_PAYLOAD_REQUIRED_KEYS: Dict[str, Set[str]] = {
+    ACTION_TYPE_MEMORY_WRITE: {"content"},
+    ACTION_TYPE_FILE_READ: {"path"},
+    ACTION_TYPE_FILE_LIST: {"path"},
+    ACTION_TYPE_FILE_DELETE: {"path"},
+    ACTION_TYPE_USER_PROMPT: {"question"},
+}
+_PAYLOAD_REQUIRED_ONE_OF_KEYS: Dict[str, List[List[str]]] = {
+    ACTION_TYPE_LLM_CALL: [["prompt", "template_id"]],
+    ACTION_TYPE_TASK_OUTPUT: [["content", "run_id"]],
+    ACTION_TYPE_TOOL_CALL: [["tool_id", "tool_name"], ["input"]],
+    ACTION_TYPE_SHELL_COMMAND: [["command"], ["workdir"]],
+    ACTION_TYPE_HTTP_REQUEST: [["url"]],
+    ACTION_TYPE_FILE_WRITE: [["path"]],
+    ACTION_TYPE_FILE_APPEND: [["path"]],
+    ACTION_TYPE_JSON_PARSE: [["text"]],
+}
 
 
 def register_action_type(spec: ActionTypeSpec) -> None:
     key = str(spec.action_type or "").strip()
     if not key:
         return
-    _SPECS[key] = spec
-    for alias in spec.aliases or set():
-        value = str(alias or "").strip()
-        if not value:
-            continue
-        _ALIASES[value] = key
+    with _REGISTRY_LOCK:
+        if _REGISTRY_FROZEN:
+            raise RuntimeError(f"注册表已冻结，无法注册新 action 类型: {key}")
+        _SPECS[key] = spec
+        for alias in spec.aliases or set():
+            value = str(alias or "").strip()
+            if not value:
+                continue
+            _ALIASES[value] = key
+
+
+def _freeze_registry() -> None:
+    """冻结注册表，之后不再允许新增注册。运行时只读访问无需加锁。"""
+    global _REGISTRY_FROZEN
+    with _REGISTRY_LOCK:
+        _REGISTRY_FROZEN = True
 
 
 def normalize_action_type(value: str) -> Optional[str]:
@@ -404,6 +446,80 @@ def action_types_line() -> str:
     return " / ".join(list_action_types())
 
 
+def action_payload_keys_guide() -> str:
+    """
+    返回运行时权威的 action payload 字段白名单说明。
+
+    用途：
+    - 注入到 ReAct 提示词，减少“提示词示例字段”与执行白名单漂移；
+    - 提升模型在新增字段（如 http_request.fallback_urls）时的命中率。
+    """
+    lines: List[str] = []
+    for action_type in list_action_types():
+        spec = get_action_spec(action_type)
+        if not spec:
+            continue
+        keys = sorted(str(k) for k in (spec.allowed_payload_keys or set()) if str(k).strip())
+        keys_text = ", ".join(keys) if keys else "(无)"
+        lines.append(f"- {action_type}: {keys_text}")
+    return "\n".join(lines) if lines else "(无)"
+
+
+def export_action_contract_schema() -> Dict[str, object]:
+    """
+    导出运行时 action 契约（JSON Schema 2020-12）。
+
+    说明：
+    - `additionalProperties=false` 由白名单驱动，避免字段漂移；
+    - `x-required-one-of` 为扩展约束（Schema 原生难以直接表达“二选一”可读规则）。
+    """
+    payload_defs: Dict[str, dict] = {}
+    action_one_of: List[dict] = []
+    for action_type in list_action_types():
+        spec = get_action_spec(action_type)
+        if not spec:
+            continue
+        allowed_keys = sorted(str(key) for key in (spec.allowed_payload_keys or set()) if str(key).strip())
+        required_keys = sorted(
+            key for key in (_PAYLOAD_REQUIRED_KEYS.get(action_type) or set()) if key in set(allowed_keys)
+        )
+        payload_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {key: {} for key in allowed_keys},
+            "required": required_keys,
+            "x-required-one-of": list(_PAYLOAD_REQUIRED_ONE_OF_KEYS.get(action_type) or []),
+            "x-aliases": sorted(str(alias) for alias in (spec.aliases or set()) if str(alias).strip()),
+        }
+        payload_defs[action_type] = payload_schema
+        action_one_of.append(
+            {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["type", "payload"],
+                        "properties": {
+                            "type": {"const": action_type},
+                            "payload": {"$ref": f"#/$defs/payloads/{action_type}"},
+                        },
+                    }
+                },
+            }
+        )
+
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "AgentActionContract",
+        "type": "object",
+        "description": "Agent ReAct action object contract",
+        "$defs": {"payloads": payload_defs},
+        "oneOf": action_one_of,
+    }
+
+
 def validate_action_object(action_obj: dict) -> Optional[str]:
     """
     统一校验 ReAct action 结构：
@@ -416,6 +532,12 @@ def validate_action_object(action_obj: dict) -> Optional[str]:
         return "缺少 action"
     action_type = normalize_action_type(action.get("type"))
     if not action_type:
+        raw_type = str(action.get("type") or "").strip().lower().replace("-", "_")
+        if raw_type == "plan_patch":
+            return format_task_error(
+                code="plan_patch_not_action",
+                message="action.type 非法: plan_patch（plan_patch 不是可执行的 action，请输出可执行的 action）",
+            )
         return f"action.type 非法: {action.get('type')}"
     payload = action.get("payload")
     if not isinstance(payload, dict):
@@ -515,6 +637,8 @@ def _register_builtin_specs() -> None:
                 "encoding",
                 "max_bytes",
                 "strict_business_success",
+                "strict_status_code",
+                "fallback_urls",
             },
             aliases={"http", "http_request", "request"},
             executor=_exec_http_request,
@@ -587,3 +711,4 @@ def _register_builtin_specs() -> None:
 
 
 _register_builtin_specs()
+_freeze_registry()

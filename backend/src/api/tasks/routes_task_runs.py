@@ -2,48 +2,44 @@ from fastapi import APIRouter
 
 from backend.src.api.schemas import TaskRunCreate, TaskRunUpdate
 from backend.src.common.serializers import task_run_from_row
-from backend.src.api.utils import ensure_write_permission, error_response, now_iso
+from backend.src.api.utils import (
+    clamp_non_negative_int,
+    clamp_page_limit,
+    now_iso,
+    require_write_permission,
+)
+from backend.src.api.tasks.route_common import (
+    ensure_task_exists_or_error,
+    record_not_found_response,
+)
 from backend.src.constants import (
     DEFAULT_PAGE_LIMIT,
     DEFAULT_PAGE_OFFSET,
-    ERROR_CODE_NOT_FOUND,
-    ERROR_MESSAGE_RECORD_NOT_FOUND,
-    ERROR_MESSAGE_TASK_NOT_FOUND,
-    HTTP_STATUS_NOT_FOUND,
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
     RUN_STATUS_PLANNED,
     RUN_STATUS_RUNNING,
     RUN_STATUS_STOPPED,
-    RUN_STATUS_WAITING,
 )
-from backend.src.repositories.task_runs_repo import (
-    create_task_run as create_task_run_record,
-    get_task_run as repo_get_task_run,
-    list_task_runs as list_task_runs_repo,
-    update_task_run as update_task_run_repo,
-)
-from backend.src.repositories.tasks_repo import task_exists
+from backend.src.services.tasks.task_queries import create_task_run as create_task_run_record
+from backend.src.services.tasks.task_queries import get_task_run as repo_get_task_run
+from backend.src.services.tasks.task_queries import list_task_runs as list_task_runs_repo
+from backend.src.services.tasks.task_queries import update_task_run as update_task_run_repo
 
 router = APIRouter()
 
 
 @router.post("/tasks/{task_id}/runs")
+@require_write_permission
 def create_task_run(task_id: int, payload: TaskRunCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     created_at = now_iso()
     updated_at = created_at
     status = payload.status or RUN_STATUS_PLANNED
     started_at = created_at if status == RUN_STATUS_RUNNING else None
     finished_at = created_at if status in {RUN_STATUS_DONE, RUN_STATUS_FAILED, RUN_STATUS_STOPPED} else None
-    if not task_exists(task_id=task_id):
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+    task_exists_error = ensure_task_exists_or_error(task_id=task_id)
+    if task_exists_error:
+        return task_exists_error
     run_id, _created, _updated = create_task_run_record(
         task_id=task_id,
         status=status,
@@ -63,13 +59,12 @@ def list_task_runs(
     offset: int = DEFAULT_PAGE_OFFSET,
     limit: int = DEFAULT_PAGE_LIMIT,
 ) -> dict:
-    if not task_exists(task_id=task_id):
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
-    rows = list_task_runs_repo(task_id=task_id, offset=offset, limit=limit)
+    task_exists_error = ensure_task_exists_or_error(task_id=task_id)
+    if task_exists_error:
+        return task_exists_error
+    safe_offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
+    rows = list_task_runs_repo(task_id=task_id, offset=safe_offset, limit=safe_limit)
     return {"items": [task_run_from_row(row) for row in rows]}
 
 
@@ -77,19 +72,13 @@ def list_task_runs(
 def get_task_run(run_id: int):
     row = repo_get_task_run(run_id=run_id)
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_RECORD_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return record_not_found_response()
     return {"run": task_run_from_row(row)}
 
 
 @router.patch("/tasks/runs/{run_id}")
+@require_write_permission
 def update_task_run(run_id: int, payload: TaskRunUpdate):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     updated_at = now_iso()
     row = update_task_run_repo(
         run_id=run_id,
@@ -98,9 +87,5 @@ def update_task_run(run_id: int, payload: TaskRunUpdate):
         updated_at=updated_at,
     )
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_RECORD_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return record_not_found_response()
     return {"run": task_run_from_row(row)}

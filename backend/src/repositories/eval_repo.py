@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from backend.src.common.sql import in_clause_placeholders
 from backend.src.common.utils import now_iso
 from backend.src.repositories.repo_conn import provide_connection
 
@@ -108,7 +109,9 @@ def list_eval_criteria_by_eval_ids(
     ids = [int(i) for i in (eval_ids or []) if i is not None]
     if not ids:
         return []
-    placeholders = ",".join(["?"] * len(ids))
+    placeholders = in_clause_placeholders(ids)
+    if not placeholders:
+        return []
     sql = f"SELECT * FROM eval_criteria_records WHERE eval_id IN ({placeholders}) ORDER BY id ASC"
     with provide_connection(conn) as inner:
         return list(inner.execute(sql, ids).fetchall())

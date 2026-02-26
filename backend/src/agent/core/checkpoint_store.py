@@ -5,7 +5,7 @@ import time
 from typing import Callable, Optional
 
 from backend.src.common.utils import now_iso
-from backend.src.repositories.task_runs_repo import update_task_run
+from backend.src.services.tasks.task_queries import update_task_run
 
 
 def persist_checkpoint(

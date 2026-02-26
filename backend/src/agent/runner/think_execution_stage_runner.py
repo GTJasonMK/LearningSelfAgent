@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional
 
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.core.run_context import AgentRunContext
@@ -11,7 +11,9 @@ from backend.src.agent.runner.mode_think_runner import (
     build_inferred_parallel_dependencies,
     run_think_mode_execution_from_config,
 )
+from backend.src.agent.runner.capability_router import resolve_executor_role_by_capability, resolve_step_capability
 from backend.src.agent.runner.stream_task_events import iter_stream_task_events
+from backend.src.agent.runner.think_helpers import create_step_llm_config_resolver
 from backend.src.agent.think import infer_executor_assignments
 from backend.src.agent.think.think_execution import _infer_executor_from_allow, build_executor_assignments_payload
 from backend.src.constants import (
@@ -124,20 +126,17 @@ async def iter_think_execution_stage_events(
     think_config = config.think_config
     base_model = str(config.model or "")
 
-    def _resolve_step_llm_config(step_order: int, title: str, allow: List[str]):
-        role = _infer_executor_from_allow(allow or [], title or "")
-        exec_cfg = think_config.get_executor(role) or think_config.get_executor("executor_code")
-
-        resolved_model = base_model
-        overrides: Dict = {}
-        if exec_cfg:
-            if isinstance(getattr(exec_cfg, "model", None), str) and str(exec_cfg.model).strip():
-                resolved_model = str(exec_cfg.model).strip()
-            if getattr(exec_cfg, "temperature", None) is not None:
-                overrides["temperature"] = float(exec_cfg.temperature)
-            if getattr(exec_cfg, "max_tokens", None) is not None:
-                overrides["max_tokens"] = int(exec_cfg.max_tokens)
-        return resolved_model, overrides
+    step_llm_config_resolver = create_step_llm_config_resolver(
+        base_model=base_model,
+        think_config=think_config,
+        role_resolver=lambda _step_order, title, allow: resolve_executor_role_by_capability(
+            capability=resolve_step_capability(
+                allowed_actions=list(allow or []),
+                step_title=title or "",
+            ),
+            fallback_role=_infer_executor_from_allow(allow or [], title or ""),
+        ),
+    )
 
     base_dependencies = list(config.base_dependencies or []) if isinstance(config.base_dependencies, list) else None
 
@@ -203,7 +202,7 @@ async def iter_think_execution_stage_events(
                 observations=observations,
                 think_config=think_config,
                 llm_call_func=config.llm_call_func,
-                step_llm_config_resolver=_resolve_step_llm_config,
+                step_llm_config_resolver=step_llm_config_resolver,
                 yield_func=emit,
                 persist_reflection_plan_func=_persist_reflection_plan,
                 safe_write_debug=config.safe_write_debug,

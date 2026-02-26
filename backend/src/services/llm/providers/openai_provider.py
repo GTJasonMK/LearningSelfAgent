@@ -17,6 +17,15 @@ from backend.src.services.llm.providers.base import LLMProvider
 logger = logging.getLogger(__name__)
 
 
+def _sdk_missing_error(exc: Exception) -> AppError:
+    return AppError(
+        code=ERROR_CODE_INVALID_REQUEST,
+        message=ERROR_MESSAGE_LLM_SDK_MISSING,
+        status_code=HTTP_STATUS_BAD_REQUEST,
+        details={"error": str(exc)},
+    )
+
+
 class OpenAIProvider(LLMProvider):
     """
     OpenAI Provider 实现。
@@ -36,12 +45,7 @@ class OpenAIProvider(LLMProvider):
         try:
             from openai import OpenAI
         except Exception as exc:
-            raise AppError(
-                code=ERROR_CODE_INVALID_REQUEST,
-                message=ERROR_MESSAGE_LLM_SDK_MISSING,
-                status_code=HTTP_STATUS_BAD_REQUEST,
-                details={"error": str(exc)},
-            ) from exc
+            raise _sdk_missing_error(exc) from exc
 
         # 同步 client：用于非流式（避免在 sync 路由里 asyncio.run 反复创建/销毁事件循环）
         self._sync_client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
@@ -54,18 +58,43 @@ class OpenAIProvider(LLMProvider):
         try:
             from openai import AsyncOpenAI
         except Exception as exc:
-            raise AppError(
-                code=ERROR_CODE_INVALID_REQUEST,
-                message=ERROR_MESSAGE_LLM_SDK_MISSING,
-                status_code=HTTP_STATUS_BAD_REQUEST,
-                details={"error": str(exc)},
-            ) from exc
+            raise _sdk_missing_error(exc) from exc
         self._async_client = (
             AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
             if self._base_url
             else AsyncOpenAI(api_key=self._api_key)
         )
         return self._async_client
+
+    @staticmethod
+    def _normalize_chat_completions_params(parameters: Optional[dict]) -> dict:
+        """
+        统一归一化 chat.completions 参数，避免不同 OpenAI 兼容实现间的字段差异导致调用失败。
+
+        约定：
+        - 优先使用 `max_tokens`；
+        - 若仅提供 `max_output_tokens`，自动映射到 `max_tokens`；
+        - 过滤值为 None 的键，减少 SDK 参数校验噪声。
+        """
+        raw = dict(parameters or {})
+
+        if raw.get("max_tokens") is None and raw.get("max_output_tokens") is not None:
+            max_output_tokens = raw.pop("max_output_tokens")
+            try:
+                max_tokens = int(max_output_tokens)
+            except Exception:
+                max_tokens = None
+            if isinstance(max_tokens, int) and max_tokens > 0:
+                raw["max_tokens"] = max_tokens
+        else:
+            raw.pop("max_output_tokens", None)
+
+        normalized: dict = {}
+        for key, value in raw.items():
+            if value is None:
+                continue
+            normalized[str(key)] = value
+        return normalized
 
     async def aclose(self) -> None:
         client = self._async_client
@@ -92,7 +121,7 @@ class OpenAIProvider(LLMProvider):
     ) -> AsyncGenerator[Dict[str, Any], None]:
         request_id = str(uuid.uuid4())[:8]
         actual_model = model or self._default_model
-        params = parameters or {}
+        params = self._normalize_chat_completions_params(parameters)
 
         collected = ""
         chunk_count = 0
@@ -147,7 +176,7 @@ class OpenAIProvider(LLMProvider):
         timeout: int,
     ) -> Tuple[str, Optional[dict]]:
         actual_model = model or self._default_model
-        params = parameters or {}
+        params = self._normalize_chat_completions_params(parameters)
         try:
             resp = self._sync_client.with_options(timeout=float(timeout)).chat.completions.create(
                 model=actual_model,
@@ -180,7 +209,7 @@ class OpenAIProvider(LLMProvider):
         timeout: int,
     ) -> Tuple[str, Optional[dict]]:
         actual_model = model or self._default_model
-        params = parameters or {}
+        params = self._normalize_chat_completions_params(parameters)
         try:
             client = self._get_async_client()
             resp = await client.with_options(timeout=float(timeout)).chat.completions.create(

@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import now_iso, parse_json_dict, tool_is_draft
 from backend.src.repositories.repo_conn import provide_connection
 
 
@@ -38,14 +38,25 @@ def get_tool(*, tool_id: int, conn: Optional[sqlite3.Connection] = None) -> Opti
         return inner.execute(sql, params).fetchone()
 
 
+def _parse_metadata_dict(metadata_text: Optional[str]) -> Optional[dict]:
+    return parse_json_dict(metadata_text)
+
+
+def _dump_metadata_json(metadata: Optional[dict]) -> Optional[str]:
+    if metadata is None:
+        return None
+    return json.dumps(metadata, ensure_ascii=False)
+
+
+def _metadata_from_tool_row(row) -> Optional[dict]:
+    if not row:
+        return None
+    return _parse_metadata_dict(row["metadata"])
+
+
 def _exec_supports_input(metadata_text: Optional[str]) -> bool:
-    if not metadata_text:
-        return False
-    try:
-        meta = json.loads(metadata_text)
-    except Exception:
-        return False
-    if not isinstance(meta, dict):
+    meta = _parse_metadata_dict(metadata_text)
+    if not meta:
         return False
     exec_spec = meta.get("exec")
     if not isinstance(exec_spec, dict):
@@ -72,18 +83,7 @@ def _tool_is_draft(metadata_text: Optional[str]) -> bool:
     - Agent 执行阶段创建的新工具默认是 draft（待评估通过后再批准）；
     - draft 工具不应优先进入后续任务的 tools_hint，否则容易把“未验证/不稳定工具”当成默认依赖。
     """
-    if not metadata_text:
-        return False
-    try:
-        meta = json.loads(metadata_text)
-    except Exception:
-        return False
-    if not isinstance(meta, dict):
-        return False
-    approval = meta.get("approval")
-    if not isinstance(approval, dict):
-        return False
-    return str(approval.get("status") or "").strip().lower() == "draft"
+    return tool_is_draft(metadata_text)
 
 
 def get_tool_by_name(*, name: str, conn: Optional[sqlite3.Connection] = None) -> Optional[sqlite3.Row]:
@@ -113,24 +113,12 @@ def get_tool_by_name(*, name: str, conn: Optional[sqlite3.Connection] = None) ->
 
 def get_tool_metadata_by_id(*, tool_id: int, conn: Optional[sqlite3.Connection] = None) -> Optional[dict]:
     row = get_tool(tool_id=int(tool_id), conn=conn)
-    if not row or not row["metadata"]:
-        return None
-    try:
-        meta = json.loads(row["metadata"])
-        return meta if isinstance(meta, dict) else None
-    except Exception:
-        return None
+    return _metadata_from_tool_row(row)
 
 
 def get_tool_metadata_by_name(*, name: str, conn: Optional[sqlite3.Connection] = None) -> Optional[dict]:
     row = get_tool_by_name(name=str(name or ""), conn=conn)
-    if not row or not row["metadata"]:
-        return None
-    try:
-        meta = json.loads(row["metadata"])
-        return meta if isinstance(meta, dict) else None
-    except Exception:
-        return None
+    return _metadata_from_tool_row(row)
 
 
 def tool_exists(*, tool_id: int, conn: Optional[sqlite3.Connection] = None) -> bool:
@@ -145,7 +133,7 @@ def create_tool(params: ToolCreateParams, *, conn: Optional[sqlite3.Connection] 
     created = params.created_at or now_iso()
     updated = params.updated_at or created
     last_used = params.last_used_at or created
-    metadata_value = json.dumps(params.metadata, ensure_ascii=False) if params.metadata else None
+    metadata_value = _dump_metadata_json(params.metadata)
     sql = (
         "INSERT INTO tools_items (name, description, version, created_at, updated_at, last_used_at, metadata, source_path) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -188,21 +176,20 @@ def update_tool(
 
         fields: List[str] = []
         params: List[Any] = []
-        if name is not None:
-            fields.append("name = ?")
-            params.append(name)
-        if description is not None:
-            fields.append("description = ?")
-            params.append(description)
-        if version is not None:
-            fields.append("version = ?")
-            params.append(version)
+        plain_updates: List[Tuple[str, Optional[str]]] = [
+            ("name", name),
+            ("description", description),
+            ("version", version),
+            ("source_path", source_path),
+        ]
+        for column, value in plain_updates:
+            if value is None:
+                continue
+            fields.append(f"{column} = ?")
+            params.append(value)
         if metadata is not None:
             fields.append("metadata = ?")
-            params.append(json.dumps(metadata, ensure_ascii=False))
-        if source_path is not None:
-            fields.append("source_path = ?")
-            params.append(source_path)
+            params.append(_dump_metadata_json(metadata))
 
         previous_version = row["version"]
         next_version = version if version is not None else previous_version

@@ -5,10 +5,14 @@ from typing import Callable, Generator, List, Optional
 from backend.src.agent.core.plan_coordinator import PlanCoordinator
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.planning_phase import PlanPhaseFailure, run_replan_phase
-from backend.src.agent.runner.feedback import append_task_feedback_step, is_task_feedback_step_title
+from backend.src.agent.runner.feedback import (
+    canonicalize_task_feedback_steps,
+    canonicalized_feedback_meta,
+    is_task_feedback_step_title,
+)
 from backend.src.common.utils import now_iso
 from backend.src.services.llm.llm_client import sse_json
-from backend.src.repositories.task_runs_repo import update_task_run
+from backend.src.services.tasks.task_queries import update_task_run
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +85,7 @@ def run_replan_and_merge(
             workdir=workdir,
             model=model,
             parameters=react_params,
-            max_steps=int(max_steps_value),
+            max_steps=max_steps_value,
             tools_hint=tools_hint,
             skills_hint=skills_hint,
             solutions_hint=solutions_hint_value,
@@ -92,6 +96,11 @@ def run_replan_and_merge(
             done_steps=done_steps,
             error=str(error or ""),
             observations=replan_observations,
+            failure_signatures=(
+                agent_state.get("failure_signatures")
+                if isinstance(agent_state, dict) and isinstance(agent_state.get("failure_signatures"), dict)
+                else None
+            ),
         )
     except PlanPhaseFailure as exc:
         safe_write_debug(
@@ -128,27 +137,42 @@ def run_replan_and_merge(
     had_feedback_step = any(is_task_feedback_step_title(s.title) for s in plan_struct.steps)
     has_feedback_after_replan = any(is_task_feedback_step_title(s.title) for s in merged_plan.steps)
     feedback_asked = bool(agent_state.get("task_feedback_asked")) if isinstance(agent_state, dict) else False
-    if had_feedback_step and (not feedback_asked) and (not has_feedback_after_replan):
-        # append_task_feedback_step 仍使用 legacy 列表接口（后续可进一步收编）
+    if had_feedback_step or has_feedback_after_replan:
+        # Replan 产物规范化：反馈步骤只能由编排层控制，且最多保留一个尾部步骤。
         new_titles, new_items, new_allows, new_artifacts = merged_plan.to_legacy_lists()
-        restored = append_task_feedback_step(
+        canonicalized = canonicalize_task_feedback_steps(
             plan_titles=new_titles,
             plan_items=new_items,
             plan_allows=new_allows,
+            keep_single_tail=bool(had_feedback_step),
+            feedback_asked=bool(feedback_asked),
             max_steps=None,
         )
-        if restored:
-            merged_plan = PlanStructure.from_legacy(
-                plan_titles=new_titles,
-                plan_items=new_items,
-                plan_allows=new_allows,
-                plan_artifacts=new_artifacts,
-            )
+        feedback_meta = canonicalized_feedback_meta(canonicalized)
+        merged_plan = PlanStructure.from_legacy(
+            plan_titles=new_titles,
+            plan_items=new_items,
+            plan_allows=new_allows,
+            plan_artifacts=new_artifacts,
+        )
+        if feedback_meta["appended"]:
             safe_write_debug(
                 task_id=int(task_id),
                 run_id=int(run_id),
                 message="agent.replan.feedback_step_restored",
                 data={"done_count": int(done_count), "plan_len": merged_plan.step_count},
+                level="info",
+            )
+        if feedback_meta["removed"] > 0:
+            safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.replan.feedback_step_dedup",
+                data={
+                    "removed": feedback_meta["removed"],
+                    "found": feedback_meta["found"],
+                    "feedback_asked": bool(feedback_asked),
+                },
                 level="info",
             )
 

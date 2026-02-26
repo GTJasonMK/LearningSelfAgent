@@ -4,50 +4,44 @@ from fastapi import APIRouter
 
 from backend.src.api.schemas import TaskStepCreate, TaskStepUpdate
 from backend.src.common.serializers import task_step_from_row
-from backend.src.api.utils import ensure_write_permission, error_response, now_iso
+from backend.src.api.utils import (
+    clamp_non_negative_int,
+    clamp_page_limit,
+    error_response,
+    now_iso,
+    require_write_permission,
+)
 from backend.src.constants import (
     DEFAULT_PAGE_LIMIT,
     DEFAULT_PAGE_OFFSET,
     ERROR_CODE_INVALID_REQUEST,
-    ERROR_CODE_NOT_FOUND,
     ERROR_MESSAGE_INVALID_STATUS,
-    ERROR_MESSAGE_TASK_NOT_FOUND,
-    ERROR_MESSAGE_TASK_STEP_NOT_FOUND,
     HTTP_STATUS_BAD_REQUEST,
-    HTTP_STATUS_NOT_FOUND,
-    STEP_STATUS_DONE,
-    STEP_STATUS_FAILED,
     STEP_STATUS_PLANNED,
-    STEP_STATUS_RUNNING,
-    STEP_STATUS_SKIPPED,
-    STEP_STATUS_WAITING,
 )
-from backend.src.repositories.task_steps_repo import (
-    TaskStepCreateParams,
-    create_task_step as create_task_step_repo,
-    get_task_step as get_task_step_repo,
-    list_task_steps as list_task_steps_repo,
-    update_task_step as update_task_step_repo,
+from backend.src.api.tasks.route_common import (
+    ensure_task_exists_or_error,
+    is_valid_task_step_status,
+    task_step_not_found_response,
 )
-from backend.src.repositories.tasks_repo import task_exists
+from backend.src.services.tasks.task_queries import TaskStepCreateParams
+from backend.src.services.tasks.task_queries import create_task_step as create_task_step_repo
+from backend.src.services.tasks.task_queries import get_task_step as get_task_step_repo
+from backend.src.services.tasks.task_queries import list_task_steps as list_task_steps_repo
+from backend.src.services.tasks.task_queries import update_task_step as update_task_step_repo
 
 router = APIRouter()
 
 
 @router.post("/tasks/{task_id}/steps")
+@require_write_permission
 def create_task_step(task_id: int, payload: TaskStepCreate) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     created_at = now_iso()
     updated_at = created_at
     status = payload.status or STEP_STATUS_PLANNED
-    if not task_exists(task_id=task_id):
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+    task_exists_error = ensure_task_exists_or_error(task_id=task_id)
+    if task_exists_error:
+        return task_exists_error
     step_id, _created, _updated = create_task_step_repo(
         TaskStepCreateParams(
             task_id=task_id,
@@ -76,13 +70,17 @@ def list_task_steps(
     offset: int = DEFAULT_PAGE_OFFSET,
     limit: int = DEFAULT_PAGE_LIMIT,
 ) -> dict:
-    if not task_exists(task_id=task_id):
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
-    rows = list_task_steps_repo(task_id=task_id, run_id=run_id, offset=offset, limit=limit)
+    task_exists_error = ensure_task_exists_or_error(task_id=task_id)
+    if task_exists_error:
+        return task_exists_error
+    safe_offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
+    rows = list_task_steps_repo(
+        task_id=task_id,
+        run_id=run_id,
+        offset=safe_offset,
+        limit=safe_limit,
+    )
     return {"items": [task_step_from_row(row) for row in rows]}
 
 
@@ -90,29 +88,15 @@ def list_task_steps(
 def get_task_step(step_id: int):
     row = get_task_step_repo(step_id=step_id)
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_STEP_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return task_step_not_found_response()
     return {"step": task_step_from_row(row)}
 
 
 @router.patch("/tasks/steps/{step_id}")
+@require_write_permission
 def update_task_step(step_id: int, payload: TaskStepUpdate):
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     updated_at = now_iso()
-    allowed_statuses = {
-        STEP_STATUS_PLANNED,
-        STEP_STATUS_RUNNING,
-        STEP_STATUS_WAITING,
-        STEP_STATUS_DONE,
-        STEP_STATUS_FAILED,
-        STEP_STATUS_SKIPPED,
-    }
-    if payload.status is not None and payload.status not in allowed_statuses:
+    if payload.status is not None and not is_valid_task_step_status(payload.status):
         return error_response(
             ERROR_CODE_INVALID_REQUEST,
             ERROR_MESSAGE_INVALID_STATUS,
@@ -130,9 +114,5 @@ def update_task_step(step_id: int, payload: TaskStepUpdate):
         updated_at=updated_at,
     )
     if not row:
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_STEP_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+        return task_step_not_found_response()
     return {"step": task_step_from_row(row)}

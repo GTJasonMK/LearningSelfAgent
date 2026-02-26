@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from dataclasses import dataclass
@@ -9,7 +10,8 @@ from typing import Callable, List, Optional, Tuple
 from backend.src.agent.core.run_context import AgentRunContext
 from backend.src.agent.core.checkpoint_store import persist_checkpoint_async
 from backend.src.agent.runner.run_stage import persist_run_stage
-from backend.src.common.utils import now_iso
+from backend.src.common.sql import is_sqlite_locked_error, sqlite_retry_sleep_seconds
+from backend.src.common.utils import coerce_int, now_iso, parse_optional_int, parse_positive_int
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.constants import (
     ACTION_TYPE_USER_PROMPT,
@@ -28,9 +30,7 @@ from backend.src.constants import (
     STREAM_TAG_FAIL,
     TASK_OUTPUT_TYPE_USER_ANSWER,
 )
-from backend.src.repositories.task_outputs_repo import create_task_output
-from backend.src.repositories.task_steps_repo import mark_task_step_done
-from backend.src.repositories.tasks_repo import update_task
+from backend.src.services.tasks.task_queries import create_task_output, mark_task_step_done, update_task
 from backend.src.services.tasks.task_run_lifecycle import (
     check_missing_artifacts,
     enqueue_postprocess_thread,
@@ -38,6 +38,39 @@ from backend.src.services.tasks.task_run_lifecycle import (
 )
 
 logger = logging.getLogger(__name__)
+_RESUME_SYNC_OP_TIMEOUT_SECONDS = 3.0
+
+
+async def _run_sync_with_timeout(
+    func: Callable[..., object],
+    *args,
+    timeout_seconds: float = _RESUME_SYNC_OP_TIMEOUT_SECONDS,
+    **kwargs,
+):
+    """
+    在线程池执行同步函数，并对单次调用施加超时保护。
+
+    目的：
+    - 防止个别同步依赖（DB/文件锁）异常卡死，拖挂整个 resume 流。
+    """
+    try:
+        timeout_value = float(timeout_seconds)
+    except Exception:
+        timeout_value = float(_RESUME_SYNC_OP_TIMEOUT_SECONDS)
+    if timeout_value <= 0:
+        timeout_value = float(_RESUME_SYNC_OP_TIMEOUT_SECONDS)
+    # 单测里的 Mock/AsyncMock 走直连执行，避免 to_thread 在线程池内卡死且不可取消。
+    func_type_module = str(getattr(type(func), "__module__", "") or "")
+    if func_type_module.startswith("unittest.mock"):
+        result = func(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=timeout_value)
+    except asyncio.TimeoutError as exc:
+        name = getattr(func, "__name__", None) or getattr(type(func), "__name__", "sync_func")
+        raise TimeoutError(f"resume sync op timeout: {name}") from exc
 
 
 @dataclass
@@ -62,33 +95,30 @@ def infer_resume_step_decision(
     - 其他场景优先 task_steps 最后活跃记录；
     - 无活跃记录再用 last_done_step 兜底。
     """
-    resume_step_order = paused_step_order or state_step_order or 1
-    try:
-        resume_step_order = int(resume_step_order)
-    except Exception:
-        resume_step_order = 1
-    if resume_step_order < 1:
-        resume_step_order = 1
+    resume_step_order = int(parse_positive_int(paused_step_order or state_step_order or 1, default=1) or 1)
+    last_done_step_value = coerce_int(last_done_step, default=0)
+    last_active_step_order_value = coerce_int(last_active_step_order, default=0)
+    plan_total_steps_value = coerce_int(plan_total_steps, default=0)
 
     inferred_from_steps: Optional[int] = None
-    if paused_step_order is None and int(last_active_step_order) >= 1:
+    if paused_step_order is None and last_active_step_order_value >= 1:
         active_status = str(last_active_step_status or "").strip()
         if active_status in {STEP_STATUS_DONE, STEP_STATUS_SKIPPED}:
-            inferred_from_steps = int(last_active_step_order) + 1
+            inferred_from_steps = last_active_step_order_value + 1
         elif active_status in {STEP_STATUS_RUNNING, STEP_STATUS_FAILED, STEP_STATUS_WAITING}:
-            inferred_from_steps = int(last_active_step_order)
+            inferred_from_steps = last_active_step_order_value
 
-    if inferred_from_steps is None and paused_step_order is None and int(last_done_step) >= 1:
-        inferred_from_steps = int(last_done_step) + 1
+    if inferred_from_steps is None and paused_step_order is None and last_done_step_value >= 1:
+        inferred_from_steps = last_done_step_value + 1
 
     if inferred_from_steps is not None:
-        resume_step_order = int(inferred_from_steps)
-    elif int(plan_total_steps) > 0 and int(resume_step_order) > int(plan_total_steps):
-        resume_step_order = int(plan_total_steps)
+        resume_step_order = inferred_from_steps
+    elif plan_total_steps_value > 0 and resume_step_order > plan_total_steps_value:
+        resume_step_order = plan_total_steps_value
 
     skip_execution = bool(
-        int(plan_total_steps) > 0
-        and int(resume_step_order) > int(plan_total_steps)
+        plan_total_steps_value > 0
+        and resume_step_order > plan_total_steps_value
         and not bool(pending_planning)
     )
     return ResumeStepDecision(
@@ -143,8 +173,10 @@ async def apply_resume_user_input(
     - 统一回写 run/task 运行中状态与 checkpoint。
     """
     created_at = now_iso()
+    resume_step_order_value = coerce_int(resume_step_order, default=1)
+    paused_step_order_value = parse_optional_int(paused_step_order, default=None)
     try:
-        await asyncio.to_thread(
+        await _run_sync_with_timeout(
             create_task_output,
             task_id=int(task_id),
             run_id=int(run_id),
@@ -164,26 +196,17 @@ async def apply_resume_user_input(
 
     paused_step_id = paused.get("step_id")
     if paused_step_id is not None:
-        try:
-            step_id = int(paused_step_id)
-        except Exception:
-            step_id = 0
+        step_id = int(parse_positive_int(paused_step_id, default=0) or 0)
         if step_id > 0:
-            try:
-                result_value = json.dumps(
-                    {"question": str(question or ""), "answer": str(user_input or "")},
-                    ensure_ascii=False,
-                )
-            except Exception:
-                result_value = json.dumps(
-                    {"question": str(question), "answer": str(user_input or "")},
-                    ensure_ascii=False,
-                )
+            result_value = json.dumps(
+                {"question": str(question or ""), "answer": str(user_input or "")},
+                ensure_ascii=False,
+            )
             try:
                 last_exc: Optional[BaseException] = None
                 for attempt in range(0, 3):
                     try:
-                        await asyncio.to_thread(
+                        await _run_sync_with_timeout(
                             mark_task_step_done,
                             step_id=int(step_id),
                             result=result_value,
@@ -193,8 +216,8 @@ async def apply_resume_user_input(
                         break
                     except Exception as exc:
                         last_exc = exc
-                        if "locked" in str(exc or "").lower() and attempt < 2:
-                            await asyncio.sleep(0.05 * (attempt + 1))
+                        if is_sqlite_locked_error(exc) and attempt < 2:
+                            await asyncio.sleep(sqlite_retry_sleep_seconds(attempt))
                             continue
                         break
                 if last_exc:
@@ -215,18 +238,18 @@ async def apply_resume_user_input(
                 )
 
     if (
-        paused_step_order is not None
-        and int(resume_step_order) == int(paused_step_order)
-        and 1 <= int(paused_step_order) <= len(plan_titles or [])
+        paused_step_order_value is not None
+        and resume_step_order_value == paused_step_order_value
+        and 1 <= paused_step_order_value <= len(plan_titles or [])
     ):
-        paused_idx = int(paused_step_order) - 1
+        paused_idx = paused_step_order_value - 1
         paused_title = str(plan_titles[paused_idx] or "")
         paused_allows = plan_allows[paused_idx] if 0 <= paused_idx < len(plan_allows or []) else []
         allow_set = set(str(item).strip() for item in (paused_allows or []) if str(item).strip())
         is_user_prompt_only = (ACTION_TYPE_USER_PROMPT in allow_set) and (len(allow_set) == 1)
         if is_user_prompt_only and not is_task_feedback_step_title_func(paused_title):
-            if int(paused_step_order) < len(plan_titles):
-                resume_step_order = int(paused_step_order) + 1
+            if paused_step_order_value < len(plan_titles):
+                resume_step_order_value = paused_step_order_value + 1
                 if 0 <= paused_idx < len(plan_items) and isinstance(plan_items[paused_idx], dict):
                     plan_items[paused_idx]["status"] = "done"
             else:
@@ -234,7 +257,7 @@ async def apply_resume_user_input(
                     task_id,
                     run_id,
                     message="agent.user_prompt.only_step_is_last",
-                    data={"step_order": int(paused_step_order), "title": paused_title},
+                    data={"step_order": paused_step_order_value, "title": paused_title},
                     level="warning",
                 )
 
@@ -243,7 +266,7 @@ async def apply_resume_user_input(
     state_obj["last_user_prompt"] = str(question or "")
     state_obj["observations"] = list(observations or [])
     state_obj["context"] = dict(context or {})
-    state_obj["step_order"] = int(resume_step_order)
+    state_obj["step_order"] = int(resume_step_order_value)
     run_ctx = AgentRunContext.from_agent_state(state_obj)
 
     updated_at = now_iso()
@@ -278,7 +301,7 @@ async def apply_resume_user_input(
     try:
         if persist_error:
             raise RuntimeError(str(persist_error))
-        await asyncio.to_thread(
+        await _run_sync_with_timeout(
             update_task,
             task_id=int(task_id),
             status=STATUS_RUNNING,
@@ -294,7 +317,7 @@ async def apply_resume_user_input(
             level="error",
         )
 
-    return int(resume_step_order), state_obj
+    return int(resume_step_order_value), state_obj
 
 
 async def finalize_skip_execution_resume(
@@ -376,7 +399,7 @@ async def finalize_skip_execution_resume(
             )
             events.append(sse_json({"delta": f"{STREAM_TAG_FAIL} 未生成文件：{', '.join(missing)}\n"}))
 
-    await asyncio.to_thread(
+    await _run_sync_with_timeout(
         finalize_run_and_task_status,
         task_id=int(task_id),
         run_id=int(run_id),
@@ -388,7 +411,7 @@ async def finalize_skip_execution_resume(
             from backend.src.services.tasks.task_postprocess import write_task_result_memory_if_missing
 
             title = str(task_row["title"] or "").strip()
-            item = await asyncio.to_thread(
+            item = await _run_sync_with_timeout(
                 write_task_result_memory_if_missing,
                 task_id=int(task_id),
                 run_id=int(run_id),

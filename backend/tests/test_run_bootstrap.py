@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from backend.src.agent.runner.run_bootstrap import bootstrap_new_mode_run
+from backend.src.common.utils import parse_json_value
 
 
 class TestRunBootstrap(unittest.IsolatedAsyncioTestCase):
@@ -34,7 +35,10 @@ class TestRunBootstrap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(boot.run_id, 22)
         self.assertEqual(boot.stage_event, "stage-event")
         self.assertIn("run_created", boot.run_created_event)
+        created_obj = parse_json_value(str(boot.run_created_event).split("data: ", 1)[1].strip())
+        self.assertTrue(bool(str((created_obj or {}).get("session_key") or "").strip()))
         self.assertEqual(boot.run_ctx.state.get("mode"), "think")
+        self.assertTrue(bool(str(boot.run_ctx.state.get("session_key") or "").strip()))
         self.assertEqual(boot.run_ctx.state.get("think_config"), {"x": 1})
         self.assertEqual(boot.run_ctx.state.get("max_steps"), 8)
         mock_create.assert_called_once()

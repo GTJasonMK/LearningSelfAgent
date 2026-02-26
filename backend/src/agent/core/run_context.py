@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from backend.src.common.utils import parse_optional_int, parse_positive_int
 from backend.src.constants import AGENT_EXPERIMENT_DIR_REL
 
 
@@ -11,13 +12,7 @@ def _normalize_dict(value: object) -> Dict:
 
 
 def _normalize_step_order(value: object) -> int:
-    try:
-        normalized = int(value or 1)
-    except Exception:
-        normalized = 1
-    if normalized < 1:
-        normalized = 1
-    return int(normalized)
+    return int(parse_positive_int(value, default=1) or 1)
 
 
 def _normalize_observations(value: object) -> List[str]:
@@ -131,11 +126,7 @@ class AgentRunContext:
         known_keys = cls._known_keys()
         extras = {key: value for key, value in state.items() if key not in known_keys}
 
-        raw_max_steps = state.get("max_steps")
-        try:
-            normalized_max_steps = int(raw_max_steps) if raw_max_steps is not None else None
-        except Exception:
-            normalized_max_steps = None
+        normalized_max_steps = parse_optional_int(state.get("max_steps"), default=None)
 
         run_ctx = cls(
             mode=str(state.get("mode") or ""),
@@ -168,11 +159,7 @@ class AgentRunContext:
         self.message = str(self.message or "")
         self.model = str(self.model or "")
         self.parameters = _normalize_dict(self.parameters)
-        if self.max_steps is not None:
-            try:
-                self.max_steps = int(self.max_steps)
-            except Exception:
-                self.max_steps = None
+        self.max_steps = parse_optional_int(self.max_steps, default=None)
         self.workdir = str(self.workdir or "")
         self.tools_hint = str(self.tools_hint or "")
         self.skills_hint = str(self.skills_hint or "")

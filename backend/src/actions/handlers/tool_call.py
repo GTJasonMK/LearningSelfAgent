@@ -1,11 +1,19 @@
-import json
-import logging
 import os
+import re
 import shlex
 import time
+from functools import lru_cache
 from typing import List, Optional, Set, Tuple
 
+from backend.src.actions.handlers.common_utils import (
+    load_json_object,
+    parse_command_tokens,
+    resolve_path_with_workdir,
+    truncate_inline_text,
+)
 from backend.src.common.path_utils import normalize_windows_abs_path_on_posix
+from backend.src.common.task_error_codes import format_task_error
+from backend.src.common.utils import parse_json_dict, parse_json_value
 from backend.src.constants import (
     ACTION_TYPE_TOOL_CALL,
     AGENT_EXPERIMENT_DIR_REL,
@@ -15,11 +23,14 @@ from backend.src.constants import (
     DEFAULT_TOOL_VERSION,
     ERROR_MESSAGE_PROMPT_RENDER_FAILED,
     TOOL_NAME_WEB_FETCH,
+    WEB_FETCH_BLOCK_MARKERS_DEFAULT,
+    AGENT_WEB_FETCH_BLOCK_MARKERS_ENV,
+    AGENT_WEB_FETCH_BLOCK_MARKERS_MAX,
     TOOL_METADATA_SOURCE_AUTO,
     SHELL_COMMAND_REQUIRE_FILE_WRITE_BINDING_DEFAULT,
 )
 from backend.src.services.execution.shell_command import run_shell_command
-from backend.src.services.debug.debug_output import write_task_debug_output
+from backend.src.services.debug.safe_debug import safe_write_debug as _safe_write_debug
 from backend.src.services.tools.tool_records import create_tool_record as _create_tool_record
 from backend.src.repositories.task_steps_repo import list_task_steps_for_run
 from backend.src.repositories.tools_repo import (
@@ -30,34 +41,79 @@ from backend.src.repositories.tools_repo import (
 )
 from backend.src.services.permissions.permissions_store import is_tool_enabled
 
-logger = logging.getLogger(__name__)
 
-def _truncate_inline(text: object, max_chars: int = 220) -> str:
-    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    raw = " ".join(raw.split()).strip()
-    if not raw:
-        return ""
-    limit = max(1, int(max_chars))
-    if len(raw) <= limit:
-        return raw
-    return f"{raw[: max(0, limit - 1)]}…"
+def _normalize_web_fetch_marker(phrase: object, tag: object) -> Optional[Tuple[str, str]]:
+    text = str(phrase or "").strip().lower()
+    code = str(tag or "").strip().lower()
+    if not text:
+        return None
+    if not code:
+        code = "custom_blocked"
+    return text, code
 
 
-_WEB_FETCH_BLOCK_MARKERS: List[Tuple[str, str]] = [
-    # 英文常见反爬/限流提示
-    ("too many requests", "too_many_requests"),
-    ("access denied", "access_denied"),
-    ("request blocked", "request_blocked"),
-    ("verify you are human", "verify_human"),
-    ("enable javascript", "enable_javascript"),
-    ("cloudflare", "cloudflare"),
-    ("captcha", "captcha"),
-    ("service unavailable", "service_unavailable"),
-    # 中文常见提示
-    ("请求过于频繁", "too_many_requests"),
-    ("访问被拒绝", "access_denied"),
-    ("需要启用javascript", "enable_javascript"),
-]
+def _iter_env_web_fetch_markers(raw_env: str) -> List[Tuple[str, str]]:
+    text = str(raw_env or "").strip()
+    if not text:
+        return []
+    payload = parse_json_value(text)
+    if not isinstance(payload, list):
+        return []
+
+    parsed: List[Tuple[str, str]] = []
+    for item in payload:
+        if isinstance(item, str):
+            normalized = _normalize_web_fetch_marker(item, "custom_blocked")
+            if normalized:
+                parsed.append(normalized)
+            continue
+        if isinstance(item, list) and len(item) >= 1:
+            phrase = item[0]
+            tag = item[1] if len(item) >= 2 else "custom_blocked"
+            normalized = _normalize_web_fetch_marker(phrase, tag)
+            if normalized:
+                parsed.append(normalized)
+            continue
+        if isinstance(item, dict):
+            normalized = _normalize_web_fetch_marker(item.get("phrase"), item.get("tag") or item.get("code"))
+            if normalized:
+                parsed.append(normalized)
+    return parsed
+
+
+@lru_cache(maxsize=1)
+def _get_web_fetch_block_markers() -> List[Tuple[str, str]]:
+    """
+    统一获取 web_fetch 拦截判定规则（默认 + 环境变量扩展）。
+
+    环境变量格式（JSON array）：
+    - ["blocked by upstream"]
+    - [["blocked by upstream", "request_blocked"]]
+    - [{"phrase":"blocked by upstream","tag":"request_blocked"}]
+    """
+    merged: List[Tuple[str, str]] = []
+    seen = set()
+    for phrase, tag in list(WEB_FETCH_BLOCK_MARKERS_DEFAULT or []):
+        normalized = _normalize_web_fetch_marker(phrase, tag)
+        if not normalized:
+            continue
+        if normalized[0] in seen:
+            continue
+        seen.add(normalized[0])
+        merged.append(normalized)
+
+    env_markers = _iter_env_web_fetch_markers(os.getenv(AGENT_WEB_FETCH_BLOCK_MARKERS_ENV, ""))
+    for phrase, tag in env_markers:
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        merged.append((phrase, tag))
+
+    try:
+        limit = max(1, int(AGENT_WEB_FETCH_BLOCK_MARKERS_MAX or 64))
+    except Exception:
+        limit = 64
+    return merged[:limit]
 
 
 def _detect_web_fetch_block_reason(output_text: str) -> Optional[str]:
@@ -73,10 +129,73 @@ def _detect_web_fetch_block_reason(output_text: str) -> Optional[str]:
         return None
     lowered = raw.lower()
     sample = lowered[:4000]
-    for phrase, tag in _WEB_FETCH_BLOCK_MARKERS:
+    for phrase, tag in _get_web_fetch_block_markers():
         if phrase in sample:
             return tag
+    # 兜底：部分站点只返回状态行/标题，不包含完整描述文本。
+    if re.search(r"\bhttp/[0-9.]+\s+429\b", sample):
+        return "too_many_requests"
+    if re.search(r"\bhttp/[0-9.]+\s+403\b", sample):
+        return "access_denied"
+    if re.search(r"\bhttp/[0-9.]+\s+503\b", sample):
+        return "service_unavailable"
     return None
+
+
+def _detect_web_fetch_semantic_error(output_text: str) -> Optional[str]:
+    """
+    检测 web_fetch 的“业务语义失败”（例如 success=false / error 对象）。
+
+    背景：
+    - 某些数据接口会返回 200 + JSON 错误体（如 missing_access_key）；
+    - 这类响应不应被当作抓取成功继续流转，否则会诱发后续空产物/伪结果。
+    """
+    raw = str(output_text or "").strip()
+    if not raw:
+        return None
+
+    parsed = parse_json_dict(raw)
+    if not parsed:
+        return None
+
+    success_value = parsed.get("success")
+    status_text = str(parsed.get("status") or "").strip().lower()
+    error_obj = parsed.get("error")
+
+    has_error_payload = bool(
+        isinstance(error_obj, dict)
+        or (isinstance(error_obj, str) and str(error_obj).strip())
+    )
+    explicit_failure = (success_value is False) or (status_text in {"error", "failed", "fail"})
+    if not explicit_failure and not has_error_payload:
+        return None
+
+    if isinstance(error_obj, dict):
+        error_type = str(
+            error_obj.get("type")
+            or error_obj.get("code")
+            or error_obj.get("name")
+            or ""
+        ).strip()
+        error_message = truncate_inline_text(
+            error_obj.get("info")
+            or error_obj.get("message")
+            or error_obj.get("detail")
+            or "",
+            180,
+        )
+    else:
+        error_type = ""
+        error_message = truncate_inline_text(error_obj, 180)
+
+    if error_type and error_message:
+        return f"{error_type}: {error_message}"
+    if error_type:
+        return error_type
+    if error_message:
+        return error_message
+
+    return "semantic_error"
 
 
 def _normalize_exec_spec(exec_spec: dict) -> dict:
@@ -136,29 +255,6 @@ def _normalize_exec_spec(exec_spec: dict) -> dict:
     return spec
 
 
-def _safe_write_debug(
-    task_id: int,
-    run_id: int,
-    *,
-    message: str,
-    data: Optional[dict] = None,
-    level: str = "debug",
-) -> None:
-    """
-    工具链路的调试输出不应影响主链路：失败时降级为 logger.exception。
-    """
-    try:
-        write_task_debug_output(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            message=message,
-            data=data if isinstance(data, dict) else None,
-            level=level,
-        )
-    except Exception:
-        logger.exception("write_task_debug_output failed: %s", message)
-
-
 def _load_tool_metadata_from_db(tool_id: Optional[int], tool_name: Optional[str]) -> Optional[dict]:
     """
     读取 tools_items.metadata（JSON）并解析为 dict。
@@ -170,6 +266,15 @@ def _load_tool_metadata_from_db(tool_id: Optional[int], tool_name: Optional[str]
     return get_tool_metadata_by_name(name=str(tool_name or ""))
 
 
+def _has_nonempty_exec_spec(spec: dict) -> bool:
+    """判断 exec_spec 是否包含有效内容（兼容模型输出空 exec {}）。"""
+    return bool(
+        str(spec.get("type") or "").strip()
+        or (isinstance(spec.get("args"), list) and spec.get("args"))
+        or str(spec.get("command") or "").strip()
+    )
+
+
 def _resolve_tool_exec_spec(payload: dict) -> Optional[dict]:
     """
     优先从 payload.tool_metadata 读取 exec，其次从 tools_items.metadata 读取 exec。
@@ -179,25 +284,14 @@ def _resolve_tool_exec_spec(payload: dict) -> Optional[dict]:
         exec_spec = meta.get("exec")
         if isinstance(exec_spec, dict):
             exec_spec = _normalize_exec_spec(exec_spec)
-            # 兼容：模型可能会输出空 exec {}。这种情况下不要“抢占”掉 DB 里的 exec。
-            has_any = bool(
-                str(exec_spec.get("type") or "").strip()
-                or (isinstance(exec_spec.get("args"), list) and exec_spec.get("args"))
-                or str(exec_spec.get("command") or "").strip()
-            )
-            if has_any:
+            if _has_nonempty_exec_spec(exec_spec):
                 return exec_spec
     meta = _load_tool_metadata_from_db(payload.get("tool_id"), payload.get("tool_name"))
     if isinstance(meta, dict):
         exec_spec = meta.get("exec")
         if isinstance(exec_spec, dict):
             normalized = _normalize_exec_spec(exec_spec)
-            has_any = bool(
-                str(normalized.get("type") or "").strip()
-                or (isinstance(normalized.get("args"), list) and normalized.get("args"))
-                or str(normalized.get("command") or "").strip()
-            )
-            if has_any:
+            if _has_nonempty_exec_spec(normalized):
                 return normalized
 
     # 再兜底：从实验目录脚本推断执行定义（防止“已写脚本但漏填 exec”中断）。
@@ -250,41 +344,6 @@ def _infer_exec_spec_from_workspace_script(payload: dict) -> Optional[dict]:
         }
 
     return None
-
-
-def _load_json_object(value: object) -> Optional[dict]:
-    if isinstance(value, dict):
-        return dict(value)
-    if not isinstance(value, str):
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return None
-    return dict(parsed) if isinstance(parsed, dict) else None
-
-
-def _parse_command_tokens_for_dependency(command: object) -> List[str]:
-    if isinstance(command, list):
-        return [str(item) for item in command if str(item).strip()]
-    if isinstance(command, str):
-        raw = str(command).strip()
-        if not raw:
-            return []
-        tokens = shlex.split(raw, posix=os.name != "nt")
-        if os.name != "nt":
-            return [str(item) for item in tokens]
-        cleaned: List[str] = []
-        for item in tokens:
-            value = str(item)
-            if len(value) >= 2 and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'")):
-                value = value[1:-1]
-            cleaned.append(value)
-        return cleaned
-    return []
 
 
 def _looks_like_executable_token(token: str) -> bool:
@@ -359,7 +418,7 @@ def _extract_script_candidates_from_exec_spec(exec_spec: dict, tool_input: str) 
     if isinstance(args, list) and args:
         formatted_args = [str(item).replace("{input}", tool_input) for item in args]
         if isinstance(command, str) and command.strip():
-            command_tokens = _parse_command_tokens_for_dependency(str(command).replace("{input}", tool_input))
+            command_tokens = parse_command_tokens(str(command).replace("{input}", tool_input))
             if command_tokens:
                 if _looks_like_executable_token(formatted_args[0]):
                     tokens = formatted_args
@@ -370,27 +429,11 @@ def _extract_script_candidates_from_exec_spec(exec_spec: dict, tool_input: str) 
         else:
             tokens = formatted_args
     elif isinstance(command, str) and command.strip():
-        tokens = _parse_command_tokens_for_dependency(str(command).replace("{input}", tool_input))
+        tokens = parse_command_tokens(str(command).replace("{input}", tool_input))
     elif isinstance(command, list) and command:
         tokens = [str(item).replace("{input}", tool_input) for item in command if str(item).strip()]
 
     return _extract_script_candidates_from_tokens(tokens)
-
-
-def _resolve_path_for_dependency(raw_path: str, workdir: str) -> str:
-    text = normalize_windows_abs_path_on_posix(str(raw_path or "").strip())
-    if not text:
-        return ""
-
-    base = normalize_windows_abs_path_on_posix(str(workdir or "").strip())
-    if not base:
-        base = os.getcwd()
-    if not os.path.isabs(base):
-        base = os.path.abspath(base)
-
-    if os.path.isabs(text):
-        return os.path.abspath(text)
-    return os.path.abspath(os.path.join(base, text))
 
 
 def _collect_written_script_paths_for_run(
@@ -420,13 +463,13 @@ def _collect_written_script_paths_for_run(
         if status != "done":
             continue
 
-        detail_obj = _load_json_object(row["detail"] if "detail" in row.keys() else None)
+        detail_obj = load_json_object(row["detail"] if "detail" in row.keys() else None)
         action_type = str(detail_obj.get("type") or "").strip().lower() if isinstance(detail_obj, dict) else ""
         if action_type not in {"file_write", "file_append"}:
             continue
 
         payload_obj = detail_obj.get("payload") if isinstance(detail_obj, dict) else None
-        result_obj = _load_json_object(row["result"] if "result" in row.keys() else None)
+        result_obj = load_json_object(row["result"] if "result" in row.keys() else None)
 
         raw_path = ""
         if isinstance(result_obj, dict):
@@ -434,7 +477,7 @@ def _collect_written_script_paths_for_run(
         if not raw_path and isinstance(payload_obj, dict):
             raw_path = str(payload_obj.get("path") or "").strip()
 
-        resolved = _resolve_path_for_dependency(raw_path, workdir)
+        resolved = resolve_path_with_workdir(raw_path, workdir)
         if resolved:
             paths.add(os.path.normcase(resolved))
 
@@ -484,7 +527,7 @@ def _enforce_tool_exec_script_dependency(
     missing_paths: List[str] = []
     unbound_paths: List[str] = []
     for candidate in script_candidates:
-        absolute_path = _resolve_path_for_dependency(candidate, workdir)
+        absolute_path = resolve_path_with_workdir(candidate, workdir)
         if not absolute_path:
             continue
         if not os.path.exists(absolute_path):
@@ -818,6 +861,10 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
 
     output_text, exec_error = _execute_tool_with_exec_spec(exec_spec, str(tool_input))
     if exec_error:
+        # 检测 TLS/SSL 握手失败
+        lowered_err = str(exec_error).lower()
+        if "handshake" in lowered_err and ("ssl" in lowered_err or "tls" in lowered_err):
+            raise ValueError(format_task_error(code="tls_handshake_failed", message=exec_error))
         raise ValueError(exec_error)
 
     output_text = str(output_text or "")
@@ -855,10 +902,30 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
             else:
                 record["warnings"] = [warn_text]
 
-            url_text = _truncate_inline(str(tool_input), 180)
-            preview = _truncate_inline(output_text, 260)
+            url_text = truncate_inline_text(str(tool_input), 180)
+            preview = truncate_inline_text(output_text, 260)
             tail = f" {preview}" if preview else ""
-            return record, f"web_fetch 可能被限流/反爬（{block_reason}）：{url_text}{tail}"
+            error_code = "rate_limited" if block_reason == "too_many_requests" else "web_fetch_blocked"
+            return record, format_task_error(
+                code=error_code,
+                message=f"web_fetch 可能被限流/反爬（{block_reason}）：{url_text}{tail}",
+            )
+
+        semantic_error = _detect_web_fetch_semantic_error(output_text)
+        if semantic_error:
+            warn_text = f"web_fetch 语义失败：{semantic_error}"
+            if isinstance(record.get("warnings"), list):
+                record["warnings"].append(warn_text)
+            else:
+                record["warnings"] = [warn_text]
+
+            url_text = truncate_inline_text(str(tool_input), 180)
+            semantic_lower = str(semantic_error).lower()
+            error_code = "missing_api_key" if ("missing_access_key" in semantic_lower or "access key" in semantic_lower) else "web_fetch_blocked"
+            return record, format_task_error(
+                code=error_code,
+                message=f"web_fetch 返回错误响应（{semantic_error}）：{url_text}",
+            )
 
     # 新工具：此处只负责“真实执行 + 记录调用”，不直接沉淀为 skill。
     # 说明：

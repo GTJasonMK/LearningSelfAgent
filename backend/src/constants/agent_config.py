@@ -10,7 +10,24 @@ Agent 配置常量。
 - 知识图谱配置
 """
 
+import os
 from typing import Final, Tuple
+
+
+def _read_int_env(name: str, default: int, *, min_value: int = 0) -> int:
+    """
+    读取整型环境变量；非法值回退到默认值，并限制最小值。
+    """
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(float(raw))
+    except Exception:
+        return int(default)
+    if value < int(min_value):
+        return int(min_value)
+    return int(value)
 
 # 数据库和环境变量
 DB_ENV_VAR: Final = "AGENT_DB_PATH"
@@ -44,6 +61,9 @@ AGENT_PLAN_HEARTBEAT_INTERVAL_SECONDS: Final = 2
 AGENT_PLAN_MAX_WAIT_SECONDS: Final = 120
 AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS: Final = 1
 AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS: Final = 300
+# Think 规划阶段总体超时（秒）：多个规划者并行 LLM 调用的总耗时上限，
+# 避免单个/全部规划者卡死导致整个 Think 流程无限等待。
+AGENT_THINK_PLANNING_TIMEOUT_SECONDS: Final = 300
 
 # SSE plan 事件节流（plan 事件 payload 可能很大，频繁广播会导致前端渲染抖动）
 # - <=0 表示不节流
@@ -74,7 +94,10 @@ HTTP_REQUEST_DEFAULT_TIMEOUT_MS: Final = 20000
 AGENT_REACT_OBSERVATION_MAX_CHARS: Final = 4000
 AGENT_REACT_ACTION_RETRY_MAX_ATTEMPTS: Final = 2
 AGENT_REACT_ARTIFACT_AUTOFIX_MAX_ATTEMPTS: Final = 2
-AGENT_REACT_REPLAN_MAX_ATTEMPTS: Final = 2
+AGENT_REACT_REPLAN_MAX_ATTEMPTS: Final = _read_int_env("AGENT_REACT_REPLAN_MAX_ATTEMPTS", 2, min_value=0)
+# ReAct 重复失败预算：同一错误签名连续命中达到阈值后直接失败收敛，
+# 避免外部依赖不可用时出现“失败-重规划-再失败”的长循环。
+AGENT_REACT_REPEAT_FAILURE_MAX: Final = _read_int_env("AGENT_REACT_REPEAT_FAILURE_MAX", 3, min_value=0)
 
 # shell_command 执行保护（P0）
 # 说明：当 shell_command 运行本地脚本时，要求脚本必须由当前 run 的 file_write/file_append 产生，
@@ -119,6 +142,9 @@ AGENT_REVIEW_DISTILL_STATUS_MANUAL: Final = "manual"
 # 任务反馈
 AGENT_TASK_FEEDBACK_KIND: Final = "task_feedback"
 AGENT_KNOWLEDGE_SUFFICIENCY_KIND: Final = "knowledge_sufficiency"
+# knowledge_sufficiency 默认选项 value：使用稳定语义值，避免文案变动影响恢复判定。
+AGENT_KNOWLEDGE_SUFFICIENCY_PROCEED_VALUE: Final = "proceed_with_assumptions"
+AGENT_KNOWLEDGE_SUFFICIENCY_ASK_CLARIFY_VALUE: Final = "ask_for_clarification"
 AGENT_USER_PROMPT_CHOICES_MAX: Final = 12
 AGENT_TASK_FEEDBACK_STEP_TITLE: Final = "确认满意度"
 AGENT_TASK_FEEDBACK_STEP_BRIEF: Final = "确认满意度"
@@ -212,6 +238,28 @@ TOOL_NAME_WEB_FETCH: Final = "web_fetch"
 TOOL_DESCRIPTION_WEB_FETCH: Final = "抓取指定 URL 内容（curl -fsSL + UA，HTTP>=400 视为失败，带重试）"
 TOOL_VERSION_WEB_FETCH: Final = "0.1.0"
 TOOL_WEB_FETCH_TIMEOUT_MS: Final = 15000
+# web_fetch 拦截页/限流页判定：
+# - 默认规则提供通用保护，避免把“200 + 拦截正文”误判为成功数据；
+# - 支持通过环境变量追加，避免站点特征变化时必须改代码。
+WEB_FETCH_BLOCK_MARKERS_DEFAULT: Final[Tuple[Tuple[str, str], ...]] = (
+    ("too many requests", "too_many_requests"),
+    ("daily hits limit", "too_many_requests"),
+    ("exceeded the daily hits limit", "too_many_requests"),
+    ("rate limit exceeded", "too_many_requests"),
+    ("access denied", "access_denied"),
+    ("request blocked", "request_blocked"),
+    ("verify you are human", "verify_human"),
+    ("enable javascript", "enable_javascript"),
+    ("cloudflare", "cloudflare"),
+    ("captcha", "captcha"),
+    ("service unavailable", "service_unavailable"),
+    ("请求过于频繁", "too_many_requests"),
+    ("访问被拒绝", "access_denied"),
+    ("需要启用javascript", "enable_javascript"),
+)
+AGENT_WEB_FETCH_BLOCK_MARKERS_ENV: Final = "AGENT_WEB_FETCH_BLOCK_MARKERS_JSON"
+AGENT_WEB_FETCH_BLOCK_MARKERS_MAX: Final = 64
+
 # curl:
 # -f：HTTP>=400 直接返回非 0（否则 429/403 会被当作“成功抓取”而污染后续步骤）
 # -sS：静默输出但保留错误信息

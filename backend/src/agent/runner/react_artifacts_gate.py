@@ -13,10 +13,12 @@ from backend.src.constants import (
     AGENT_REACT_ARTIFACT_AUTOFIX_MAX_ATTEMPTS,
     AGENT_REACT_REPLAN_MAX_ATTEMPTS,
     STREAM_TAG_EXEC,
+    STREAM_TAG_FAIL,
+    RUN_STATUS_FAILED,
 )
 from backend.src.agent.runner.plan_events import sse_plan
-from backend.src.repositories.task_runs_repo import update_task_run
 from backend.src.services.llm.llm_client import sse_json
+from backend.src.services.tasks.task_queries import update_task_run
 from backend.src.services.tasks.task_run_lifecycle import check_missing_artifacts
 
 
@@ -185,8 +187,8 @@ def apply_artifacts_gates(
             )
             observations.append(f"artifacts_missing_unfixed: {', '.join(missing)}")
             agent_state["missing_artifacts"] = list(missing)
-            yield sse_json({"delta": f"{STREAM_TAG_EXEC} 警告：未生成文件：{', '.join(missing)}（继续执行，结果可能需要补救）\n"})
-            return ArtifactsGateOutcome()
+            yield sse_json({"delta": f"{STREAM_TAG_FAIL} 缺少必需产物：{', '.join(missing)}（终止本次执行）\n"})
+            return ArtifactsGateOutcome(run_status=RUN_STATUS_FAILED)
 
     # --- 1.5) task_output + http_request：缺少成功的抓取证据时禁止输出 ---
     if ACTION_TYPE_TASK_OUTPUT in allowed_set:
@@ -247,13 +249,16 @@ def apply_artifacts_gates(
             )
             observations.append("http_evidence_missing: no successful http_request step")
             agent_state["http_evidence_missing"] = True
-            yield sse_json({"delta": f"{STREAM_TAG_EXEC} 警告：缺少可验证的抓取证据（继续执行，结果可能不可靠）\n"})
-            return ArtifactsGateOutcome()
+            yield sse_json({"delta": f"{STREAM_TAG_FAIL} 缺少可验证抓取证据（终止本次执行）\n"})
+            return ArtifactsGateOutcome(run_status=RUN_STATUS_FAILED)
 
-    # --- 2) 存在失败步骤：禁止直接输出最终结果，优先 replan 补救 ---
+    # --- 2) 存在失败步骤：优先 replan 补救；若不可补救则带风险继续 ---
     if ACTION_TYPE_TASK_OUTPUT in allowed_set:
         failed_steps: List[int] = []
         for step_idx, step in enumerate(plan_struct.steps):
+            # 只检查当前输出步骤之前的历史步骤，避免把未来步骤状态误判为阻断条件。
+            if step_idx >= int(idx):
+                break
             if step.status == "failed":
                 failed_steps.append(step_idx + 1)
         if failed_steps:
@@ -304,13 +309,24 @@ def apply_artifacts_gates(
                 task_id=int(task_id),
                 run_id=int(run_id),
                 message="agent.prior_failed_steps.before_output",
-                data={"failed_steps": failed_steps},
+                data={
+                    "failed_steps": failed_steps,
+                    "decision": "allow_with_risk",
+                    "can_replan": bool(can_replan),
+                },
                 level="warning",
             )
             observations.append(f"prior_failed_steps_before_output: {failed_steps}")
             agent_state["prior_failed_steps_before_output"] = list(failed_steps)
-            yield sse_json({"delta": f"{STREAM_TAG_EXEC} 警告：存在失败步骤（继续执行，但结果可能不完整）\n"})
-            return ArtifactsGateOutcome()
+            agent_state["output_risk_has_failed_steps"] = True
+            yield sse_json(
+                {
+                    "delta": (
+                        f"{STREAM_TAG_EXEC} 警告：检测到历史失败步骤 {failed_steps}，"
+                        "已记录风险并继续执行最终输出。\n"
+                    )
+                }
+            )
 
     # --- 3) artifacts：必须至少有一次"验证成功"的步骤 ---
     if plan_artifacts and ACTION_TYPE_TASK_OUTPUT in allowed_set:
@@ -367,7 +383,7 @@ def apply_artifacts_gates(
             )
             observations.append("artifact_validation_missing: no successful validation step")
             agent_state["artifact_validation_missing"] = True
-            yield sse_json({"delta": f"{STREAM_TAG_EXEC} 警告：缺少验证步骤（继续执行，结果可能不可靠）\n"})
-            return ArtifactsGateOutcome()
+            yield sse_json({"delta": f"{STREAM_TAG_FAIL} 缺少成功验证步骤（终止本次执行）\n"})
+            return ArtifactsGateOutcome(run_status=RUN_STATUS_FAILED)
 
     return ArtifactsGateOutcome()

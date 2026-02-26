@@ -22,6 +22,7 @@ LLM_PROVIDER_OPENAI: Final = "openai"
 
 # 默认模型
 DEFAULT_LLM_MODEL: Final = "gpt-4o-mini"
+RIGHT_CODES_DEFAULT_BASE_URL: Final = "https://right.codes/codex/v1"
 
 # Chat 角色
 CHAT_ROLE_SYSTEM: Final = "system"

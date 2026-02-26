@@ -41,7 +41,7 @@ async def run_do_planning_phase_with_stream(
         workdir=str(workdir or ""),
         model=str(model or ""),
         parameters=dict(parameters or {}),
-        max_steps=int(max_steps),
+        max_steps=max_steps,
         tools_hint=str(tools_hint or ""),
         skills_hint=str(skills_hint or ""),
         solutions_hint=str(solutions_hint or ""),

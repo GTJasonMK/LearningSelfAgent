@@ -8,10 +8,11 @@ from fastapi.responses import StreamingResponse
 from backend.src.agent.runner.stream_pump import pump_sync_generator
 from backend.src.actions.executor import _execute_step_action
 from backend.src.api.schemas import TaskExecuteRequest
+from backend.src.api.tasks.route_common import ensure_task_exists_or_error
 from backend.src.common.serializers import task_run_from_row, task_step_from_row
-from backend.src.api.utils import ensure_write_permission, error_response, now_iso
+from backend.src.api.utils import now_iso, require_write_permission
 from backend.src.common.errors import AppError
-from backend.src.common.utils import truncate_text
+from backend.src.common.utils import action_type_from_step_detail, truncate_text
 from backend.src.constants import (
     ACTION_TYPE_LLM_CALL,
     ACTION_TYPE_SHELL_COMMAND,
@@ -26,10 +27,12 @@ from backend.src.constants import (
     RUN_STATUS_FAILED,
     RUN_STATUS_RUNNING,
     RUN_STATUS_STOPPED,
+    RUN_STATUS_WAITING,
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_RUNNING,
     STATUS_STOPPED,
+    STATUS_WAITING,
     STREAM_TAG_EXEC,
     STREAM_TAG_FAIL,
     STREAM_TAG_OK,
@@ -41,24 +44,24 @@ from backend.src.constants import (
     STEP_STATUS_PLANNED,
     STEP_STATUS_RUNNING,
     STEP_STATUS_SKIPPED,
+    STEP_STATUS_WAITING,
 )
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.services.output.output_format import format_visible_result
-from backend.src.repositories.task_runs_repo import (
+from backend.src.services.tasks.task_queries import (
     create_task_run as create_task_run_record,
-    get_task_run,
-    update_task_run as update_task_run_repo,
 )
-from backend.src.repositories.task_steps_repo import (
-    get_task_step as get_task_step_repo,
-    list_task_steps_for_task,
-    mark_task_step_done,
-    mark_task_step_failed,
-    mark_task_step_running,
-    mark_task_step_skipped,
-    update_task_step as update_task_step_repo,
-)
-from backend.src.repositories.tasks_repo import get_task as get_task_repo, task_exists, update_task as update_task_repo
+from backend.src.services.tasks.task_queries import get_task as get_task_repo
+from backend.src.services.tasks.task_queries import get_task_run
+from backend.src.services.tasks.task_queries import get_task_step as get_task_step_repo
+from backend.src.services.tasks.task_queries import list_task_steps_for_task
+from backend.src.services.tasks.task_queries import mark_task_step_done
+from backend.src.services.tasks.task_queries import mark_task_step_failed
+from backend.src.services.tasks.task_queries import mark_task_step_running
+from backend.src.services.tasks.task_queries import mark_task_step_skipped
+from backend.src.services.tasks.task_queries import update_task as update_task_repo
+from backend.src.services.tasks.task_queries import update_task_run as update_task_run_repo
+from backend.src.services.tasks.task_queries import update_task_step as update_task_step_repo
 
 router = APIRouter()
 
@@ -93,15 +96,37 @@ def _format_step_result_preview(action_type: Optional[str], result) -> Optional[
     return None
 
 
+def _build_run_event(
+    *,
+    event_type: str,
+    task_id: int,
+    run_id: int,
+    status: Optional[str] = None,
+    created_at: Optional[str] = None,
+) -> dict:
+    payload = {
+        "type": str(event_type or "").strip(),
+        "task_id": int(task_id),
+        "run_id": int(run_id),
+    }
+    if status is not None:
+        payload["status"] = str(status or "").strip().lower()
+    if created_at is not None:
+        payload["created_at"] = str(created_at or "").strip() or None
+    return payload
+
+
 def _execute_task_with_messages(
     task_id: int, payload: Optional[TaskExecuteRequest] = None
-) -> Generator[str, None, dict]:
+) -> Generator[object, None, dict]:
     """
     复用 execute_task 的执行逻辑，并在关键节点产出可用于 SSE 的文本消息。
 
     说明：
     - 该 generator 会真正修改数据库（创建 run、更新 step 状态等）
-    - yield 的消息用于桌宠气泡实时展示
+    - yield 的内容包含两类：
+      1) 字符串：用于桌宠气泡实时展示
+      2) 结构化 dict：run_created/run_status 等前端状态事件
     - generator return 的 dict 与 execute_task 的返回结构一致
     """
     run_summary = payload.run_summary if payload else None
@@ -135,22 +160,43 @@ def _execute_task_with_messages(
 
     executed_steps = []
     run_status = RUN_STATUS_DONE
+    last_emitted_run_status = ""
     # 执行上下文：用于把上一步结果带入下一步（最低限度支持“两步规划：llm_call -> task_output”）
     context: dict = {"last_llm_response": None}
 
+    def _emit_run_status(status: object) -> Optional[dict]:
+        nonlocal last_emitted_run_status
+        normalized = str(status or "").strip().lower()
+        if not normalized or normalized == last_emitted_run_status:
+            return None
+        last_emitted_run_status = normalized
+        return _build_run_event(
+            event_type="run_status",
+            task_id=int(task_id),
+            run_id=int(run_id),
+            status=normalized,
+        )
+
     try:
         yield f"{STREAM_TAG_EXEC} 开始执行任务 #{task_id}: {task_row['title']}"
+        yield _build_run_event(
+            event_type="run_created",
+            task_id=int(task_id),
+            run_id=int(run_id),
+            status=RUN_STATUS_RUNNING,
+            created_at=created_at,
+        )
+        running_event = _emit_run_status(RUN_STATUS_RUNNING)
+        if running_event is not None:
+            yield running_event
 
         for step_row in step_rows:
             if step_row["status"] not in {STEP_STATUS_PLANNED, STEP_STATUS_RUNNING}:
                 continue
 
             action_type = None
-            try:
-                if step_row["detail"]:
-                    action_type = json.loads(step_row["detail"]).get("type")
-            except Exception:
-                action_type = None
+            if step_row["detail"]:
+                action_type = action_type_from_step_detail(step_row["detail"])
 
             yield f"{STREAM_TAG_STEP} {step_row['title']}"
 
@@ -200,6 +246,9 @@ def _execute_task_with_messages(
                             run_status = RUN_STATUS_FAILED
                             step_completed = True
                             yield f"{STREAM_TAG_FAIL} {step_row['title']}（{error_message}）"
+                            failed_event = _emit_run_status(RUN_STATUS_FAILED)
+                            if failed_event is not None:
+                                yield failed_event
                 else:
                     result_value = None
                     if result is not None:
@@ -239,6 +288,32 @@ def _execute_task_with_messages(
             executed_steps.append(task_step_from_row(row))
             if run_status == RUN_STATUS_FAILED:
                 break
+
+        # 若仍存在 waiting 步骤，run 不应被标记为 done。
+        # 典型场景：用户输入步骤尚未恢复，当前轮 execute 只是触发到等待态。
+        if run_status == RUN_STATUS_DONE:
+            try:
+                latest_rows = list_task_steps_for_task(task_id=task_id)
+            except Exception:
+                latest_rows = []
+            has_waiting_step = any(
+                str((row or {}).get("status") or "").strip().lower() == STEP_STATUS_WAITING
+                for row in (latest_rows or [])
+            )
+            if has_waiting_step:
+                run_status = RUN_STATUS_WAITING
+                yield f"{STREAM_TAG_EXEC} 检测到 waiting 步骤，等待用户输入后可继续执行"
+                waiting_event = _emit_run_status(RUN_STATUS_WAITING)
+                if waiting_event is not None:
+                    yield waiting_event
+            else:
+                done_event = _emit_run_status(RUN_STATUS_DONE)
+                if done_event is not None:
+                    yield done_event
+        elif run_status == RUN_STATUS_FAILED:
+            failed_event = _emit_run_status(RUN_STATUS_FAILED)
+            if failed_event is not None:
+                yield failed_event
     except GeneratorExit:
         # SSE 客户端断开/上层主动关闭 generator 时：
         # - 必须把 run/task 收敛到 stopped，避免错误标记为 done；
@@ -248,6 +323,9 @@ def _execute_task_with_messages(
     except Exception as exc:
         run_status = RUN_STATUS_FAILED
         yield f"{STREAM_TAG_FAIL} 任务执行异常（{exc}）"
+        failed_event = _emit_run_status(RUN_STATUS_FAILED)
+        if failed_event is not None:
+            yield failed_event
     finally:
         finished_at = now_iso()
         if run_id is not None:
@@ -257,6 +335,8 @@ def _execute_task_with_messages(
             task_final_status = STATUS_DONE
         elif run_status == RUN_STATUS_STOPPED:
             task_final_status = STATUS_STOPPED
+        elif run_status == RUN_STATUS_WAITING:
+            task_final_status = STATUS_WAITING
         else:
             task_final_status = STATUS_FAILED
         update_task_repo(task_id=task_id, status=task_final_status, updated_at=finished_at)
@@ -272,14 +352,18 @@ def _execute_task_with_messages(
             except Exception:
                 pass
 
-    from backend.src.services.tasks.task_postprocess import postprocess_task_run
+    eval_response = None
+    skill_response = None
+    graph_update = None
+    if run_status in {RUN_STATUS_DONE, RUN_STATUS_FAILED, RUN_STATUS_STOPPED}:
+        from backend.src.services.tasks.task_postprocess import postprocess_task_run
 
-    eval_response, skill_response, graph_update = postprocess_task_run(
-        task_row=task_row,
-        task_id=task_id,
-        run_id=run_id,
-        run_status=run_status,
-    )
+        eval_response, skill_response, graph_update = postprocess_task_run(
+            task_row=task_row,
+            task_id=task_id,
+            run_id=run_id,
+            run_status=run_status,
+        )
 
     run_row = get_task_run(run_id=int(run_id))
 
@@ -293,16 +377,11 @@ def _execute_task_with_messages(
 
 
 @router.post("/tasks/{task_id}/execute")
+@require_write_permission
 async def execute_task(task_id: int, payload: Optional[TaskExecuteRequest] = None) -> dict:
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-    if not task_exists(task_id=task_id):
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+    task_exists_error = ensure_task_exists_or_error(task_id=task_id)
+    if task_exists_error:
+        return task_exists_error
 
     def _run() -> dict:
         inner = _execute_task_with_messages(task_id, payload)
@@ -316,22 +395,16 @@ async def execute_task(task_id: int, payload: Optional[TaskExecuteRequest] = Non
 
 
 @router.post("/tasks/{task_id}/execute/stream")
+@require_write_permission
 async def execute_task_stream(task_id: int, payload: Optional[TaskExecuteRequest] = None):
     """
     执行任务（SSE 流式）：用于桌宠实时显示 step 进度。
 
     data: {"delta":"..."} 逐段输出；event: done 表示结束；event: error 表示失败。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    if not task_exists(task_id=task_id):
-        return error_response(
-            ERROR_CODE_NOT_FOUND,
-            ERROR_MESSAGE_TASK_NOT_FOUND,
-            HTTP_STATUS_NOT_FOUND,
-        )
+    task_exists_error = ensure_task_exists_or_error(task_id=task_id)
+    if task_exists_error:
+        return task_exists_error
 
     async def gen():
         cancelled = False
@@ -345,10 +418,29 @@ async def execute_task_stream(task_id: int, payload: Optional[TaskExecuteRequest
             ):
                 if kind == "msg":
                     msg = payload_obj
+                    if isinstance(msg, dict):
+                        msg_type = str(msg.get("type") or "").strip()
+                        if msg_type:
+                            yield sse_json(msg)
+                            continue
                     if msg:
                         yield sse_json({"delta": f"{msg}\n"})
                     continue
                 if kind == "done":
+                    # 兜底：即便中间 run_status 丢失，也尽量在 done 前补一个最终状态事件。
+                    if isinstance(payload_obj, dict):
+                        run_obj = payload_obj.get("run") if isinstance(payload_obj.get("run"), dict) else None
+                        run_id = int(run_obj.get("id") or 0) if isinstance(run_obj, dict) else 0
+                        status = str(run_obj.get("status") or "").strip().lower() if isinstance(run_obj, dict) else ""
+                        if run_id > 0 and status:
+                            yield sse_json(
+                                _build_run_event(
+                                    event_type="run_status",
+                                    task_id=int(task_id),
+                                    run_id=int(run_id),
+                                    status=status,
+                                )
+                            )
                     return
                 if kind == "err":
                     yield sse_json({"message": f"任务执行失败:{payload_obj}"}, event="error")

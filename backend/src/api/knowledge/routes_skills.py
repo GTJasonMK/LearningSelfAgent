@@ -4,9 +4,14 @@ from typing import Dict, Optional
 from fastapi import APIRouter
 
 from backend.src.common.serializers import skill_from_row
-from backend.src.api.utils import ensure_write_permission, parse_json_list
+from backend.src.api.utils import (
+    clamp_non_negative_int,
+    clamp_page_limit,
+    parse_json_list,
+    require_write_permission,
+)
 from backend.src.constants import DEFAULT_PAGE_LIMIT, DEFAULT_PAGE_OFFSET
-from backend.src.repositories.skills_repo import (
+from backend.src.services.knowledge.knowledge_query import (
     list_skill_catalog_source,
     search_skills_filtered_like,
     update_skill_status,
@@ -19,14 +24,39 @@ from backend.src.services.skills.skills_sync import sync_skills_from_files
 router = APIRouter()
 
 
+def _invalid_skill_status_response(*, include_list_payload: bool) -> dict:
+    message = f"无效的状态值，有效值为: {', '.join(VALID_SKILL_STATUSES)}"
+    if include_list_payload:
+        return {"error": message, "total": 0, "items": []}
+    return {"error": message}
+
+
+async def _set_skill_status_with_guard(
+    *,
+    skill_id: int,
+    target_status: str,
+    already_message: str,
+) -> dict:
+    existing = await asyncio.to_thread(get_skill, skill_id=skill_id)
+    if existing is None:
+        return {"error": "技能不存在"}
+
+    current_status = (existing["status"] or "approved").strip().lower()
+    if current_status == target_status:
+        return {"message": already_message, "skill": skill_from_row(existing)}
+
+    row = await asyncio.to_thread(update_skill_status, skill_id=skill_id, status=target_status)
+    if row is None:
+        return {"error": "更新失败"}
+    return {"success": True, "skill": skill_from_row(row)}
+
+
 @router.post("/skills/sync")
+@require_write_permission
 async def sync_skills() -> dict:
     """
     将 backend/prompt/skills 下的技能文件同步到数据库（skills_items）。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
     result = await asyncio.to_thread(sync_skills_from_files)
     return {"result": result}
 
@@ -50,14 +80,16 @@ def search_skills(
     - skill_type：methodology / solution
     - status：draft / approved / deprecated / abandoned
     """
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
+    safe_offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
     total, rows = search_skills_filtered_like(
         q=q,
         category=category,
         tag=tag,
         skill_type=skill_type,
         status=status,
-        limit=limit,
-        offset=offset,
+        limit=safe_limit,
+        offset=safe_offset,
     )
     return {"total": total, "items": [skill_from_row(row) for row in rows]}
 
@@ -78,7 +110,7 @@ def skills_catalog(limit_tags: int = 30) -> dict:
         category = (row["category"] or "").strip() or "misc"
         categories_map[category] = categories_map.get(category, 0) + 1
 
-        tags = parse_json_list(row["tags"]) if row["tags"] else []
+        tags = parse_json_list(row["tags"])
         for item in tags:
             key = str(item).strip()
             if not key:
@@ -130,12 +162,15 @@ def list_skills_with_status(
     """
     status = status.strip().lower()
     if status not in VALID_SKILL_STATUSES:
-        return {"error": f"无效的状态值，有效值为: {', '.join(VALID_SKILL_STATUSES)}", "total": 0, "items": []}
-    total, rows = list_skills_by_status(status=status, limit=limit, offset=offset)
+        return _invalid_skill_status_response(include_list_payload=True)
+    safe_limit = clamp_page_limit(limit, default=DEFAULT_PAGE_LIMIT)
+    safe_offset = clamp_non_negative_int(offset, default=DEFAULT_PAGE_OFFSET)
+    total, rows = list_skills_by_status(status=status, limit=safe_limit, offset=safe_offset)
     return {"total": total, "items": [skill_from_row(row) for row in rows]}
 
 
 @router.put("/skills/{skill_id}/status")
+@require_write_permission
 async def change_skill_status(skill_id: int, status: str) -> dict:
     """
     更新技能状态（draft → approved → deprecated 生命周期管理）。
@@ -150,13 +185,9 @@ async def change_skill_status(skill_id: int, status: str) -> dict:
     - skill_id: 技能 ID
     - status: 目标状态（draft/approved/deprecated）
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
     status = status.strip().lower()
     if status not in VALID_SKILL_STATUSES:
-        return {"error": f"无效的状态值，有效值为: {', '.join(VALID_SKILL_STATUSES)}"}
+        return _invalid_skill_status_response(include_list_payload=False)
 
     row = await asyncio.to_thread(update_skill_status, skill_id=skill_id, status=status)
     if row is None:
@@ -166,49 +197,26 @@ async def change_skill_status(skill_id: int, status: str) -> dict:
 
 
 @router.post("/skills/{skill_id}/approve")
+@require_write_permission
 async def approve_skill(skill_id: int) -> dict:
     """
     审核通过技能（draft → approved）。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    # 检查当前状态
-    existing = await asyncio.to_thread(get_skill, skill_id=skill_id)
-    if existing is None:
-        return {"error": "技能不存在"}
-
-    current_status = (existing["status"] or "approved").strip().lower()
-    if current_status == "approved":
-        return {"message": "技能已经是 approved 状态", "skill": skill_from_row(existing)}
-
-    row = await asyncio.to_thread(update_skill_status, skill_id=skill_id, status="approved")
-    if row is None:
-        return {"error": "更新失败"}
-
-    return {"success": True, "skill": skill_from_row(row)}
+    return await _set_skill_status_with_guard(
+        skill_id=skill_id,
+        target_status="approved",
+        already_message="技能已经是 approved 状态",
+    )
 
 
 @router.post("/skills/{skill_id}/deprecate")
+@require_write_permission
 async def deprecate_skill(skill_id: int) -> dict:
     """
     废弃技能（approved/draft → deprecated）。
     """
-    permission = ensure_write_permission()
-    if permission:
-        return permission
-
-    existing = await asyncio.to_thread(get_skill, skill_id=skill_id)
-    if existing is None:
-        return {"error": "技能不存在"}
-
-    current_status = (existing["status"] or "approved").strip().lower()
-    if current_status == "deprecated":
-        return {"message": "技能已经是 deprecated 状态", "skill": skill_from_row(existing)}
-
-    row = await asyncio.to_thread(update_skill_status, skill_id=skill_id, status="deprecated")
-    if row is None:
-        return {"error": "更新失败"}
-
-    return {"success": True, "skill": skill_from_row(row)}
+    return await _set_skill_status_with_guard(
+        skill_id=skill_id,
+        target_status="deprecated",
+        already_message="技能已经是 deprecated 状态",
+    )

@@ -138,6 +138,29 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         self.assertEqual(obj["payload"]["workdir"], workdir)
         self.assertIn("timeout_ms", obj["payload"])
 
+    def test_llm_call_parameters_max_output_tokens_is_normalized(self):
+        detail, _ = self._run_react_loop_once(
+            plan_title="llm_call:输出关键假设",
+            allow=["llm_call"],
+            llm_actions=[
+                {
+                    "action": {
+                        "type": "llm_call",
+                        "payload": {
+                            "prompt": "仅测试参数归一化",
+                            "parameters": {"temperature": 0.2, "max_output_tokens": 900},
+                        },
+                    }
+                }
+            ],
+        )
+        obj = json.loads(detail)
+        self.assertEqual(obj["type"], "llm_call")
+        self.assertIn("parameters", obj["payload"])
+        self.assertEqual(obj["payload"]["parameters"]["temperature"], 0.2)
+        self.assertEqual(obj["payload"]["parameters"]["max_tokens"], 900)
+        self.assertNotIn("max_output_tokens", obj["payload"]["parameters"])
+
     def test_shell_command_alias_cmd_missing_workdir_is_auto_filled_before_validation(self):
         """
         回归：模型输出 action.type=cmd（alias）时，也应在校验前补齐 workdir/timeout_ms。
@@ -383,9 +406,9 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         self.assertEqual(obj["payload"]["tool_name"], "web_fetch")
 
 
-    def test_tool_call_web_fetch_self_test_uses_stable_example_url(self):
+    def test_tool_call_web_fetch_self_test_preserves_input_url(self):
         """
-        回归：web_fetch 自测阶段优先使用稳定样例 URL，避免外部站点波动导致自测超时。
+        回归：自测场景不应强制覆写输入 URL，避免把任务目标源替换成无关站点。
         """
         detail, _ = self._run_react_loop_once(
             plan_title="tool_call:自测web_fetch工具 验证可用性",
@@ -406,7 +429,7 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         obj = json.loads(detail)
         self.assertEqual(obj["type"], "tool_call")
         self.assertEqual(obj["payload"]["tool_name"], "web_fetch")
-        self.assertEqual(obj["payload"]["input"], "https://example.com")
+        self.assertEqual(obj["payload"]["input"], "https://wttr.in/Chengdu?format=j1")
 
 
 if __name__ == "__main__":

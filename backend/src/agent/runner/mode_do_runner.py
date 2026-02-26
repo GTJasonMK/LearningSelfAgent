@@ -7,6 +7,7 @@ from typing import Callable, List, Optional
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_loop import run_react_loop
 from backend.src.agent.runner.stream_pump import pump_sync_generator
+from backend.src.services.llm.llm_client import sse_json
 
 
 @dataclass
@@ -40,6 +41,8 @@ class DoExecutionConfig:
     pump_label: str = "react"
     poll_interval_seconds: float = 0.1
     idle_timeout_seconds: float = 300.0
+    heartbeat_min_interval_seconds: float = 3.0
+    heartbeat_trigger_debounce_seconds: float = 0.6
 
 
 async def _run_do_mode_execution_impl(config: DoExecutionConfig) -> DoExecutionResult:
@@ -77,6 +80,18 @@ async def _run_do_mode_execution_impl(config: DoExecutionConfig) -> DoExecutionR
         label=str(pump_label or "react"),
         poll_interval_seconds=float(config.poll_interval_seconds),
         idle_timeout_seconds=float(config.idle_timeout_seconds),
+        heartbeat_builder=lambda: sse_json(
+            {
+                "type": "run_heartbeat",
+                "phase": "do_execution",
+                "task_id": int(task_id),
+                "run_id": int(run_id),
+                "status": "running",
+                "label": str(pump_label or "react"),
+            }
+        ),
+        heartbeat_min_interval_seconds=float(config.heartbeat_min_interval_seconds or 0),
+        heartbeat_trigger_debounce_seconds=float(config.heartbeat_trigger_debounce_seconds or 0),
     ):
         if kind == "msg":
             if payload:

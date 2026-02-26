@@ -13,11 +13,32 @@ from backend.src.constants import (
 from backend.src.services.llm.providers.base import LLMProvider
 
 
+def is_right_codes_provider_name(name: Optional[str]) -> bool:
+    raw = str(name or "").strip().lower()
+    return raw in {
+        "right",
+        "rightcode",
+        "rightcodes",
+        "right-codes",
+        "right_codes",
+        "right.codes",
+        "rc",
+    }
+
+
 def normalize_provider_name(name: Optional[str]) -> str:
     raw = str(name or "").strip().lower()
     if not raw:
         raw = str(os.getenv("LLM_PROVIDER") or "").strip().lower()
-    if raw in {"deepseek", "deepseek-openai", "deepseek_openai"}:
+    # 兼容别名：
+    # - deepseek / right.codes 都走 OpenAI 兼容协议。
+    if raw in {
+        "deepseek",
+        "deepseek-openai",
+        "deepseek_openai",
+    }:
+        return LLM_PROVIDER_OPENAI
+    if is_right_codes_provider_name(raw):
         return LLM_PROVIDER_OPENAI
     return raw or LLM_PROVIDER_OPENAI
 

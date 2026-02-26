@@ -1,8 +1,6 @@
-import json
-import logging
 from typing import Dict, List, Optional
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import now_iso, parse_json_dict, tool_approval_status
 from backend.src.constants import (
     RUN_STATUS_DONE,
     RUN_STATUS_WAITING,
@@ -13,45 +11,16 @@ from backend.src.constants import (
 )
 from backend.src.repositories.tool_call_records_repo import list_tool_calls_with_tool_name_by_run
 from backend.src.repositories.tools_repo import get_tool, update_tool
-from backend.src.services.debug.debug_output import write_task_debug_output
+from backend.src.services.debug.safe_debug import safe_write_debug as _safe_write_debug
 from backend.src.services.skills.tool_skill_autogen import autogen_tool_skill_from_call
 from backend.src.services.tools.tools_store import publish_tool_file
 from backend.src.storage import get_connection
-
-logger = logging.getLogger(__name__)
-
-
-def _safe_write_debug(
-    *,
-    task_id: int,
-    run_id: int,
-    message: str,
-    data: Optional[dict] = None,
-    level: str = "debug",
-) -> None:
-    """
-    工具审批链路的调试输出不应影响主链路：失败时降级为 logger.exception。
-    """
-    try:
-        write_task_debug_output(
-            task_id=int(task_id),
-            run_id=int(run_id),
-            message=message,
-            data=data if isinstance(data, dict) else None,
-            level=level,
-        )
-    except Exception:
-        logger.exception("write_task_debug_output failed: %s", message)
 
 
 def _load_tool_metadata(row) -> Dict:
     if not row or not row["metadata"]:
         return {}
-    try:
-        meta = json.loads(row["metadata"])
-    except Exception:
-        return {}
-    return meta if isinstance(meta, dict) else {}
+    return parse_json_dict(row["metadata"]) or {}
 
 
 def approve_draft_tools_from_run(
@@ -127,7 +96,7 @@ def approve_draft_tools_from_run(
             approval = meta.get(TOOL_METADATA_APPROVAL_KEY)
             if not isinstance(approval, dict):
                 continue
-            status = str(approval.get("status") or "").strip().lower()
+            status = tool_approval_status(meta, approval_key=TOOL_METADATA_APPROVAL_KEY)
             if status != TOOL_APPROVAL_STATUS_DRAFT:
                 continue
             created_run_id = approval.get("created_run_id")

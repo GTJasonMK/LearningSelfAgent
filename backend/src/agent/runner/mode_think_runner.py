@@ -14,7 +14,7 @@ from backend.src.agent.runner.stream_pump import pump_sync_generator
 from backend.src.agent.runner.think_parallel_loop import run_think_parallel_loop
 from backend.src.agent.think import infer_executor_assignments, merge_fix_steps_into_plan, run_reflection
 from backend.src.agent.think.think_execution import _infer_executor_from_allow
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import coerce_int, now_iso
 from backend.src.constants import (
     AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS,
     AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
@@ -24,8 +24,8 @@ from backend.src.constants import (
     STREAM_TAG_FAIL,
     STREAM_TAG_REFLECTION,
 )
-from backend.src.repositories.task_steps_repo import list_task_steps_for_run, mark_task_step_skipped
 from backend.src.services.llm.llm_client import sse_json
+from backend.src.services.tasks.task_queries import list_task_steps_for_run, mark_task_step_skipped
 
 
 @dataclass
@@ -81,12 +81,35 @@ class ThinkExecutionConfig:
     reflection_runner: Optional[Callable[..., Any]] = None
     poll_interval_seconds: float = AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS
     idle_timeout_seconds: float = AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS
+    heartbeat_min_interval_seconds: float = 3.0
+    heartbeat_trigger_debounce_seconds: float = 0.6
 
 
 async def run_think_mode_execution_from_config(
     config: ThinkExecutionConfig,
 ) -> ThinkExecutionResult:
     return await _run_think_mode_execution_impl(config)
+
+
+def _normalize_plan_index(value: object, *, plan_len: int) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        idx = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= idx < int(plan_len):
+        return idx
+    return None
+
+
+def _row_int_value(row: object, key: str, *, default: int = 0) -> int:
+    if isinstance(row, dict):
+        return coerce_int(row.get(key), default=default)
+    try:
+        return coerce_int(row[key], default=default)
+    except (TypeError, KeyError, IndexError):
+        return int(default)
 
 
 def normalize_saved_parallel_dependencies(
@@ -97,7 +120,8 @@ def normalize_saved_parallel_dependencies(
     """
     将 state 中缓存的依赖结构标准化为并行执行器可消费的格式。
     """
-    if not isinstance(saved_dependencies, list) or int(plan_len) <= 0:
+    normalized_plan_len = coerce_int(plan_len, default=0)
+    if not isinstance(saved_dependencies, list) or normalized_plan_len <= 0:
         return None
     normalized: List[dict] = []
     for item in saved_dependencies:
@@ -105,22 +129,17 @@ def normalize_saved_parallel_dependencies(
             continue
         raw_idx = item.get("step_index")
         raw_deps = item.get("depends_on")
-        try:
-            step_idx = int(raw_idx) if raw_idx is not None else None
-        except (TypeError, ValueError):
-            step_idx = None
-        if step_idx is None or not (0 <= int(step_idx) < int(plan_len)):
+        step_idx = _normalize_plan_index(raw_idx, plan_len=normalized_plan_len)
+        if step_idx is None:
             continue
         deps_list: List[int] = []
         if isinstance(raw_deps, list):
             for dep in raw_deps:
-                try:
-                    dep_idx = int(dep)
-                except (TypeError, ValueError):
+                dep_idx = _normalize_plan_index(dep, plan_len=normalized_plan_len)
+                if dep_idx is None or dep_idx == step_idx:
                     continue
-                if 0 <= int(dep_idx) < int(plan_len) and int(dep_idx) != int(step_idx):
-                    deps_list.append(int(dep_idx))
-        normalized.append({"step_index": int(step_idx), "depends_on": sorted(set(deps_list))})
+                deps_list.append(dep_idx)
+        normalized.append({"step_index": step_idx, "depends_on": sorted(set(deps_list))})
     return normalized or None
 
 
@@ -178,9 +197,9 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
     yield_func = config.yield_func
     persist_reflection_plan_func = config.persist_reflection_plan_func
     safe_write_debug = config.safe_write_debug
-    start_step_order = int(config.start_step_order or 1)
-    initial_reflection_count = int(config.initial_reflection_count or 0)
-    max_reflection_rounds = int(config.max_reflection_rounds or 2)
+    start_step_order = coerce_int(config.start_step_order or 1, default=1)
+    initial_reflection_count = coerce_int(config.initial_reflection_count or 0, default=0)
+    max_reflection_rounds = coerce_int(config.max_reflection_rounds or 2, default=2)
     parallel_variables_source = str(config.parallel_variables_source or "agent_think_parallel")
     tail_variables_source = str(config.tail_variables_source or "agent_think_react_tail")
     parallel_pump_label = str(config.parallel_pump_label or "think_parallel")
@@ -198,6 +217,8 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
     reflection_runner = config.reflection_runner or run_reflection
     poll_interval_seconds = float(config.poll_interval_seconds or AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS)
     idle_timeout_seconds = float(config.idle_timeout_seconds or AGENT_STREAM_PUMP_IDLE_TIMEOUT_SECONDS)
+    heartbeat_min_interval_seconds = float(config.heartbeat_min_interval_seconds or 0)
+    heartbeat_trigger_debounce_seconds = float(config.heartbeat_trigger_debounce_seconds or 0)
 
     if not isinstance(config.plan_struct, PlanStructure):
         raise TypeError("ThinkExecutionConfig.plan_struct 必须是 PlanStructure 实例")
@@ -226,6 +247,18 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
             label=str(label or "think"),
             poll_interval_seconds=float(poll_interval_seconds),
             idle_timeout_seconds=float(idle_timeout_seconds),
+            heartbeat_builder=lambda: sse_json(
+                {
+                    "type": "run_heartbeat",
+                    "phase": "think_execution",
+                    "task_id": int(task_id),
+                    "run_id": int(run_id),
+                    "status": "running",
+                    "label": str(label or "think"),
+                }
+            ),
+            heartbeat_min_interval_seconds=float(heartbeat_min_interval_seconds),
+            heartbeat_trigger_debounce_seconds=float(heartbeat_trigger_debounce_seconds),
         ):
             if kind == "msg":
                 if payload:
@@ -254,8 +287,8 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
 
     run_status = RUN_STATUS_DONE
     last_step_order = 0
-    reflection_count = max(0, int(initial_reflection_count or 0))
-    start_step = max(1, int(start_step_order or 1))
+    reflection_count = max(0, coerce_int(initial_reflection_count or 0, default=0))
+    start_step = max(1, coerce_int(start_step_order or 1, default=1))
     plan_modified = False
 
     while True:
@@ -337,7 +370,7 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
 
         if run_status != RUN_STATUS_FAILED:
             break
-        if reflection_count >= int(max_reflection_rounds):
+        if reflection_count >= coerce_int(max_reflection_rounds, default=0):
             yield_func(sse_json({"delta": f"{STREAM_TAG_FAIL} 已达反思次数上限（{max_reflection_rounds}次），停止执行\n"}))
             break
 
@@ -443,11 +476,14 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
             target_error = ""
             for row in reversed(step_rows or []):
                 try:
-                    if int(row["step_order"] or 0) != int(last_step_order):
+                    if _row_int_value(row, "step_order", default=0) != coerce_int(last_step_order, default=0):
                         continue
                     if str(row["status"] or "").strip() != str(STEP_STATUS_FAILED or "failed"):
                         continue
-                    target_id = int(row["id"])
+                    candidate_id = _row_int_value(row, "id", default=0)
+                    if candidate_id <= 0:
+                        continue
+                    target_id = candidate_id
                     target_error = str(row["error"] or "").strip()
                     break
                 except (TypeError, ValueError, KeyError):

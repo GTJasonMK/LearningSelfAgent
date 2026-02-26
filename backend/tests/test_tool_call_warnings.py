@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch
 
@@ -66,6 +67,177 @@ class TestToolCallWarnings(unittest.TestCase):
         self.assertIsInstance(record, dict)
         self.assertIsNotNone(error)
         self.assertIn("web_fetch", str(error))
+        self.assertIn("rate_limited", str(error))
+        self.assertIn("too_many_requests", str(error))
+
+    def test_web_fetch_semantic_error_success_false_returns_error(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 抓取页面"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "https://api.exchangerate.host/timeseries",
+            "output": "",
+        }
+        semantic_error_output = (
+            '{'
+            '"success": false, '
+            '"error": {"type": "missing_access_key", "info": "access key required"}'
+            '}'
+        )
+
+        with patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            return_value=(semantic_error_output, None),
+        ), patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            return_value={
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": "https://api.exchangerate.host/timeseries",
+                    "output": semantic_error_output,
+                }
+            },
+        ):
+            record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsInstance(record, dict)
+        self.assertIsNotNone(error)
+        self.assertIn("web_fetch", str(error))
+        self.assertIn("missing_api_key", str(error))
+        self.assertIn("missing_access_key", str(error))
+
+    def test_web_fetch_daily_hits_limit_is_treated_as_rate_limited(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 抓取页面"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "https://stooq.com/q/d/l/?s=xauusd&i=d",
+            "output": "",
+        }
+
+        with patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            return_value=("Exceeded the daily hits limit", None),
+        ), patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            return_value={
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": payload["input"],
+                    "output": "Exceeded the daily hits limit",
+                }
+            },
+        ):
+            _record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNotNone(error)
+        self.assertIn("rate_limited", str(error))
+        self.assertIn("daily hits limit", str(error))
+
+    def test_web_fetch_block_marker_can_be_extended_by_env(self):
+        from backend.src.actions.handlers import tool_call as tool_call_module
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 抓取页面"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "https://demo.example.org",
+            "output": "",
+        }
+
+        with patch.dict(
+            os.environ,
+            {"AGENT_WEB_FETCH_BLOCK_MARKERS_JSON": '[["upstream waf triggered", "request_blocked"]]'},
+            clear=False,
+        ):
+            tool_call_module._get_web_fetch_block_markers.cache_clear()
+            with patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+                "backend.src.actions.handlers.tool_call.get_tool_by_name",
+                return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+            ), patch(
+                "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+            ), patch(
+                "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+                return_value=("upstream waf triggered", None),
+            ), patch(
+                "backend.src.actions.handlers.tool_call._create_tool_record",
+                return_value={
+                    "record": {
+                        "tool_id": 1,
+                        "tool_name": "web_fetch",
+                        "input": payload["input"],
+                        "output": "upstream waf triggered",
+                    }
+                },
+            ):
+                _record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        tool_call_module._get_web_fetch_block_markers.cache_clear()
+        self.assertIsNotNone(error)
+        self.assertIn("web_fetch_blocked", str(error))
+        self.assertIn("request_blocked", str(error))
+
+    def test_web_fetch_status_line_429_is_treated_as_rate_limited(self):
+        from backend.src.actions.handlers import tool_call as tool_call_module
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 抓取页面"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "https://rate.example.org",
+            "output": "",
+        }
+
+        tool_call_module._get_web_fetch_block_markers.cache_clear()
+        with patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            return_value=("HTTP/1.1 429", None),
+        ), patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            return_value={
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": payload["input"],
+                    "output": "HTTP/1.1 429",
+                }
+            },
+        ):
+            _record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNotNone(error)
+        self.assertIn("rate_limited", str(error))
         self.assertIn("too_many_requests", str(error))
 
 

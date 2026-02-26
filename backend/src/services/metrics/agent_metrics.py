@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from backend.src.common.utils import extract_json_object, now_iso
+from backend.src.common.sql import in_clause_placeholders
+from backend.src.common.utils import coerce_int, extract_json_object, now_iso
 from backend.src.storage import get_connection
+
 
 
 def _chunked(values: List[int], chunk_size: int = 900) -> List[List[int]]:
@@ -17,10 +19,7 @@ def _chunked(values: List[int], chunk_size: int = 900) -> List[List[int]]:
 
 
 def _resolve_since_iso(*, since_days: int) -> Tuple[int, Optional[str]]:
-    try:
-        days = int(since_days)
-    except Exception:
-        days = 30
+    days = coerce_int(since_days, default=30)
     if days <= 0:
         days = 30
     try:
@@ -30,6 +29,32 @@ def _resolve_since_iso(*, since_days: int) -> Tuple[int, Optional[str]]:
     except Exception:
         since = None
     return days, since
+
+
+def _query_one_with_optional_since(
+    conn,
+    *,
+    sql_prefix: str,
+    since: Optional[str],
+    has_where: bool = False,
+) -> Optional[object]:
+    if since:
+        joiner = " AND " if has_where else " WHERE "
+        return conn.execute(f"{sql_prefix}{joiner}created_at >= ?", (str(since),)).fetchone()
+    return conn.execute(sql_prefix).fetchone()
+
+
+def _query_all_with_optional_since(
+    conn,
+    *,
+    sql_prefix: str,
+    since: Optional[str],
+    has_where: bool = False,
+) -> List[object]:
+    if since:
+        joiner = " AND " if has_where else " WHERE "
+        return list(conn.execute(f"{sql_prefix}{joiner}created_at >= ?", (str(since),)).fetchall())
+    return list(conn.execute(sql_prefix).fetchall())
 
 
 def _classify_distill_block_reason(*, distill_status: str, distill_notes: str) -> str:
@@ -88,25 +113,14 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
         run_ids: List[int] = []
         runs: List[dict] = []
         for row in run_rows or []:
-            try:
-                rid = int(row["id"])
-            except Exception:
-                continue
+            rid = coerce_int(row["id"], default=0)
             if rid <= 0:
                 continue
             run_ids.append(rid)
             state_obj = extract_json_object(row["agent_state"] or "") or {}
             mode = str(state_obj.get("mode") or "").strip().lower() or "do"
-            replan_attempts = 0
-            reflection_count = 0
-            try:
-                replan_attempts = int(state_obj.get("replan_attempts") or 0)
-            except Exception:
-                replan_attempts = 0
-            try:
-                reflection_count = int(state_obj.get("reflection_count") or 0)
-            except Exception:
-                reflection_count = 0
+            replan_attempts = coerce_int(state_obj.get("replan_attempts") or 0, default=0)
+            reflection_count = coerce_int(state_obj.get("reflection_count") or 0, default=0)
             runs.append(
                 {
                     "run_id": rid,
@@ -122,65 +136,56 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
         token_sums: Dict[int, int] = {}
         if run_ids:
             for chunk in _chunked(run_ids):
-                placeholders = ",".join(["?"] * len(chunk))
+                placeholders = in_clause_placeholders(chunk)
+                if not placeholders:
+                    continue
                 rows = conn.execute(
                     f"SELECT run_id, COUNT(*) AS c FROM task_steps WHERE run_id IN ({placeholders}) GROUP BY run_id",
                     chunk,
                 ).fetchall()
                 for r in rows or []:
-                    try:
-                        step_counts[int(r["run_id"])] = int(r["c"] or 0)
-                    except Exception:
+                    rid = coerce_int(r["run_id"], default=0)
+                    if rid <= 0:
                         continue
+                    step_counts[rid] = coerce_int(r["c"] or 0, default=0)
 
                 rows = conn.execute(
                     f"SELECT run_id, COALESCE(SUM(tokens_total), 0) AS t FROM llm_records WHERE run_id IN ({placeholders}) GROUP BY run_id",
                     chunk,
                 ).fetchall()
                 for r in rows or []:
-                    try:
-                        token_sums[int(r["run_id"])] = int(r["t"] or 0)
-                    except Exception:
+                    rid = coerce_int(r["run_id"], default=0)
+                    if rid <= 0:
                         continue
+                    token_sums[rid] = coerce_int(r["t"] or 0, default=0)
 
         # tool reuse stats（时间窗内）
-        if since:
-            tool_row = conn.execute(
-                """
+        tool_row = _query_one_with_optional_since(
+            conn,
+            sql_prefix="""
                 SELECT
                     COUNT(*) AS calls,
                     COALESCE(SUM(reuse), 0) AS reuse_calls,
                     COALESCE(SUM(CASE WHEN reuse_status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_calls,
                     COALESCE(SUM(CASE WHEN reuse_status = 'fail' THEN 1 ELSE 0 END), 0) AS fail_calls
                 FROM tool_call_records
-                WHERE created_at >= ?
-                """,
-                (str(since),),
-            ).fetchone()
-        else:
-            tool_row = conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS calls,
-                    COALESCE(SUM(reuse), 0) AS reuse_calls,
-                    COALESCE(SUM(CASE WHEN reuse_status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_calls,
-                    COALESCE(SUM(CASE WHEN reuse_status = 'fail' THEN 1 ELSE 0 END), 0) AS fail_calls
-                FROM tool_call_records
-                """,
-            ).fetchone()
+            """,
+            since=since,
+            has_where=False,
+        )
 
-        calls = int(tool_row["calls"] or 0) if tool_row else 0
-        reuse_calls = int(tool_row["reuse_calls"] or 0) if tool_row else 0
+        calls = coerce_int(tool_row["calls"] or 0, default=0) if tool_row else 0
+        reuse_calls = coerce_int(tool_row["reuse_calls"] or 0, default=0) if tool_row else 0
         reuse_rate = (float(reuse_calls) / float(calls)) if calls else 0.0
-        pass_calls = int(tool_row["pass_calls"] or 0) if tool_row else 0
-        fail_calls = int(tool_row["fail_calls"] or 0) if tool_row else 0
+        pass_calls = coerce_int(tool_row["pass_calls"] or 0, default=0) if tool_row else 0
+        fail_calls = coerce_int(tool_row["fail_calls"] or 0, default=0) if tool_row else 0
         denom = pass_calls + fail_calls
         reuse_pass_rate = (float(pass_calls) / float(denom)) if denom else 0.0
 
         # review stats（时间窗内）
-        if since:
-            review_row = conn.execute(
-                """
+        review_row = _query_one_with_optional_since(
+            conn,
+            sql_prefix="""
                 SELECT
                     COUNT(*) AS total,
                     COALESCE(SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_count,
@@ -189,53 +194,33 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
                     COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'deny' THEN 1 ELSE 0 END), 0) AS distill_deny_count,
                     COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'allow' AND distill_evidence_refs IS NOT NULL AND TRIM(distill_evidence_refs) NOT IN ('', '[]', 'null') THEN 1 ELSE 0 END), 0) AS distill_allow_with_evidence_count
                 FROM agent_review_records
-                WHERE created_at >= ?
-                """,
-                (str(since),),
-            ).fetchone()
-        else:
-            review_row = conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    COALESCE(SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END), 0) AS pass_count,
-                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'allow' THEN 1 ELSE 0 END), 0) AS distill_allow_count,
-                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'manual' THEN 1 ELSE 0 END), 0) AS distill_manual_count,
-                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'deny' THEN 1 ELSE 0 END), 0) AS distill_deny_count,
-                    COALESCE(SUM(CASE WHEN status = 'pass' AND distill_status = 'allow' AND distill_evidence_refs IS NOT NULL AND TRIM(distill_evidence_refs) NOT IN ('', '[]', 'null') THEN 1 ELSE 0 END), 0) AS distill_allow_with_evidence_count
-                FROM agent_review_records
-                """,
-            ).fetchone()
+            """,
+            since=since,
+            has_where=False,
+        )
 
-        review_total = int(review_row["total"] or 0) if review_row else 0
-        review_pass = int(review_row["pass_count"] or 0) if review_row else 0
-        distill_allow = int(review_row["distill_allow_count"] or 0) if review_row else 0
-        distill_manual = int(review_row["distill_manual_count"] or 0) if review_row else 0
-        distill_deny = int(review_row["distill_deny_count"] or 0) if review_row else 0
+        review_total = coerce_int(review_row["total"] or 0, default=0) if review_row else 0
+        review_pass = coerce_int(review_row["pass_count"] or 0, default=0) if review_row else 0
+        distill_allow = coerce_int(review_row["distill_allow_count"] or 0, default=0) if review_row else 0
+        distill_manual = coerce_int(review_row["distill_manual_count"] or 0, default=0) if review_row else 0
+        distill_deny = coerce_int(review_row["distill_deny_count"] or 0, default=0) if review_row else 0
         distill_allow_with_evidence = (
-            int(review_row["distill_allow_with_evidence_count"] or 0) if review_row else 0
+            coerce_int(review_row["distill_allow_with_evidence_count"] or 0, default=0) if review_row else 0
         )
         distill_rate = (float(distill_allow) / float(review_pass)) if review_pass else 0.0
         evidence_coverage = (float(distill_allow_with_evidence) / float(distill_allow)) if distill_allow else 0.0
 
         # distill block reasons（仅在 pass 场景观察：任务完成但不沉淀）
-        if since:
-            rows = conn.execute(
-                """
-                SELECT distill_status, distill_notes
-                FROM agent_review_records
-                WHERE status = 'pass' AND created_at >= ? AND distill_status IN ('manual', 'deny')
-                """,
-                (str(since),),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
+        rows = _query_all_with_optional_since(
+            conn,
+            sql_prefix="""
                 SELECT distill_status, distill_notes
                 FROM agent_review_records
                 WHERE status = 'pass' AND distill_status IN ('manual', 'deny')
-                """,
-            ).fetchall()
+            """,
+            since=since,
+            has_where=True,
+        )
 
         distill_block_reasons: Dict[str, int] = {}
         for r in rows or []:
@@ -272,11 +257,11 @@ def compute_agent_metrics(*, since_days: int = 30) -> dict:
         elif status == "waiting":
             waiting += 1
 
-        rid = int(r.get("run_id") or 0)
-        total_steps += int(step_counts.get(rid) or 0)
-        total_tokens += int(token_sums.get(rid) or 0)
-        total_replan += int(r.get("replan_attempts") or 0)
-        total_reflection += int(r.get("reflection_count") or 0)
+        rid = coerce_int(r.get("run_id") or 0, default=0)
+        total_steps += coerce_int(step_counts.get(rid) or 0, default=0)
+        total_tokens += coerce_int(token_sums.get(rid) or 0, default=0)
+        total_replan += coerce_int(r.get("replan_attempts") or 0, default=0)
+        total_reflection += coerce_int(r.get("reflection_count") or 0, default=0)
 
     denom_success = done + failed
     success_rate = (float(done) / float(denom_success)) if denom_success else 0.0

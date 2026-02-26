@@ -22,9 +22,9 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Generator, List, Optional, Set, Tuple
 
-from backend.src.actions.registry import action_types_line
 from backend.src.agent.observation import _truncate_observation
 from backend.src.agent.plan_utils import extract_file_write_target_path
+from backend.src.agent.source_failure_summary import summarize_recent_source_failures_for_prompt
 from backend.src.agent.runner.feedback import is_task_feedback_step_title
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_loop_impl import _enforce_allow_constraints
@@ -36,6 +36,8 @@ from backend.src.agent.runner.react_step_executor import (
     yield_memory_write_event,
     yield_visible_result,
 )
+from backend.src.agent.runner.react_helpers import build_react_step_prompt
+from backend.src.agent.runner.capability_router import build_capability_hint, resolve_step_capability
 from backend.src.agent.runner.plan_events import sse_plan_delta
 from backend.src.agent.runner.react_state_manager import persist_loop_state
 from backend.src.agent.think.think_execution import _infer_executor_from_allow
@@ -60,12 +62,9 @@ from backend.src.constants import (
     STREAM_TAG_OK,
     STREAM_TAG_SKIP,
     STREAM_TAG_STEP,
-    AGENT_EXPERIMENT_DIR_REL,
     AGENT_THINK_PARALLEL_PERSIST_MIN_INTERVAL_SECONDS,
-    AGENT_REACT_STEP_PROMPT_TEMPLATE,
-    ASSISTANT_OUTPUT_STYLE_GUIDE,
 )
-from backend.src.repositories.task_steps_repo import (
+from backend.src.services.tasks.task_queries import (
     TaskStepCreateParams,
     create_task_step,
     mark_task_step_done,
@@ -144,49 +143,56 @@ def _build_dependency_map(
     total = len(plan_titles or [])
     dep_sets: List[Set[int]] = [set() for _ in range(total)]
 
+    def _to_int(value: object) -> Optional[int]:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_dep_index(value: object, base: int) -> Optional[int]:
+        parsed = _to_int(value)
+        if parsed is None:
+            return None
+        return int(parsed) - int(base)
+
+    def _iter_explicit_dependency_edges(base: int) -> List[Tuple[int, int]]:
+        """
+        解析 dependencies 中的显式依赖，统一产出 (from_step, to_step) 边。
+        """
+        edges: List[Tuple[int, int]] = []
+        for dep in dependencies or []:
+            if not isinstance(dep, dict):
+                continue
+            if "from_step" in dep and "to_step" in dep:
+                from_step = _normalize_dep_index(dep.get("from_step"), base)
+                to_step = _normalize_dep_index(dep.get("to_step"), base)
+                if from_step is None or to_step is None or from_step == to_step:
+                    continue
+                edges.append((int(from_step), int(to_step)))
+                continue
+            if "step_index" in dep and "depends_on" in dep:
+                step_index = _normalize_dep_index(dep.get("step_index"), base)
+                if step_index is None:
+                    continue
+                raw_deps = dep.get("depends_on")
+                if not isinstance(raw_deps, list):
+                    continue
+                for item in raw_deps:
+                    dep_index = _normalize_dep_index(item, base)
+                    if dep_index is None or dep_index == step_index:
+                        continue
+                    edges.append((int(dep_index), int(step_index)))
+        return edges
+
     # docs/agent：依赖索引约定为 0-based，但 LLM 可能误输出 1-based。
     # 这里做一次全局归一化：选择“有效边数更多”的解释方案。
     dep_index_base = 0
     if dependencies and total > 0:
-        def _to_int(value: object) -> Optional[int]:
-            try:
-                return int(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return None
-
         def _count_valid_edges(base: int) -> int:
             n = 0
-            for dep in dependencies or []:
-                if not isinstance(dep, dict):
-                    continue
-                if "from_step" in dep and "to_step" in dep:
-                    a = _to_int(dep.get("from_step"))
-                    b = _to_int(dep.get("to_step"))
-                    if a is None or b is None:
-                        continue
-                    a -= int(base)
-                    b -= int(base)
-                    if 0 <= a < total and 0 <= b < total and a != b:
-                        n += 1
-                    continue
-                if "step_index" in dep and "depends_on" in dep:
-                    si = _to_int(dep.get("step_index"))
-                    if si is None:
-                        continue
-                    si -= int(base)
-                    if not (0 <= si < total):
-                        continue
-                    raw = dep.get("depends_on")
-                    if not isinstance(raw, list):
-                        continue
-                    for item in raw:
-                        d = _to_int(item)
-                        if d is None:
-                            continue
-                        d -= int(base)
-                        if 0 <= d < total and d != si:
-                            n += 1
-                    continue
+            for from_step, to_step in _iter_explicit_dependency_edges(base):
+                if 0 <= from_step < total and 0 <= to_step < total and from_step != to_step:
+                    n += 1
             return n
 
         valid0 = _count_valid_edges(0)
@@ -248,37 +254,9 @@ def _build_dependency_map(
         return value
 
     # 1) 来自 LLM 的显式依赖
-    for dep in dependencies or []:
-        if not isinstance(dep, dict):
-            continue
-        if "from_step" in dep and "to_step" in dep:
-            try:
-                from_step = int(dep.get("from_step")) - int(dep_index_base)
-                to_step = int(dep.get("to_step")) - int(dep_index_base)
-            except (TypeError, ValueError):
-                continue
-            if 0 <= from_step < total and 0 <= to_step < total and from_step != to_step:
-                dep_sets[to_step].add(from_step)
-            continue
-
-        if "step_index" in dep and "depends_on" in dep:
-            try:
-                step_index = int(dep.get("step_index")) - int(dep_index_base)
-            except (TypeError, ValueError):
-                continue
-            if not (0 <= step_index < total):
-                continue
-            raw_deps = dep.get("depends_on")
-            if not isinstance(raw_deps, list):
-                continue
-            for item in raw_deps:
-                try:
-                    d = int(item) - int(dep_index_base)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= d < total and d != step_index:
-                    dep_sets[step_index].add(d)
-            continue
+    for from_step, to_step in _iter_explicit_dependency_edges(dep_index_base):
+        if 0 <= from_step < total and 0 <= to_step < total and from_step != to_step:
+            dep_sets[to_step].add(from_step)
 
     # 2) artifacts 引用的隐式依赖（尽量 deterministic，不再调用 LLM）
     file_producers: Dict[str, int] = {}
@@ -510,7 +488,9 @@ def run_think_parallel_loop(
     )
 
     # 共享状态
-    out_q: "queue.Queue[str]" = queue.Queue()
+    # maxsize 限制：避免消费端（SSE pump）跟不上生产端时内存无限增长；
+    # 设为较大值（10000）保证正常流程不会阻塞，只防范异常堆积。
+    out_q: "queue.Queue[str]" = queue.Queue(maxsize=10000)
     state_lock = threading.Lock()
     cond = threading.Condition(state_lock)
     stop_event = threading.Event()
@@ -892,27 +872,45 @@ def run_think_parallel_loop(
         # 构造 prompt（观测取最后 3 条）
         with state_lock:
             obs_text = "\n".join(f"- {_truncate_observation(o)}" for o in observations[-3:]) or "(无)"
+            failure_signatures = (
+                dict(agent_state.get("failure_signatures"))
+                if isinstance(agent_state, dict) and isinstance(agent_state.get("failure_signatures"), dict)
+                else None
+            )
+            obs_snapshot = list(observations or [])
 
-        react_prompt = AGENT_REACT_STEP_PROMPT_TEMPLATE.format(
-            now=now_iso(),
+        source_failure_summary = summarize_recent_source_failures_for_prompt(
+            observations=obs_snapshot,
+            failure_signatures=failure_signatures,
+        )
+
+        budget_meta: dict = {}
+        react_prompt = build_react_step_prompt(
+            now_utc=now_iso(),
             workdir=workdir,
-            agent_workspace=AGENT_EXPERIMENT_DIR_REL,
             message=message,
             plan=plan_struct.get_titles_json(),
             step_index=step_order,
             step_title=title,
             allowed_actions=allow_text,
             observations=obs_text,
+            recent_source_failures=source_failure_summary,
             graph=graph_hint,
             tools=tools_hint,
             skills=skills_hint,
             memories=memories_hint,
-            output_style=ASSISTANT_OUTPUT_STYLE_GUIDE,
-            action_types_line=action_types_line(),
+            disallow_plan_patch=True,
+            capability_hint=build_capability_hint(
+                capability=resolve_step_capability(
+                    allowed_actions=list(allow or []),
+                    step_title=title,
+                )
+            ),
+            budget_meta_sink=budget_meta,
         )
-        # Think 并行执行器不支持 plan_patch：避免模型“输出了计划修正但实际上不会生效”造成隐性卡死。
-        # 与 docs/agent 对齐：Think 失败由外层反思机制插入修复步骤，而不是在并行执行中做 plan_patch。
-        react_prompt += "\n额外约束：当前为 Think 并行执行阶段，不支持 plan_patch。请不要输出 plan_patch 字段（或始终为 null）。\n"
+        with state_lock:
+            if isinstance(agent_state, dict):
+                agent_state["context_budget_last_meta"] = dict(budget_meta or {})
 
         # 生成 action
         action_obj, action_type, payload_obj, action_validate_error, last_action_text = generate_action_with_retry(
@@ -1257,9 +1255,9 @@ def run_think_parallel_loop(
         stop_event.set()
         with state_lock:
             cond.notify_all()
-        # 尽量快速退出；daemon 线程可由进程回收
+        # 等待工作线程退出；给足时间让 DB 操作完成，避免强制终止导致事务中断
         for t in threads:
-            t.join(timeout=0.2)
+            t.join(timeout=2.0)
         # 退出前强制落盘一次，避免节流导致最后若干步状态未写入 DB。
         with state_lock:
             if bool(persist_ctrl.get("dirty")):

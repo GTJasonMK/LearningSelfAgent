@@ -1,8 +1,11 @@
 import json
+import importlib.util
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
+
+HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
 
 
 class TestAgentMetrics(unittest.TestCase):
@@ -220,6 +223,8 @@ class TestAgentMetrics(unittest.TestCase):
         self.assertEqual(metrics["reviews"]["distill_block_reasons_among_pass"].get("evaluator_denied"), 1)
 
     def test_metrics_agent_route(self):
+        if not HAS_FASTAPI:
+            self.skipTest("fastapi 未安装，跳过路由层测试")
         from backend.src.api.system.routes_metrics import metrics_agent
         from backend.src.services.metrics.agent_metrics import compute_agent_metrics
 

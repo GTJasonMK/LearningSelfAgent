@@ -7,8 +7,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.src.api.routes import router as api_router
+from backend.src.common.app_error_utils import app_error_response
 from backend.src.common.errors import AppError
-from backend.src.common.utils import error_response
 from backend.src.constants import APP_TITLE
 from backend.src.storage import init_db
 from backend.src.services.tasks.task_recovery import stop_running_task_records
@@ -104,7 +104,7 @@ def create_app() -> FastAPI:
     @app.exception_handler(AppError)
     async def _handle_app_error(request: Request, exc: AppError):
         # 统一服务层异常协议：services 层只 raise AppError；API 层/全局 handler 转为 HTTP JSONResponse。
-        return error_response(exc.code, exc.message, exc.status_code)
+        return app_error_response(exc)
 
     app.add_middleware(
         CORSMiddleware,

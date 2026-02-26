@@ -1,9 +1,10 @@
 import logging
-import json
 from typing import Optional
 
 from backend.src.actions.registry import get_action_spec, normalize_action_type
+from backend.src.actions.post_action_verifier import verify_and_normalize_action_result
 from backend.src.common.errors import AppError
+from backend.src.common.utils import parse_json_dict
 from backend.src.constants import (
     ACTION_TYPE_LLM_CALL,
     ERROR_MESSAGE_ACTION_UNSUPPORTED,
@@ -27,9 +28,8 @@ def _execute_step_action(
     detail = step_row["detail"]
     if not detail:
         return None, ERROR_MESSAGE_PROMPT_RENDER_FAILED
-    try:
-        action = json.loads(detail)
-    except json.JSONDecodeError:
+    action = parse_json_dict(detail)
+    if not action:
         return None, ERROR_MESSAGE_PROMPT_RENDER_FAILED
     raw_type = action.get("type")
     action_type = normalize_action_type(raw_type) or raw_type
@@ -61,7 +61,14 @@ def _execute_step_action(
             logger.debug("drop_extra_payload_keys action_type=%s extra=%s", action_type, extra_keys)
 
     try:
-        return spec.executor(int(task_id), int(run_id), step_row, payload, context)
+        result, error = spec.executor(int(task_id), int(run_id), step_row, payload, context)
+        return verify_and_normalize_action_result(
+            action_type=action_type,
+            payload=payload,
+            result=result,
+            error=error,
+            context=context,
+        )
     except AppError as exc:
         message = str(exc.message or "").strip()
         return None, message or ERROR_MESSAGE_PROMPT_RENDER_FAILED

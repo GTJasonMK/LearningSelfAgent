@@ -1,6 +1,7 @@
 import json
-from typing import Any, Dict, List, Optional
-from backend.src.common.utils import extract_json_object, now_iso, truncate_text
+import logging
+from typing import Any, Dict, Optional
+from backend.src.common.utils import coerce_str_list, extract_json_object, now_iso, parse_json_value, truncate_text
 from backend.src.constants import (
     DEFAULT_SKILL_VERSION,
     SKILL_DEFAULT_CATEGORY,
@@ -13,25 +14,7 @@ from backend.src.services.skills.skills_publish import classify_and_publish_skil
 from backend.src.services.knowledge.skill_tag_policy import normalize_skill_tags
 from backend.src.storage import get_connection
 
- 
-
-
-def _as_str_list(value: Any, max_items: int) -> List[str]:
-    if value is None:
-        return []
-    items: List[str] = []
-    if isinstance(value, list):
-        for item in value:
-            text = str(item).strip()
-            if text:
-                items.append(text)
-            if len(items) >= max_items:
-                break
-        return items
-    text = str(value).strip()
-    return [text] if text else []
-
-
+logger = logging.getLogger(__name__)
 def _tool_scope(tool_id: int) -> str:
     return f"{SKILL_SCOPE_TOOL_PREFIX}{int(tool_id)}"
 
@@ -40,7 +23,7 @@ def find_tool_skill_id(tool_id: int) -> Optional[int]:
     scope = _tool_scope(tool_id)
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT id FROM skills_items WHERE scope = ? ORDER BY id DESC LIMIT 1",
+            "SELECT id FROM skills_items WHERE scope = ? ORDER BY id ASC LIMIT 1",
             (scope,),
         ).fetchone()
     if not row:
@@ -88,12 +71,7 @@ def autogen_tool_skill_from_call(
     tool_name = str(tool_row["name"] or "").strip()
     tool_description = str(tool_row["description"] or "").strip()
     tool_version = str(tool_row["version"] or "").strip()
-    metadata_obj = None
-    if tool_row["metadata"]:
-        try:
-            metadata_obj = json.loads(tool_row["metadata"])
-        except json.JSONDecodeError:
-            metadata_obj = None
+    metadata_obj = parse_json_value(tool_row["metadata"]) if tool_row["metadata"] else None
 
     tool_payload = {
         "tool": {
@@ -129,12 +107,12 @@ def autogen_tool_skill_from_call(
 
     name = str(meta.get("name") or "").strip()
     description = str(meta.get("description") or "").strip()
-    steps = _as_str_list(meta.get("steps"), max_items=10)
-    validation = _as_str_list(meta.get("validation"), max_items=6)
-    failure_modes = _as_str_list(meta.get("failure_modes"), max_items=6)
-    tags = _as_str_list(meta.get("tags"), max_items=12)
-    triggers = _as_str_list(meta.get("triggers"), max_items=18)
-    aliases = _as_str_list(meta.get("aliases"), max_items=6)
+    steps = coerce_str_list(meta.get("steps"), max_items=10)
+    validation = coerce_str_list(meta.get("validation"), max_items=6)
+    failure_modes = coerce_str_list(meta.get("failure_modes"), max_items=6)
+    tags = coerce_str_list(meta.get("tags"), max_items=12)
+    triggers = coerce_str_list(meta.get("triggers"), max_items=18)
+    aliases = coerce_str_list(meta.get("aliases"), max_items=6)
 
     if not name:
         return {"ok": False, "error": "missing_field:name", "model": model_value}
@@ -163,7 +141,14 @@ def autogen_tool_skill_from_call(
     tags.append("domain:misc")
 
     # tags 规范化：避免 LLM 输出污染检索索引
-    tags, _issues = normalize_skill_tags(tags, strict_keys=False)
+    tags, tag_issues = normalize_skill_tags(tags, strict_keys=False)
+    if tag_issues:
+        logger.warning("tool_skill_autogen: tag normalization issues for tool %d: %s", tool_id_value, tag_issues)
+
+    # 创建前二次检查（防止 LLM 调用期间另一个线程已创建同 scope 的技能）
+    recheck_id = find_tool_skill_id(tool_id_value)
+    if recheck_id is not None:
+        return {"ok": True, "status": "exists", "skill_id": recheck_id}
 
     skill_id = create_skill(
         SkillCreateParams(

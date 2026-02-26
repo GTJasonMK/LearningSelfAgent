@@ -1,9 +1,11 @@
 // 任务标签页模块
 
 import * as api from "../api.js";
+import { streamSse } from "../streaming.js";
 import {
   UI_TEXT,
-  TASK_STATUS
+  TASK_STATUS,
+  INPUT_ATTRS
 } from "../constants.js";
 import { createEventManager, formatTemplate, debounce } from "../utils.js";
 import {
@@ -13,6 +15,26 @@ import {
   validateOptionalNumber,
   attachFormClear
 } from "../form-utils.js";
+import { normalizeRunStatusValue } from "../run_status.js";
+import {
+  inferNeedInputChoices,
+  NEED_INPUT_CHOICES_LIMIT_DEFAULT,
+  normalizeNeedInputChoices as normalizeSharedNeedInputChoices,
+  resolvePendingResumeFromRunDetail
+} from "../need_input.js";
+
+export function deriveTaskResumeActionState({
+  executingTask = false,
+  resumingNeedInput = false,
+  pendingNeedInput = null
+} = {}) {
+  const blockedByNeedInput = !!pendingNeedInput;
+  const disabled = !!executingTask || !!resumingNeedInput || blockedByNeedInput;
+  return {
+    disabled,
+    title: blockedByNeedInput ? UI_TEXT.TASK_RESUME_DISABLED_WAITING : ""
+  };
+}
 
 /**
  * 绑定任务标签页
@@ -52,53 +74,10 @@ export function bind(section, onStatusChange) {
   let executingTask = false;
   let currentNeedInput = null;
   let resumingNeedInput = false;
+  let detailRequestSeq = 0;
 
   function normalizeNeedInputChoices(rawChoices) {
-    if (!Array.isArray(rawChoices)) return [];
-    const out = [];
-    const seen = new Set();
-    for (const rawItem of rawChoices) {
-      let label = "";
-      let value = "";
-      if (typeof rawItem === "string") {
-        label = String(rawItem || "").trim();
-        value = label;
-      } else if (rawItem && typeof rawItem === "object") {
-        label = String(rawItem.label || "").trim();
-        const rawValue = rawItem.value;
-        value = String(rawValue != null ? rawValue : label).trim();
-      }
-      if (!label || !value) continue;
-      const dedupeKey = `${label}__${value}`;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-      out.push({ label, value });
-      if (out.length >= 12) break;
-    }
-    return out;
-  }
-
-  function inferNeedInputChoices(question, kind) {
-    const normalizedKind = String(kind || "").trim().toLowerCase();
-    if (normalizedKind === "task_feedback") {
-      return [{ label: "是", value: "是" }, { label: "否", value: "否" }];
-    }
-    const text = String(question || "").trim();
-    if (!text) return [];
-    const looksLikeYesNo = (
-      text.includes("是否")
-      || text.includes("可否")
-      || text.includes("能否")
-      || text.includes("要不要")
-      || text.includes("确认")
-      || text.endsWith("吗")
-      || text.endsWith("吗？")
-      || text.endsWith("吗?")
-    );
-    if (looksLikeYesNo) {
-      return [{ label: "是", value: "是" }, { label: "否", value: "否" }];
-    }
-    return [];
+    return normalizeSharedNeedInputChoices(rawChoices, { limit: NEED_INPUT_CHOICES_LIMIT_DEFAULT });
   }
 
   function buildNeedInputPendingFromRunDetail(detail) {
@@ -106,27 +85,31 @@ export function bind(section, onStatusChange) {
     if (!run) return null;
     const runId = Number(run.run_id);
     if (!Number.isFinite(runId) || runId <= 0) return null;
-    const status = String(run.status || "").trim().toLowerCase();
-    if (status !== TASK_STATUS.WAITING) return null;
+    const resolved = resolvePendingResumeFromRunDetail(runId, detail, {
+      fallbackTaskId: Number(run.task_id) || null,
+      requireQuestionForWaiting: false,
+      normalizeChoices: normalizeNeedInputChoices
+    });
+    if (!resolved.waiting) return null;
 
-    const taskId = Number(run.task_id) || null;
-    const agentState = detail?.agent_state && typeof detail.agent_state === "object" ? detail.agent_state : null;
-    const paused = agentState?.paused && typeof agentState.paused === "object" ? agentState.paused : null;
-    if (!paused) {
-      return {
-        runId,
-        taskId,
-        question: UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION,
-        kind: null,
-        choices: []
-      };
-    }
-
-    const question = String(paused.question || "").trim() || UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION;
-    const kind = String(paused.kind || "").trim() || null;
-    const choices = normalizeNeedInputChoices(paused.choices);
+    const pending = resolved.pending || {};
+    const question = String(
+      pending?.question
+      || resolved.question
+      || UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION
+    ).trim() || UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION;
+    const kind = String(pending?.kind || "").trim() || null;
+    const choices = normalizeNeedInputChoices(pending?.choices);
     const finalChoices = choices.length ? choices : inferNeedInputChoices(question, kind);
-    return { runId, taskId, question, kind, choices: finalChoices };
+    return {
+      runId: Number(pending?.runId || runId),
+      taskId: Number(pending?.taskId || resolved.taskId) || null,
+      question,
+      kind,
+      choices: finalChoices,
+      promptToken: String(pending?.promptToken || "").trim() || null,
+      sessionKey: String(pending?.sessionKey || "").trim() || null
+    };
   }
 
   function setNeedInputControlsDisabled(disabled) {
@@ -141,29 +124,95 @@ export function bind(section, onStatusChange) {
     }
   }
 
-  async function consumeStreamResponse(response) {
-    const reader = response?.body?.getReader ? response.body.getReader() : null;
-    if (!reader) {
-      await response.text();
-      return;
+  function refreshActionResumeState() {
+    if (!actionResume) return;
+    const state = deriveTaskResumeActionState({
+      executingTask,
+      resumingNeedInput,
+      pendingNeedInput: currentNeedInput
+    });
+    actionResume.disabled = !!state.disabled;
+    actionResume.title = String(state.title || "");
+  }
+
+  function isDrawerShowingTask(taskId) {
+    const rid = Number(taskId);
+    if (!Number.isFinite(rid) || rid <= 0) return false;
+    return !!drawerOverlay?.classList?.contains("is-visible")
+      && Number(currentTaskId) === rid;
+  }
+
+  function buildNeedInputPendingFromNeedInputEvent(raw, fallbackRunId = null) {
+    const runId = Number(raw?.run_id || fallbackRunId);
+    if (!Number.isFinite(runId) || runId <= 0) return null;
+    const taskId = Number(raw?.task_id) || null;
+    const question = String(raw?.question || "").trim() || UI_TEXT.TASK_NEED_INPUT_DEFAULT_QUESTION;
+    const kind = String(raw?.kind || "").trim() || null;
+    const choices = normalizeNeedInputChoices(raw?.choices);
+    const finalChoices = choices.length ? choices : inferNeedInputChoices(question, kind);
+    return {
+      runId,
+      taskId,
+      question,
+      kind,
+      choices: finalChoices,
+      promptToken: String(raw?.prompt_token || raw?.promptToken || "").trim() || null,
+      sessionKey: String(raw?.session_key || raw?.sessionKey || "").trim() || null
+    };
+  }
+
+  async function streamNeedInputResume(pending, text) {
+    const runId = Number(pending?.runId);
+    if (!Number.isFinite(runId) || runId <= 0) {
+      return {
+        hadError: true,
+        runStatus: "",
+        pendingNeedInput: null,
+        errorMessage: "invalid_run_id",
+      };
     }
-    try {
-      while (true) {
-        const { done } = await reader.read();
-        if (done) break;
+    let runStatus = "";
+    let pendingNeedInput = null;
+    let errorMessage = "";
+    const streamResult = await streamSse(
+      (signal) => api.streamAgentResume(
+        {
+          run_id: Number(runId),
+          message: text,
+          prompt_token: String(pending?.promptToken || "").trim() || undefined,
+          session_key: String(pending?.sessionKey || "").trim() || undefined
+        },
+        signal
+      ),
+      {
+        displayMode: "status",
+        onRunStatus: (obj) => {
+          const status = normalizeRunStatusValue(obj?.status);
+          if (status) runStatus = status;
+        },
+        onNeedInput: (obj) => {
+          runStatus = TASK_STATUS.WAITING;
+          pendingNeedInput = buildNeedInputPendingFromNeedInputEvent(obj, runId);
+        },
+        onError: (msg) => {
+          errorMessage = String(msg || "").trim();
+        },
       }
-    } finally {
-      try {
-        reader.releaseLock();
-      } catch (error) {
-      }
-    }
+    );
+    return {
+      hadError: !!streamResult?.hadError,
+      runStatus: normalizeRunStatusValue(runStatus),
+      pendingNeedInput,
+      errorMessage,
+    };
   }
 
   async function handleNeedInputSubmit(rawValue = null) {
     const pending = currentNeedInput;
     if (!pending?.runId || !currentTaskId) return;
     if (resumingNeedInput) return;
+    const taskIdAtSubmit = Number(currentTaskId);
+    if (!Number.isFinite(taskIdAtSubmit) || taskIdAtSubmit <= 0) return;
 
     const text = String(rawValue != null ? rawValue : (drawerNeedInputInput?.value || "")).trim();
     if (!text) {
@@ -173,16 +222,27 @@ export function bind(section, onStatusChange) {
 
     resumingNeedInput = true;
     setNeedInputControlsDisabled(true);
-    if (actionResume) actionResume.disabled = true;
+    refreshActionResumeState();
 
     try {
-      const response = await api.streamAgentResume({ run_id: Number(pending.runId), message: text });
-      if (!response || !response.ok) {
-        throw new Error("resume_failed");
+      const streamResult = await streamNeedInputResume(pending, text);
+      if (streamResult.hadError) {
+        throw new Error(streamResult.errorMessage || "resume_failed");
       }
-      await consumeStreamResponse(response);
       if (drawerNeedInputInput) drawerNeedInputInput.value = "";
-      await loadTaskDetail(currentTaskId);
+
+      // 优先同步 SSE 中已返回的 waiting 态，避免“抽屉短暂消失再出现”的闪烁。
+      if (
+        streamResult.pendingNeedInput
+        && streamResult.runStatus === TASK_STATUS.WAITING
+        && isDrawerShowingTask(taskIdAtSubmit)
+      ) {
+        renderNeedInputSection(streamResult.pendingNeedInput);
+      }
+
+      if (isDrawerShowingTask(taskIdAtSubmit)) {
+        await loadTaskDetail(taskIdAtSubmit);
+      }
       loadTasks();
       if (onStatusChange) onStatusChange();
     } catch (error) {
@@ -191,6 +251,8 @@ export function bind(section, onStatusChange) {
       if (drawerNeedInputInput) drawerNeedInputInput.focus();
     } finally {
       resumingNeedInput = false;
+      setNeedInputControlsDisabled(false);
+      refreshActionResumeState();
     }
   }
 
@@ -203,6 +265,7 @@ export function bind(section, onStatusChange) {
       if (drawerNeedInputQuestion) drawerNeedInputQuestion.textContent = "";
       if (drawerNeedInputChoices) drawerNeedInputChoices.innerHTML = "";
       if (drawerNeedInputInput) drawerNeedInputInput.value = "";
+      refreshActionResumeState();
       return;
     }
 
@@ -235,6 +298,7 @@ export function bind(section, onStatusChange) {
     }
 
     setNeedInputControlsDisabled(resumingNeedInput);
+    refreshActionResumeState();
   }
 
   // --- 抽屉函数 ---
@@ -243,18 +307,30 @@ export function bind(section, onStatusChange) {
     currentTaskId = taskId;
     drawerOverlay.classList.add("is-visible");
     renderNeedInputSection(null);
+    refreshActionResumeState();
     loadTaskDetail(taskId);
   }
 
   function closeDrawer() {
+    detailRequestSeq += 1;
     drawerOverlay.classList.remove("is-visible");
     currentTaskId = null;
     currentNeedInput = null;
     resumingNeedInput = false;
     renderNeedInputSection(null);
+    refreshActionResumeState();
   }
 
   async function loadTaskDetail(taskId) {
+    const requestSeq = detailRequestSeq + 1;
+    detailRequestSeq = requestSeq;
+
+    const isStaleRequest = () => (
+      requestSeq !== detailRequestSeq
+      || Number(currentTaskId) !== Number(taskId)
+      || !drawerOverlay?.classList?.contains("is-visible")
+    );
+
     // 重置与加载状态
     drawerTitle.textContent = formatTemplate(UI_TEXT.TASK_TITLE_TEMPLATE, { id: taskId });
     drawerStatus.textContent = UI_TEXT.TASK_STATUS_LOADING;
@@ -263,11 +339,18 @@ export function bind(section, onStatusChange) {
     renderNeedInputSection(null);
 
     try {
-      // 并行获取
-      const [record, timeline] = await Promise.all([
+      // 并行获取：详情主链路失败才中断，时间线失败降级为“仅详情可用”。
+      const [recordResult, timelineResult] = await Promise.allSettled([
         api.fetchTaskRecord(taskId),
         api.fetchTaskTimeline(taskId)
       ]);
+      if (isStaleRequest()) return;
+      if (recordResult.status !== "fulfilled") {
+        throw (recordResult.reason || new Error("task_record_load_failed"));
+      }
+      const record = recordResult.value;
+      const timelineData = timelineResult.status === "fulfilled" ? timelineResult.value : null;
+      const timelineLoadFailed = timelineResult.status !== "fulfilled";
 
       const task = record.task;
       
@@ -283,24 +366,22 @@ export function bind(section, onStatusChange) {
       const runRows = Array.isArray(record.runs) ? record.runs.slice() : [];
       runRows.sort((left, right) => Number(right?.id || 0) - Number(left?.id || 0));
       const waitingRun = runRows.find(
-        (row) => String(row?.status || "").trim().toLowerCase() === TASK_STATUS.WAITING
+        (row) => normalizeRunStatusValue(row?.status) === TASK_STATUS.WAITING
       );
       const inspectRun = waitingRun || runRows[0] || null;
       let pendingNeedInput = null;
       if (inspectRun && Number(inspectRun.id) > 0) {
         try {
           const runDetail = await api.fetchAgentRunDetail(Number(inspectRun.id));
+          if (isStaleRequest()) return;
           pendingNeedInput = buildNeedInputPendingFromRunDetail(runDetail);
         } catch (error) {
+          if (isStaleRequest()) return;
           pendingNeedInput = null;
         }
       }
       renderNeedInputSection(pendingNeedInput);
-      if (actionResume) {
-        const blockedByNeedInput = !!pendingNeedInput;
-        actionResume.disabled = !!(executingTask || blockedByNeedInput);
-        actionResume.title = blockedByNeedInput ? UI_TEXT.TASK_RESUME_DISABLED_WAITING : "";
-      }
+      refreshActionResumeState();
 
       // 渲染步骤
       if (record.steps && record.steps.length > 0) {
@@ -321,7 +402,7 @@ export function bind(section, onStatusChange) {
       }
 
       // 渲染时间线
-      const events = timeline.events || timeline.items || [];
+      const events = timelineData?.events || timelineData?.items || [];
       if (events.length > 0) {
         drawerTimeline.innerHTML = "";
         events.forEach(event => {
@@ -386,19 +467,19 @@ export function bind(section, onStatusChange) {
             item.appendChild(contentEl);
             drawerTimeline.appendChild(item);
         });
+      } else if (timelineLoadFailed) {
+        drawerTimeline.innerHTML = `<div class="panel-error">${UI_TEXT.LOAD_FAIL}</div>`;
       } else {
         drawerTimeline.innerHTML = `<div class="panel-empty-text">${UI_TEXT.TASK_TIMELINE_EMPTY}</div>`;
       }
 
     } catch (error) {
+      if (isStaleRequest()) return;
       console.error(error);
       drawerSteps.innerHTML = `<div class="panel-error">${UI_TEXT.TASK_DETAIL_LOAD_FAIL}</div>`;
       drawerTimeline.innerHTML = "";
       renderNeedInputSection(null);
-      if (actionResume) {
-        actionResume.disabled = !!executingTask;
-        actionResume.title = "";
-      }
+      refreshActionResumeState();
     }
   }
 
@@ -435,21 +516,25 @@ export function bind(section, onStatusChange) {
       return;
     }
     if (executingTask) return;
+    const taskIdAtStart = Number(currentTaskId);
+    if (!Number.isFinite(taskIdAtStart) || taskIdAtStart <= 0) return;
     executingTask = true;
-    if (actionResume) actionResume.disabled = true;
+    refreshActionResumeState();
     try {
       // 直接复用后端 /tasks/{id}/execute：会跳过已完成步骤，继续执行 planned/running 的步骤。
       drawerStatus.textContent = TASK_STATUS.RUNNING;
       drawerStatus.className = `panel-tag panel-tag--${getStatusColor(TASK_STATUS.RUNNING)}`;
-      await api.executeTask(currentTaskId, {});
-      await loadTaskDetail(currentTaskId);
+      await api.executeTask(taskIdAtStart, {});
+      if (isDrawerShowingTask(taskIdAtStart)) {
+        await loadTaskDetail(taskIdAtStart);
+      }
       loadTasks();
       if (onStatusChange) onStatusChange();
     } catch (e) {
       alert(UI_TEXT.TASK_EXECUTE_FAIL);
     } finally {
       executingTask = false;
-      if (actionResume) actionResume.disabled = false;
+      refreshActionResumeState();
     }
   }
 
@@ -545,10 +630,12 @@ export function bind(section, onStatusChange) {
       clearFormError(formEl);
       const title = titleEl.value.trim();
       if (!validateRequiredText(formEl, title)) return;
+      const expectationRaw = String(expectationEl?.value || "").trim();
+      if (!validateOptionalNumber(formEl, expectationRaw, INPUT_ATTRS.TASK_EXPECTATION_ID)) return;
       
       try {
-        const expectationId = expectationEl?.value ? Number(expectationEl.value) : null;
-        if (expectationId) {
+        const expectationId = expectationRaw ? Number(expectationRaw) : null;
+        if (expectationId != null) {
           await api.createTaskWithExpectation(title, expectationId);
         } else {
           await api.createTask(title);

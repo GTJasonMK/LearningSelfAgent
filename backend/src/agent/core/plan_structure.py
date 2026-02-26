@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from backend.src.actions.registry import normalize_action_type
 from backend.src.constants import AGENT_PLAN_BRIEF_MAX_CHARS
@@ -16,6 +19,18 @@ _PLAN_STATUS_ALLOWED = {
     "done",
     "failed",
     "skipped",
+}
+
+# 合法的状态转移表：key 为当前状态，value 为允许的目标状态集合。
+# 未在此表中的转移将被静默拒绝并记录警告日志。
+_VALID_TRANSITIONS: dict[str, set[str]] = {
+    "pending":  {"planned", "running", "waiting", "done", "skipped", "failed"},
+    "planned":  {"running", "waiting", "done", "skipped", "failed"},
+    "running":  {"done", "failed", "waiting", "skipped"},
+    "waiting":  {"running", "done", "failed"},
+    "done":     set(),  # 终态，不允许再转移
+    "failed":   {"running", "planned"},  # 允许 replan 后重新执行
+    "skipped":  {"running", "planned"},  # 允许 replan 后重新激活
 }
 
 
@@ -274,9 +289,25 @@ class PlanStructure:
         return None
 
     def set_step_status(self, idx: int, status: str) -> None:
-        """设置指定步骤状态（0-based 索引）。"""
-        if 0 <= idx < len(self.steps):
-            self.steps[idx].status = _normalize_status(status)
+        """
+        设置指定步骤状态（0-based 索引）。
+
+        遵循状态转移表 _VALID_TRANSITIONS：非法转移将被静默拒绝并记录警告日志。
+        """
+        if not (0 <= idx < len(self.steps)):
+            return
+        new_status = _normalize_status(status)
+        current = self.steps[idx].status
+        if current == new_status:
+            return
+        allowed_targets = _VALID_TRANSITIONS.get(current)
+        if allowed_targets is not None and new_status not in allowed_targets:
+            logger.warning(
+                "plan_step[%d] 非法状态转移: %s -> %s（已忽略）",
+                idx, current, new_status,
+            )
+            return
+        self.steps[idx].status = new_status
 
     def mark_running_as_done(self) -> None:
         """将所有 running 步骤标记为 done（每次进入新步骤前调用）。"""

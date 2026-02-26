@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from backend.src.agent.core.run_context import AgentRunContext
+from backend.src.common.utils import parse_positive_int
 
 
 def _normalize_entity_ids(items: List[dict]) -> List[int]:
@@ -10,14 +11,16 @@ def _normalize_entity_ids(items: List[dict]) -> List[int]:
     for value in items or []:
         if not isinstance(value, dict):
             continue
-        raw_id = value.get("id")
-        try:
-            entity_id = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-        if entity_id > 0:
+        entity_id = parse_positive_int(value.get("id"), default=None)
+        if entity_id is not None:
             result.append(int(entity_id))
     return result
+
+
+def _set_draft_solution_id(run_ctx: AgentRunContext, draft_solution_id: Optional[int]) -> None:
+    normalized = parse_positive_int(draft_solution_id, default=None)
+    if normalized is not None:
+        run_ctx.set_extra("draft_solution_id", int(normalized))
 
 
 def _set_pending_flags(run_ctx: AgentRunContext, *, pending: bool, reason: str = "") -> None:
@@ -54,7 +57,7 @@ def build_initial_pending_state(
         message=str(message or ""),
         model=str(model or ""),
         parameters=dict(parameters or {}),
-        max_steps=int(max_steps),
+        max_steps=max_steps,
         workdir=str(workdir or ""),
         tools_hint=str(tools_hint or ""),
         skills_hint=str(skills_hint or ""),
@@ -65,8 +68,7 @@ def build_initial_pending_state(
     run_ctx.set_extra("domain_ids", list(domain_ids or []))
     run_ctx.set_extra("skill_ids", _normalize_entity_ids(list(skills or [])))
     run_ctx.set_extra("solution_ids", _normalize_entity_ids(list(solutions or [])))
-    if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0:
-        run_ctx.set_extra("draft_solution_id", int(draft_solution_id))
+    _set_draft_solution_id(run_ctx, draft_solution_id)
     if run_ctx.mode == "think" and isinstance(think_config, dict) and think_config:
         run_ctx.set_extra("think_config", dict(think_config))
     _set_pending_flags(run_ctx, pending=True, reason="knowledge_sufficiency")
@@ -129,8 +131,7 @@ def build_planned_state_after_pending(
     run_ctx.set_extra("domain_ids", list(domain_ids or []))
     run_ctx.set_extra("skill_ids", _normalize_entity_ids(list(skills or [])))
     run_ctx.set_extra("solution_ids", _normalize_entity_ids(list(solutions or [])))
-    if isinstance(draft_solution_id, int) and int(draft_solution_id) > 0:
-        run_ctx.set_extra("draft_solution_id", int(draft_solution_id))
+    _set_draft_solution_id(run_ctx, draft_solution_id)
     _set_pending_flags(run_ctx, pending=False)
     if isinstance(extra_state, dict):
         for key, value in extra_state.items():

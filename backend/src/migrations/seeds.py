@@ -9,12 +9,13 @@ import json
 import sqlite3
 from typing import List, Tuple
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import now_iso, parse_json_list, tool_is_draft
 from backend.src.constants import (
     DEFAULT_ALLOWED_OPS,
     DEFAULT_ALLOWED_PATHS,
     DEFAULT_DISABLED_ACTIONS,
     DEFAULT_DISABLED_TOOLS,
+    RIGHT_CODES_DEFAULT_BASE_URL,
     DEFAULT_PANEL_ENABLED,
     DEFAULT_PET_ENABLED,
     DEFAULT_TRAY_ENABLED,
@@ -27,6 +28,11 @@ from backend.src.constants import (
     TOOL_WEB_FETCH_TIMEOUT_MS,
 )
 
+# LLM 默认配置（用于首次初始化与“空值回填”）
+DEFAULT_LLM_PROVIDER = "rightcode"
+DEFAULT_LLM_BASE_URL = RIGHT_CODES_DEFAULT_BASE_URL
+DEFAULT_LLM_MODEL = "gpt-5.2"
+
 
 def seed_config_store(conn: sqlite3.Connection) -> None:
     """
@@ -36,19 +42,44 @@ def seed_config_store(conn: sqlite3.Connection) -> None:
         conn: 数据库连接
     """
     config_row = conn.execute(
-        "SELECT id FROM config_store WHERE id = ?",
+        "SELECT id, llm_provider, llm_base_url, llm_model FROM config_store WHERE id = ?",
         (SINGLETON_ROW_ID,),
     ).fetchone()
 
     if not config_row:
         conn.execute(
-            "INSERT INTO config_store (id, tray_enabled, pet_enabled, panel_enabled) VALUES (?, ?, ?, ?)",
+            "INSERT INTO config_store (id, tray_enabled, pet_enabled, panel_enabled, llm_provider, llm_base_url, llm_model) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 SINGLETON_ROW_ID,
                 int(DEFAULT_TRAY_ENABLED),
                 int(DEFAULT_PET_ENABLED),
                 int(DEFAULT_PANEL_ENABLED),
+                DEFAULT_LLM_PROVIDER,
+                DEFAULT_LLM_BASE_URL,
+                DEFAULT_LLM_MODEL,
             ),
+        )
+        return
+
+    # 对已有行做“空值回填”：
+    # - 仅当字段为空时补默认值；
+    # - 若用户已配置 provider/base_url/model，则保持不变。
+    provider = str(config_row["llm_provider"] or "").strip()
+    base_url = str(config_row["llm_base_url"] or "").strip()
+    model = str(config_row["llm_model"] or "").strip()
+
+    next_provider = provider or DEFAULT_LLM_PROVIDER
+    next_base_url = base_url or DEFAULT_LLM_BASE_URL
+    next_model = model or DEFAULT_LLM_MODEL
+
+    if (
+        next_provider != provider
+        or next_base_url != base_url
+        or next_model != model
+    ):
+        conn.execute(
+            "UPDATE config_store SET llm_provider = ?, llm_base_url = ?, llm_model = ? WHERE id = ?",
+            (next_provider, next_base_url, next_model, SINGLETON_ROW_ID),
         )
 
 
@@ -82,10 +113,7 @@ def seed_permissions_store(conn: sqlite3.Connection) -> None:
             (SINGLETON_ROW_ID,),
         ).fetchone()
 
-        try:
-            allowed_ops = json.loads(row["allowed_ops"]) if row else []
-        except json.JSONDecodeError:
-            allowed_ops = []
+        allowed_ops = parse_json_list(row["allowed_ops"] if row else None)
 
         if OP_EXEC not in allowed_ops:
             allowed_ops.append(OP_EXEC)
@@ -108,18 +136,6 @@ def seed_builtin_tools(conn: sqlite3.Connection) -> None:
             (TOOL_NAME_WEB_FETCH,),
         ).fetchall()
 
-        def _is_draft_tool(metadata_text: object) -> bool:
-            try:
-                meta = json.loads(str(metadata_text or ""))
-            except Exception:
-                return False
-            if not isinstance(meta, dict):
-                return False
-            approval = meta.get("approval")
-            if not isinstance(approval, dict):
-                return False
-            return str(approval.get("status") or "").strip().lower() == "draft"
-
         # 仅当不存在“非 draft 的可用 web_fetch”时才插入内置版本：
         # - 避免被 Agent 运行时创建的 draft 版本占坑，导致后续任务只能选到不可复用的工具；
         # - 与 tools_repo.get_tool_by_name 的优先级策略配合：优先非 draft。
@@ -127,7 +143,7 @@ def seed_builtin_tools(conn: sqlite3.Connection) -> None:
         for row in rows or []:
             if not row:
                 continue
-            if _is_draft_tool(row["metadata"]):
+            if tool_is_draft(row["metadata"]):
                 continue
             has_non_draft = True
             break

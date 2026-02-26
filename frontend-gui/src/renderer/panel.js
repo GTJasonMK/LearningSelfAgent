@@ -5,7 +5,8 @@ import { UI_POLL_INTERVAL_MS, UI_TEXT } from "./constants.js";
 import { applyText } from "./ui.js";
 import { debounce } from "./utils.js";
 import {
-  extractResultPayloadText,
+  buildNoVisibleResultText,
+  extractVisibleResultText as extractVisibleResultTextFromTranscript,
   parseSlashCommand
 } from "./agent_text.js";
 import { createStore } from "./store.js";
@@ -16,6 +17,19 @@ import { buildInputHistoryFromChatItems, createInputHistoryManager, mergeInputHi
 import { getPanelDomRefs } from "./dom_refs.js";
 import { setMarkdownContent } from "./markdown.js";
 import { AGENT_EVENT_NAME, emitAgentEvent, initAgentEventBridge } from "./agent_events.js";
+import { bindPetImageFallback } from "./pet_image.js";
+import { isTerminalRunStatus, normalizeRunStatusValue } from "./run_status.js";
+import { buildTaskFeedbackAckText, extractRunLastError } from "./run_messages.js";
+import { shouldFinalizePendingFinal } from "./pending_final.js";
+import {
+  inferNeedInputChoices,
+  markNeedInputPromptHandled,
+  NEED_INPUT_CHOICES_LIMIT_DEFAULT,
+  normalizeNeedInputChoices as normalizeSharedNeedInputChoices,
+  pruneNeedInputRecentRecords,
+  resolvePendingResumeFromRunDetail,
+  shouldSuppressNeedInputPrompt
+} from "./need_input.js";
 import {
   formatAgentStageLabel,
   formatDurationMs,
@@ -60,6 +74,9 @@ const {
   worldSendBtn
 } = getPanelDomRefs();
 
+// 世界页桌宠图标兜底：避免某一张资源异常导致“形态区域空白”。
+bindPetImageFallback(document.querySelector(".world-pet-image"));
+
 // 标签页事件管理器跟踪
 const tabEventManagers = new Map();
 
@@ -82,16 +99,20 @@ const TAB_BINDERS = {
 const pollManager = new PollManager();
 const WORLD_POLL_KEY = "world_poll";
 const worldStream = createStreamController();
+let worldResumeInFlight = false;
 // “任务执行结果”在评估完成前不落库（避免先输出最终结论，再补评估 plan-list）
 const WORLD_EVAL_GATE_TIMEOUT_MS = 90000;
+const WORLD_NEED_INPUT_RECENT_TTL_MS = 20000;
+const AGENT_EVENT_SOURCE_PANEL = "panel";
 // 世界页关键会话状态：集中管理，避免散落的全局变量在并发/切页时漂移
 const worldSession = createStore({
   streaming: false,
   streamingMode: "",
-  // do 模式流式时的“思考状态行”（只显示在右上角思考框，不进入中间对话）
+  // 执行模式流式时（do/think/resume）的“思考状态行”（只显示在右上角思考框，不进入中间对话）
   streamingStatus: "",
-  pendingResume: null, // {runId, taskId?, question, kind?, choices?}
-  // 等待评估完成后再落库的最终回答（只用于世界页 do/resume）
+  pendingResume: null, // {runId, taskId?, question, kind?, choices?, promptToken?, sessionKey?}
+  needInputRecentRecords: [], // [{runId, fingerprint, at}]，抑制已处理提示被回放/轮询重复展示
+  // 等待评估完成后再落库的最终回答（只用于世界页执行链路：do/think/resume）
   pendingFinal: null, // {tmpKey, content, run_id, task_id, metadata, startedAt}
   // 当前 run 元信息（来自 /agent/runs/current），用于“世界页”统一展示（不区分来源：桌宠/世界页）。
   currentRun: null,
@@ -120,25 +141,232 @@ const worldSession = createStore({
 });
 
 function normalizeNeedInputChoices(rawChoices) {
-  if (!Array.isArray(rawChoices)) return [];
-  const out = [];
-  for (const rawItem of rawChoices) {
-    if (typeof rawItem === "string") {
-      const text = String(rawItem || "").trim();
-      if (!text) continue;
-      out.push({ label: text, value: text });
-      if (out.length >= 12) break;
-      continue;
-    }
-    if (!rawItem || typeof rawItem !== "object") continue;
-    const label = String(rawItem?.label || "").trim();
-    if (!label) continue;
-    const value = String(rawItem?.value != null ? rawItem.value : label).trim();
-    if (!value) continue;
-    out.push({ label, value });
-    if (out.length >= 12) break;
+  return normalizeSharedNeedInputChoices(rawChoices, { limit: NEED_INPUT_CHOICES_LIMIT_DEFAULT });
+}
+
+function markWorldNeedInputHandled(payload) {
+  worldSession.setState(
+    (prev) => ({
+      ...prev,
+      needInputRecentRecords: markNeedInputPromptHandled(
+        payload,
+        prev?.needInputRecentRecords,
+        { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
+      )
+    }),
+    { reason: "need_input_handled" }
+  );
+}
+
+function emitWorldNeedInputResolved(pending, reason = "resolved") {
+  const runId = Number(pending?.runId);
+  if (!Number.isFinite(runId) || runId <= 0) return;
+  emitAgentEvent(
+    {
+      type: "need_input_resolved",
+      run_id: runId,
+      task_id: Number(pending?.taskId) || null,
+      prompt_token: String(pending?.promptToken || "").trim() || null,
+      session_key: String(pending?.sessionKey || "").trim() || null,
+      question: String(pending?.question || "").trim() || null,
+      reason: String(reason || "").trim() || null,
+      _source: AGENT_EVENT_SOURCE_PANEL
+    },
+    { broadcast: true }
+  );
+}
+
+function clearWorldPendingResume(options = {}) {
+  const current = worldSession.getState().pendingResume;
+  if (!current) {
+    renderWorldNeedInputChoicesUi(null);
+    return;
   }
-  return out;
+  const targetRunId = Number(options?.runId);
+  if (Number.isFinite(targetRunId) && targetRunId > 0 && Number(current?.runId) !== targetRunId) return;
+
+  worldSession.setState(
+    (prev) => ({
+      ...prev,
+      pendingResume: null,
+      needInputRecentRecords: markNeedInputPromptHandled(
+        current,
+        prev?.needInputRecentRecords,
+        { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
+      )
+    }),
+    { reason: options?.reason || "need_input_clear" }
+  );
+  renderWorldNeedInputChoicesUi(null);
+  if (options?.emit !== false) {
+    emitWorldNeedInputResolved(current, options?.reason || "need_input_clear");
+  }
+}
+
+function applyRemoteRunCreatedToWorld(obj) {
+  const rid = Number(obj?.run_id);
+  const tid = Number(obj?.task_id);
+  if (!Number.isFinite(rid) || rid <= 0) return;
+
+  worldSession.setState(
+    (prev) => ({
+      ...prev,
+      currentRun: {
+        ...(prev?.currentRun || {}),
+        run_id: rid,
+        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
+        status: "running",
+        is_current: true
+      },
+      lastRunMeta: {
+        ...(prev?.lastRunMeta || {}),
+        run_id: rid,
+        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
+        updated_at: String(prev?.lastRunMeta?.updated_at || ""),
+        status: "running"
+      }
+    }),
+    { reason: "run_created_remote" }
+  );
+}
+
+function applyRemoteRunStatusToWorld(obj) {
+  const status = normalizeRunStatusValue(obj?.status);
+  if (!status) return;
+  const rid = Number(obj?.run_id);
+  const tid = Number(obj?.task_id);
+
+  worldSession.setState(
+    (prev) => {
+      const prevRun = prev?.currentRun && typeof prev.currentRun === "object" ? prev.currentRun : null;
+      const prevRunId = Number(prevRun?.run_id);
+      const prevTaskId = Number(prevRun?.task_id);
+      const nextRunId = Number.isFinite(rid) && rid > 0
+        ? rid
+        : (Number.isFinite(prevRunId) && prevRunId > 0 ? prevRunId : null);
+      const nextTaskId = Number.isFinite(tid) && tid > 0
+        ? tid
+        : (Number.isFinite(prevTaskId) && prevTaskId > 0 ? prevTaskId : null);
+      const nextStatus = status || normalizeRunStatusValue(prevRun?.status) || "running";
+
+      let nextCurrentRun = prevRun;
+      if (nextRunId && (!Number.isFinite(prevRunId) || prevRunId <= 0 || prevRunId === nextRunId)) {
+        nextCurrentRun = {
+          ...(prevRun || {
+            task_title: "",
+            summary: null,
+            mode: null,
+            started_at: "",
+            finished_at: "",
+            created_at: "",
+            updated_at: "",
+            is_current: true
+          }),
+          run_id: nextRunId,
+          task_id: nextTaskId || null,
+          status: nextStatus
+        };
+      }
+
+      const prevMeta = prev?.lastRunMeta && typeof prev.lastRunMeta === "object" ? prev.lastRunMeta : {};
+      let nextLastRunMeta = prev.lastRunMeta;
+      if (nextRunId) {
+        nextLastRunMeta = {
+          ...prevMeta,
+          run_id: nextRunId,
+          task_id: nextTaskId || null,
+          status: nextStatus,
+          updated_at: String(prevMeta.updated_at || "")
+        };
+      }
+
+      return {
+        ...prev,
+        currentRun: nextCurrentRun,
+        lastRunMeta: nextLastRunMeta
+      };
+    },
+    { reason: "run_status_remote" }
+  );
+
+  if (status !== "waiting") {
+    if (Number.isFinite(rid) && rid > 0) {
+      clearWorldPendingResume({ runId: rid, reason: "run_status_remote_continue", emit: false });
+    } else if (isTerminalRunStatus(status)) {
+      clearWorldPendingResume({ reason: "run_status_remote_terminal", emit: false });
+    }
+  }
+
+  if (pageWorldEl?.classList?.contains("is-visible")) {
+    rerenderWorldThoughtsFromState();
+  }
+}
+
+function applyRemoteNeedInputToWorld(obj) {
+  const rid = Number(obj?.run_id);
+  const tid = Number(obj?.task_id);
+  const q = String(obj?.question || "").trim();
+  if (!Number.isFinite(rid) || rid <= 0) return;
+  if (!q) return;
+
+  const pending = {
+    runId: rid,
+    taskId: Number.isFinite(tid) && tid > 0 ? tid : null,
+    question: q,
+    kind: String(obj?.kind || "").trim() || null,
+    choices: normalizeNeedInputChoices(obj?.choices),
+    promptToken: String(obj?.prompt_token || obj?.promptToken || "").trim() || null,
+    sessionKey: String(obj?.session_key || obj?.sessionKey || "").trim() || null
+  };
+
+  const state = worldSession.getState();
+  const recentRecords = pruneNeedInputRecentRecords(state?.needInputRecentRecords, {
+    ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
+  });
+  if (shouldSuppressNeedInputPrompt(pending, recentRecords, { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS })) {
+    worldSession.setState(
+      { needInputRecentRecords: recentRecords },
+      { reason: "need_input_remote_suppressed" }
+    );
+    clearWorldPendingResume({ runId: rid, reason: "need_input_remote_suppressed", emit: false });
+    return;
+  }
+
+  const currentPending = state?.pendingResume;
+  const isSamePending = !!currentPending
+    && Number(currentPending.runId) === Number(pending.runId)
+    && Number(currentPending.taskId || 0) === Number(pending.taskId || 0)
+    && String(currentPending.question || "") === String(pending.question || "")
+    && String(currentPending.kind || "") === String(pending.kind || "")
+    && String(currentPending.promptToken || "") === String(pending.promptToken || "")
+    && String(currentPending.sessionKey || "") === String(pending.sessionKey || "")
+    && JSON.stringify(Array.isArray(currentPending.choices) ? currentPending.choices : [])
+      === JSON.stringify(Array.isArray(pending.choices) ? pending.choices : []);
+  if (isSamePending) return;
+
+  worldSession.setState(
+    (prev) => ({
+      ...prev,
+      pendingResume: pending,
+      needInputRecentRecords: recentRecords,
+      currentRun: {
+        ...(prev?.currentRun || {}),
+        run_id: rid,
+        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
+        status: "waiting",
+        is_current: true
+      },
+      lastRunMeta: {
+        ...(prev?.lastRunMeta || {}),
+        run_id: rid,
+        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
+        updated_at: String(prev?.lastRunMeta?.updated_at || ""),
+        status: "waiting"
+      }
+    }),
+    { reason: "need_input_remote" }
+  );
+  renderWorldNeedInputChoicesUi(pending);
 }
 
 function renderWorldNeedInputChoicesUi(pending) {
@@ -155,7 +383,7 @@ function renderWorldNeedInputChoicesUi(pending) {
   const normalized = normalizeNeedInputChoices(pending?.choices);
   const choices = normalized.length
     ? normalized
-    : (kind === "task_feedback" ? [{ label: "是", value: "是" }, { label: "否", value: "否" }] : []);
+    : inferNeedInputChoices(String(pending?.question || ""), kind);
 
   worldChoicesEl.classList.remove("is-hidden");
 
@@ -163,7 +391,9 @@ function renderWorldNeedInputChoicesUi(pending) {
     try { worldInputEl?.focus?.(); } catch (e) {}
   }
 
+  let choiceSubmitting = false;
   async function resumeWithChoice(value) {
+    if (choiceSubmitting || worldResumeInFlight) return;
     const current = worldSession.getState().pendingResume;
     if (!current?.runId) return;
     const msg = String(value || "").trim();
@@ -171,12 +401,21 @@ function renderWorldNeedInputChoicesUi(pending) {
       focusCustomInput();
       return;
     }
+    choiceSubmitting = true;
     for (const node of Array.from(worldChoicesEl.querySelectorAll("button"))) {
       try { node.disabled = true; } catch (e) {}
     }
-    worldSession.setState({ pendingResume: null }, { reason: "resume_choice" });
-    renderWorldNeedInputChoicesUi(null);
-    await runWorldDoMode(msg, { resumeRunId: Number(current.runId), resumeTaskId: Number(current.taskId) || null });
+    clearWorldPendingResume({ runId: Number(current.runId), reason: "resume_choice" });
+    try {
+      await runWorldDoMode(msg, {
+        resumeRunId: Number(current.runId),
+        resumeTaskId: Number(current.taskId) || null,
+        resumePromptToken: String(current.promptToken || "").trim() || null,
+        resumeSessionKey: String(current.sessionKey || "").trim() || null
+      });
+    } finally {
+      choiceSubmitting = false;
+    }
   }
 
   for (const c of choices) {
@@ -404,9 +643,27 @@ try {
     AGENT_EVENT_NAME,
     (event) => {
       const obj = event?.detail;
+      const source = String(obj?._source || "").trim();
+      if (source === AGENT_EVENT_SOURCE_PANEL) return;
+      if (obj?.type === "run_created") applyRemoteRunCreatedToWorld(obj);
+      if (obj?.type === "run_status") applyRemoteRunStatusToWorld(obj);
+      if (obj?.type === "need_input") applyRemoteNeedInputToWorld(obj);
       if (obj?.type === "agent_stage") applyAgentStageEventToWorld(obj);
       if (obj?.type === "plan") applyAgentPlanEventToWorld(obj);
       if (obj?.type === "plan_delta") applyAgentPlanDeltaEventToWorld(obj);
+      if (obj?.type === "need_input_resolved") {
+        const runId = Number(obj?.run_id);
+        if (Number.isFinite(runId) && runId > 0) {
+          markWorldNeedInputHandled({
+            runId,
+            question: obj?.question,
+            kind: obj?.kind,
+            promptToken: obj?.prompt_token,
+            sessionKey: obj?.session_key
+          });
+          clearWorldPendingResume({ runId, reason: "need_input_remote_resolved", emit: false });
+        }
+      }
     },
     { passive: true }
   );
@@ -536,6 +793,145 @@ function appendPreText(el, delta) {
   }
 }
 
+function normalizeThoughtSectionTitle(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  const matched = text.match(/^【(.+?)】$/);
+  if (matched) return String(matched[1] || "").trim();
+  return text;
+}
+
+function tagClassFromThoughtBadge(rawBadge) {
+  const badge = String(rawBadge || "").trim().toUpperCase();
+  if (!badge) return "panel-tag";
+  if (badge === "OK" || badge === "DONE" || badge === "PASS") return "panel-tag panel-tag--success";
+  if (badge === "WARN" || badge === "WAIT" || badge === "WAITING") return "panel-tag panel-tag--warning";
+  if (badge === "FAIL" || badge === "ERROR" || badge === "ERR") return "panel-tag panel-tag--error";
+  return "panel-tag panel-tag--accent";
+}
+
+function splitThoughtBadge(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return { badge: "", content: "" };
+  const matched = raw.match(/^\[([A-Za-z_]+)\]\s*(.*)$/);
+  if (!matched) return { badge: "", content: raw };
+  return {
+    badge: String(matched[1] || "").trim().toUpperCase(),
+    content: String(matched[2] || "").trim() || raw
+  };
+}
+
+function renderThoughtItemContent(container, content) {
+  const text = String(content || "").trim();
+  if (!text) return;
+
+  const sepCandidates = [text.indexOf("："), text.indexOf(":")].filter((idx) => idx > 0);
+  const sep = sepCandidates.length ? Math.min(...sepCandidates) : -1;
+  if (sep > 0 && sep <= 24) {
+    const label = String(text.slice(0, sep) || "").trim();
+    const value = String(text.slice(sep + 1) || "").trim();
+    if (label && value && !/[\/\\]/.test(label)) {
+      const labelEl = document.createElement("span");
+      labelEl.className = "world-thoughts-label";
+      labelEl.textContent = `${label}：`;
+
+      const valueEl = document.createElement("span");
+      valueEl.className = "world-thoughts-value";
+      valueEl.textContent = value;
+
+      container.appendChild(labelEl);
+      container.appendChild(valueEl);
+      return;
+    }
+  }
+
+  const textEl = document.createElement("span");
+  textEl.className = "world-thoughts-text";
+  textEl.textContent = text;
+  container.appendChild(textEl);
+}
+
+function renderThoughtLinesStructured(el, lines) {
+  if (!el) return;
+  const list = Array.isArray(lines) ? lines : [];
+  const normalized = list.map((line) => String(line || "").trimEnd()).filter((line) => String(line || "").trim());
+  if (!normalized.length) {
+    setEmptyText(el, UI_TEXT.NO_DATA || "-");
+    return;
+  }
+
+  const container = el;
+  const prevScrollTop = container.scrollTop;
+  const shouldStickToBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 48;
+
+  const root = document.createElement("div");
+  root.className = "world-thoughts";
+
+  let currentList = null;
+  const ensureSection = (title) => {
+    const section = document.createElement("section");
+    section.className = "world-thoughts-section";
+
+    const titleEl = document.createElement("div");
+    titleEl.className = "world-thoughts-section-title";
+    titleEl.textContent = normalizeThoughtSectionTitle(title) || (UI_TEXT.DASH || "-");
+
+    const listEl = document.createElement("div");
+    listEl.className = "world-thoughts-list";
+
+    section.appendChild(titleEl);
+    section.appendChild(listEl);
+    root.appendChild(section);
+    currentList = listEl;
+    return listEl;
+  };
+
+  normalized.forEach((rawLine) => {
+    const sectionMatched = String(rawLine || "").trim().match(/^【(.+?)】$/);
+    if (sectionMatched) {
+      ensureSection(sectionMatched[0]);
+      return;
+    }
+
+    if (!currentList) {
+      ensureSection(UI_TEXT.WORLD_THOUGHTS_SECTION_STATUS || "【状态】");
+    }
+
+    const bulletMatched = String(rawLine || "").match(/^(\s*)-\s+(.*)$/);
+    const indentSpaces = bulletMatched ? String(bulletMatched[1] || "").length : 0;
+    const contentText = bulletMatched ? String(bulletMatched[2] || "").trim() : String(rawLine || "").trim();
+    if (!contentText) return;
+
+    const item = document.createElement("div");
+    item.className = "world-thoughts-item";
+    if (indentSpaces >= 2) item.classList.add("is-sub");
+
+    const { badge, content } = splitThoughtBadge(contentText);
+    if (badge) {
+      const tagEl = document.createElement("span");
+      tagEl.className = tagClassFromThoughtBadge(badge);
+      tagEl.textContent = badge;
+      item.appendChild(tagEl);
+    }
+
+    const contentEl = document.createElement("div");
+    contentEl.className = "world-thoughts-item-main";
+    renderThoughtItemContent(contentEl, content);
+    item.appendChild(contentEl);
+
+    currentList.appendChild(item);
+  });
+
+  el.innerHTML = "";
+  el.appendChild(root);
+
+  if (shouldStickToBottom) {
+    container.scrollTop = container.scrollHeight;
+  } else {
+    container.scrollTop = prevScrollTop;
+  }
+}
+
 function renderPlanList(el, items, options = {}) {
   if (!el) return;
   const list = Array.isArray(items) ? items : [];
@@ -610,6 +1006,22 @@ function worldChatKey(msg) {
   return "";
 }
 
+function upsertTimelineMessageById(timeline, msg) {
+  const list = Array.isArray(timeline) ? timeline : [];
+  const id = Number(msg?.id);
+  if (!Number.isFinite(id) || id <= 0) {
+    list.push(msg);
+    return list;
+  }
+  const idx = list.findIndex((item) => Number(item?.id) === id);
+  if (idx >= 0) {
+    list[idx] = msg;
+    return list;
+  }
+  list.push(msg);
+  return list;
+}
+
 function runAssistantPlaceholderKey(runId) {
   const rid = Number(runId);
   if (!Number.isFinite(rid) || rid <= 0) return "";
@@ -669,6 +1081,7 @@ function ensureRunAssistantPlaceholder(runMeta) {
   if (hasPlaceholder) return;
 
   // 新增占位消息（仅 UI，不落库）
+  const runMode = String(runMeta?.mode || "").trim().toLowerCase();
   const msg = {
     role: "assistant",
     content: UI_TEXT.PET_CHAT_SENDING || "…",
@@ -676,7 +1089,7 @@ function ensureRunAssistantPlaceholder(runMeta) {
     run_id: Number.isFinite(runId) ? runId : null,
     task_id: Number.isFinite(taskId) ? taskId : null,
     _tmpKey: key,
-    metadata: { source: "panel", placeholder: true, mode: "do" }
+    metadata: { source: "panel", placeholder: true, mode: runMode || "do" }
   };
   setWorldChatState(
     (prev) => {
@@ -749,11 +1162,34 @@ function appendWorldChatMessage(msg) {
   if (!worldChatEl) return;
   const container = worldChatScrollContainer();
   const stick = worldChatIsNearBottom(container);
+  const key = worldChatKey(msg);
+  const existing = key ? worldChatDomByKey.get(key) : null;
+  if (existing?.bubble) {
+    const role = String(msg?.role || "").trim().toLowerCase();
+    const content = String(msg?.content || "");
+    if (role === "assistant") {
+      setMarkdownContent(existing.bubble, content);
+    } else {
+      existing.bubble.textContent = content;
+    }
+
+    const createdAt = String(msg?.created_at || "").trim();
+    const runId = msg?.run_id != null ? Number(msg.run_id) : null;
+    const taskId = msg?.task_id != null ? Number(msg.task_id) : null;
+    const metaParts = [];
+    if (createdAt) metaParts.push(createdAt);
+    if (taskId) metaParts.push(`task#${taskId}`);
+    if (runId) metaParts.push(`run#${runId}`);
+    existing.bubble.title = metaParts.join(" | ");
+
+    if (stick) worldChatScrollToBottom();
+    return;
+  }
+
   // 若当前是空态占位，先清空
   if (worldChatEl.querySelector(".world-chat-empty")) {
     worldChatEl.innerHTML = "";
   }
-  const key = worldChatKey(msg);
   const { row, bubble } = createWorldChatItemEl(msg);
   if (key) worldChatDomByKey.set(key, { row, bubble });
   worldChatEl.appendChild(row);
@@ -865,7 +1301,8 @@ function applyWorldPlanDelta(deltaObj) {
     }
     if (idx < 0 || idx >= worldTaskPlanItems.length) continue;
 
-    const base = worldTaskPlanItems[idx] && typeof worldTaskPlanItems[idx] === "object" ? worldTaskPlanItems[idx] : {};
+    const orig = worldTaskPlanItems[idx] && typeof worldTaskPlanItems[idx] === "object" ? worldTaskPlanItems[idx] : {};
+    const base = { ...orig };
     if (ch.status != null) base.status = ch.status;
     if (ch.brief != null) base.brief = ch.brief;
     if (ch.title != null) base.title = ch.title;
@@ -925,9 +1362,9 @@ function renderWorldThoughts(runMeta, stateObj) {
   const session = worldSession.getState();
   const lines = [];
 
-  // do 模式流式时：把状态行固定显示在思考框顶部（中间对话区不显示这些“思考过程”）
+  // 执行模式流式时（do/think/resume）：把状态行固定显示在思考框顶部（中间对话区不显示这些“思考过程”）
   const streamingStatus = String(session?.streamingStatus || "").trim();
-  if (session?.streaming && session?.streamingMode === "do" && streamingStatus) {
+  if (session?.streaming && String(session?.streamingMode || "") !== "chat" && streamingStatus) {
     lines.push(UI_TEXT.WORLD_THOUGHTS_SECTION_STATUS || "【状态】");
     lines.push(`- ${truncateInline(streamingStatus, 240)}`);
     lines.push("");
@@ -1047,7 +1484,7 @@ function renderWorldThoughts(runMeta, stateObj) {
     setEmptyText(worldThoughtsEl, UI_TEXT.NO_DATA || "-");
     return;
   }
-  setPreText(worldThoughtsEl, lines.join("\n"));
+  renderThoughtLinesStructured(worldThoughtsEl, lines);
 }
 
 function rerenderWorldThoughtsFromState() {
@@ -1257,7 +1694,7 @@ async function syncWorldChatNew() {
         let maxId = Number(prev?.maxId || 0);
         let minId = Number(prev?.minId || 0);
         items.forEach((m) => {
-          timeline.push(m);
+          upsertTimelineMessageById(timeline, m);
           const id = Number(m?.id);
           if (Number.isFinite(id) && id > maxId) maxId = id;
           if (Number.isFinite(id) && id > 0 && (!minId || minId <= 0)) minId = id;
@@ -1323,7 +1760,7 @@ async function createAndAppendChatMessage(payload) {
     setWorldChatState(
       (prev) => {
         const timeline = Array.isArray(prev?.timeline) ? prev.timeline.slice() : [];
-        timeline.push(msg);
+        upsertTimelineMessageById(timeline, msg);
         const maxId = Number.isFinite(id) && id > Number(prev?.maxId || 0) ? id : Number(prev?.maxId || 0);
         const minId = Number.isFinite(id) && id > 0 && (!prev?.minId || prev.minId <= 0)
           ? id
@@ -1356,12 +1793,28 @@ function commitTempChatMessage(tempKey, savedMsg) {
   setWorldChatState(
     (prev) => {
       const timeline = Array.isArray(prev?.timeline) ? prev.timeline.slice() : [];
-      const idx = timeline.findIndex((m) => String(m?._tmpKey || "") === String(tempKey || ""));
-      if (idx >= 0) {
-        timeline[idx] = savedMsg;
-      } else {
-        timeline.push(savedMsg);
+      const tmpKey = String(tempKey || "");
+      for (let i = timeline.length - 1; i >= 0; i--) {
+        if (String(timeline[i]?._tmpKey || "") === tmpKey) {
+          timeline.splice(i, 1);
+        }
       }
+      upsertTimelineMessageById(timeline, savedMsg);
+
+      const savedId = Number(savedMsg?.id);
+      if (Number.isFinite(savedId) && savedId > 0) {
+        let seen = false;
+        for (let i = timeline.length - 1; i >= 0; i--) {
+          if (Number(timeline[i]?.id) !== savedId) continue;
+          if (!seen) {
+            timeline[i] = savedMsg;
+            seen = true;
+            continue;
+          }
+          timeline.splice(i, 1);
+        }
+      }
+
       const id = Number(savedMsg?.id);
       const maxId = Number.isFinite(id) && id > Number(prev?.maxId || 0) ? id : Number(prev?.maxId || 0);
       const minId = Number.isFinite(id) && id > 0 && (!prev?.minId || prev.minId <= 0)
@@ -1375,9 +1828,20 @@ function commitTempChatMessage(tempKey, savedMsg) {
   // 更新 DOM 映射：保持同一个气泡节点，避免闪烁
   const item = worldChatDomByKey.get(String(tempKey || ""));
   if (item) {
+    const existed = worldChatDomByKey.get(newKey);
+    if (existed && existed !== item) {
+      try { existed.row?.remove(); } catch (e) {}
+    }
     worldChatDomByKey.delete(String(tempKey || ""));
     worldChatDomByKey.set(newKey, item);
     if (item.bubble) {
+      const role = String(savedMsg?.role || "").trim().toLowerCase();
+      const content = String(savedMsg?.content || "");
+      if (role === "assistant") {
+        setMarkdownContent(item.bubble, content);
+      } else {
+        item.bubble.textContent = content;
+      }
       const createdAt = String(savedMsg?.created_at || "").trim();
       const runId = savedMsg?.run_id != null ? Number(savedMsg.run_id) : null;
       const taskId = savedMsg?.task_id != null ? Number(savedMsg.task_id) : null;
@@ -1385,10 +1849,10 @@ function commitTempChatMessage(tempKey, savedMsg) {
       if (createdAt) metaParts.push(createdAt);
       if (taskId) metaParts.push(`task#${taskId}`);
       if (runId) metaParts.push(`run#${runId}`);
-      if (metaParts.length) item.bubble.title = metaParts.join(" | ");
+      item.bubble.title = metaParts.join(" | ");
     }
   } else if (worldChatEl) {
-    // 兜底：没找到临时节点就直接 append
+    // 兜底：没找到临时节点就直接 upsert 到 DOM（appendWorldChatMessage 内部已做幂等）
     appendWorldChatMessage(savedMsg);
   }
 }
@@ -1404,10 +1868,10 @@ async function _updateWorldFromBackendImpl(force = false) {
     if (!run) {
       renderWorldPlan({ items: [] });
       worldSession.setState(
-        { currentRun: null, currentAgentPlan: null, currentAgentState: null, currentAgentSnapshot: null, traceLines: [], streamingStatus: "", pendingResume: null },
+        { currentRun: null, currentAgentPlan: null, currentAgentState: null, currentAgentSnapshot: null, traceLines: [], streamingStatus: "" },
         { reason: "no_run" }
       );
-      renderWorldNeedInputChoicesUi(null);
+      clearWorldPendingResume({ reason: "no_run", emit: false });
       renderWorldThoughts(null, null);
       renderWorldEvalPlan(null);
       worldSession.setState({ lastRunMeta: null }, { reason: "no_run" });
@@ -1457,13 +1921,30 @@ async function _updateWorldFromBackendImpl(force = false) {
           taskId: Number.isFinite(taskId) && taskId > 0 ? taskId : null,
           question,
           kind: String(paused?.kind || "").trim() || null,
-          choices: normalizeNeedInputChoices(paused?.choices)
+          choices: normalizeNeedInputChoices(paused?.choices),
+          promptToken: String(paused?.prompt_token || "").trim() || null,
+          sessionKey: String(paused?.session_key || latest?.currentAgentState?.session_key || "").trim() || null
         };
+        const recentRecords = pruneNeedInputRecentRecords(latest?.needInputRecentRecords, {
+          ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
+        });
+        const suppressed = shouldSuppressNeedInputPrompt(nextPending, recentRecords, {
+          ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
+        });
         const shouldSet = !existing
           || Number(existing.runId) !== runId
-          || String(existing.question || "") !== question;
-        if (shouldSet) {
-          worldSession.setState({ pendingResume: nextPending }, { reason: "need_input_poll" });
+          || String(existing.question || "") !== question
+          || String(existing.kind || "") !== String(nextPending.kind || "")
+          || String(existing.promptToken || "") !== String(nextPending.promptToken || "")
+          || String(existing.sessionKey || "") !== String(nextPending.sessionKey || "");
+        if (suppressed) {
+          worldSession.setState({ needInputRecentRecords: recentRecords }, { reason: "need_input_poll_suppressed" });
+          clearWorldPendingResume({ runId, reason: "need_input_poll_suppressed", emit: false });
+        } else if (shouldSet) {
+          worldSession.setState(
+            { pendingResume: nextPending, needInputRecentRecords: recentRecords },
+            { reason: "need_input_poll" }
+          );
           renderWorldNeedInputChoicesUi(nextPending);
         } else {
           renderWorldNeedInputChoicesUi(existing);
@@ -1471,8 +1952,7 @@ async function _updateWorldFromBackendImpl(force = false) {
       } else {
         const existing = latest.pendingResume;
         if (existing) {
-          worldSession.setState({ pendingResume: null }, { reason: "need_input_clear" });
-          renderWorldNeedInputChoicesUi(null);
+          clearWorldPendingResume({ runId, reason: "need_input_clear", emit: false });
         }
       }
     }
@@ -1517,13 +1997,23 @@ async function _updateWorldFromBackendImpl(force = false) {
     if (pendingFinal && String(pendingFinal.tmpKey || "") && Number(pendingFinal.run_id) === runId) {
       const runStatusLower = String(run.status || "").trim().toLowerCase();
       const age = Date.now() - Number(pendingFinal.startedAt || 0);
-      const timeout = age > WORLD_EVAL_GATE_TIMEOUT_MS;
+      const terminal = runStatusLower === "done" || runStatusLower === "failed" || runStatusLower === "stopped";
 
-      // 默认严格等评估完成；若评估未启用/未触发，则超时后放行（避免卡死在“评估中”）
-      const shouldFinalize = evalFinal || (!hasReview && runStatusLower !== "running" && timeout);
+      // 默认优先等评估完成；但只要 run 已终态且超过门限，也要放行，
+      // 避免“review 记录存在但长期非终态”导致对话一直停在“评估中...”。
+      const shouldFinalize = shouldFinalizePendingFinal({
+        evalFinal,
+        hasReview,
+        terminal,
+        ageMs: age,
+        timeoutMs: WORLD_EVAL_GATE_TIMEOUT_MS
+      });
       if (shouldFinalize) {
+        const fallbackLastError = extractRunLastError({
+          snapshot: worldSession.getState()?.currentAgentSnapshot || null
+        });
         const finalText = String(pendingFinal.content || "").trim()
-          || "任务已结束，但未产出可展示结果（缺少【结果】输出）。";
+          || await buildWorldNoVisibleResultText(runStatusLower, pendingFinal.run_id, fallbackLastError);
         updateWorldChatMessageContent(pendingFinal.tmpKey, finalText);
         await saveAndCommitWorldAssistantMessage(pendingFinal.tmpKey, {
           role: "assistant",
@@ -1544,7 +2034,12 @@ async function _updateWorldFromBackendImpl(force = false) {
     // 兜底：后端不可用时不要抛到全局（避免 unhandled rejection 导致 UI 卡死）
     renderWorldPlan({ items: [] });
     renderWorldEvalPlan(null);
-    if (worldThoughtsEl) setPreText(worldThoughtsEl, UI_TEXT.UNAVAILABLE || "不可用");
+    if (worldThoughtsEl) {
+      renderThoughtLinesStructured(worldThoughtsEl, [
+        UI_TEXT.WORLD_THOUGHTS_SECTION_STATUS || "【状态】",
+        `- ${UI_TEXT.UNAVAILABLE || "不可用"}`
+      ]);
+    }
   } finally {}
 }
 
@@ -1610,11 +2105,29 @@ async function streamToWorld(makeRequest, options = {}) {
   const mode = String(options.mode || "").trim().toLowerCase();
   const displayMode = String(options.displayMode || "full").trim().toLowerCase();
   const assistantKey = String(options.assistantKey || "").trim();
+  const enableAgentReplay = options.enableAgentReplay === true;
+  const expectedRunIdValue = Number(options.expectedRunId);
+  const expectedRunId = Number.isFinite(expectedRunIdValue) && expectedRunIdValue > 0
+    ? expectedRunIdValue
+    : null;
+  let streamRunId = null;
+  let streamTaskId = null;
+  let streamRunStatus = "";
 
   // 取消上一次请求（并发保护：旧请求的 finally 不应覆盖新请求状态）
   const { seq: mySeq, controller } = startStream(worldStream);
   worldSession.setState(
-    { streaming: true, streamingMode: mode, pendingResume: null, streamingStatus: "" },
+    (prev) => ({
+      ...prev,
+      streaming: true,
+      streamingMode: mode,
+      pendingResume: null,
+      streamingStatus: "",
+      needInputRecentRecords: pruneNeedInputRecentRecords(
+        prev?.needInputRecentRecords,
+        { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
+      )
+    }),
     { reason: "stream_start" }
   );
   renderWorldNeedInputChoicesUi(null);
@@ -1647,6 +2160,15 @@ async function streamToWorld(makeRequest, options = {}) {
       },
       onRunCreated: (obj) => {
         if (!isStreamActive(worldStream, mySeq)) return;
+        emitAgentEvent(
+          { ...(obj || {}), type: "run_created", _source: AGENT_EVENT_SOURCE_PANEL },
+          { broadcast: true }
+        );
+        const rid = Number(obj?.run_id);
+        const tid = Number(obj?.task_id);
+        if (Number.isFinite(rid) && rid > 0) streamRunId = rid;
+        if (Number.isFinite(tid) && tid > 0) streamTaskId = tid;
+        streamRunStatus = "running";
         const runMeta = {
           run_id: Number(obj.run_id),
           task_id: Number(obj.task_id),
@@ -1666,18 +2188,156 @@ async function streamToWorld(makeRequest, options = {}) {
         );
         updateWorldFromBackend(true);
       },
+      onRunStatus: (obj) => {
+        if (!isStreamActive(worldStream, mySeq)) return;
+        emitAgentEvent(
+          { ...(obj || {}), type: "run_status", _source: AGENT_EVENT_SOURCE_PANEL },
+          { broadcast: true }
+        );
+        const status = normalizeRunStatusValue(obj?.status);
+        const rid = Number(obj?.run_id);
+        const tid = Number(obj?.task_id);
+        if (status) streamRunStatus = status;
+        if (Number.isFinite(rid) && rid > 0) streamRunId = rid;
+        if (Number.isFinite(tid) && tid > 0) streamTaskId = tid;
+
+        const state = worldSession.getState();
+        const pending = state?.pendingResume;
+        const shouldClearPending = !!(
+          status
+          && status !== "waiting"
+          && Number.isFinite(rid)
+          && rid > 0
+          && Number(pending?.runId) === rid
+        );
+
+        worldSession.setState(
+          (prev) => {
+            const prevRun = prev?.currentRun && typeof prev.currentRun === "object" ? prev.currentRun : null;
+            const prevRunId = Number(prevRun?.run_id);
+            const prevTaskId = Number(prevRun?.task_id);
+            const nextRunId = Number.isFinite(rid) && rid > 0
+              ? rid
+              : (Number.isFinite(prevRunId) && prevRunId > 0 ? prevRunId : null);
+            const nextTaskId = Number.isFinite(tid) && tid > 0
+              ? tid
+              : (Number.isFinite(prevTaskId) && prevTaskId > 0 ? prevTaskId : null);
+            const nextStatus = status || normalizeRunStatusValue(prevRun?.status) || "running";
+
+            let nextCurrentRun = prevRun;
+            if (nextRunId && (!Number.isFinite(prevRunId) || prevRunId <= 0 || prevRunId === nextRunId)) {
+              nextCurrentRun = {
+                ...(prevRun || {
+                  task_title: "",
+                  summary: null,
+                  mode: null,
+                  started_at: "",
+                  finished_at: "",
+                  created_at: "",
+                  updated_at: "",
+                  is_current: true
+                }),
+                run_id: nextRunId,
+                task_id: nextTaskId || null,
+                status: nextStatus
+              };
+            }
+
+            const prevMeta = prev?.lastRunMeta && typeof prev.lastRunMeta === "object" ? prev.lastRunMeta : {};
+            let nextLastRunMeta = prev.lastRunMeta;
+            if (nextRunId) {
+              nextLastRunMeta = {
+                ...prevMeta,
+                run_id: nextRunId,
+                task_id: nextTaskId || null,
+                status: nextStatus,
+                updated_at: String(prevMeta.updated_at || "")
+              };
+            }
+
+            return {
+              ...prev,
+              currentRun: nextCurrentRun,
+              lastRunMeta: nextLastRunMeta
+            };
+          },
+          { reason: "run_status_event" }
+        );
+        if (shouldClearPending) {
+          clearWorldPendingResume({ runId: rid, reason: "run_status_continue" });
+        } else if (status && status !== "waiting" && isTerminalRunStatus(status)) {
+          clearWorldPendingResume({ reason: "run_status_terminal_fallback" });
+        }
+        if (pageWorldEl?.classList?.contains("is-visible")) {
+          rerenderWorldThoughtsFromState();
+        }
+      },
       onNeedInput: (obj) => {
         if (!isStreamActive(worldStream, mySeq)) return;
+        emitAgentEvent(
+          { ...(obj || {}), type: "need_input", _source: AGENT_EVENT_SOURCE_PANEL },
+          { broadcast: true }
+        );
+        const rid = Number(obj?.run_id);
+        const tid = Number(obj?.task_id);
+        if (Number.isFinite(rid) && rid > 0) streamRunId = rid;
+        if (Number.isFinite(tid) && tid > 0) streamTaskId = tid;
+        streamRunStatus = "waiting";
         const q = String(obj?.question || "").trim();
         const pending = {
-          runId: Number(obj.run_id),
-          taskId: Number(obj.task_id) || null,
+          runId: rid,
+          taskId: tid || null,
           question: q,
           kind: String(obj?.kind || "").trim() || null,
-          choices: normalizeNeedInputChoices(obj?.choices)
+          choices: normalizeNeedInputChoices(obj?.choices),
+          promptToken: String(obj?.prompt_token || obj?.promptToken || "").trim() || null,
+          sessionKey: String(obj?.session_key || obj?.sessionKey || "").trim() || null
         };
+
+        const state = worldSession.getState();
+        const recentRecords = pruneNeedInputRecentRecords(state?.needInputRecentRecords, {
+          ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
+        });
+        if (shouldSuppressNeedInputPrompt(pending, recentRecords, { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS })) {
+          worldSession.setState(
+            { needInputRecentRecords: recentRecords },
+            { reason: "need_input_suppressed" }
+          );
+          return;
+        }
+        const currentPending = state?.pendingResume;
+        const isSamePending = !!currentPending
+          && Number(currentPending.runId) === Number(pending.runId)
+          && Number(currentPending.taskId || 0) === Number(pending.taskId || 0)
+          && String(currentPending.question || "") === String(pending.question || "")
+          && String(currentPending.kind || "") === String(pending.kind || "")
+          && String(currentPending.promptToken || "") === String(pending.promptToken || "")
+          && String(currentPending.sessionKey || "") === String(pending.sessionKey || "")
+          && JSON.stringify(Array.isArray(currentPending.choices) ? currentPending.choices : [])
+            === JSON.stringify(Array.isArray(pending.choices) ? pending.choices : []);
+        if (isSamePending) return;
+
         worldSession.setState(
-          { pendingResume: pending },
+          (prev) => {
+            const prevRun = prev?.currentRun && typeof prev.currentRun === "object" ? prev.currentRun : null;
+            const prevRunId = Number(prevRun?.run_id);
+            const nextCurrentRun = Number.isFinite(rid) && rid > 0 && (!Number.isFinite(prevRunId) || prevRunId <= 0 || prevRunId === rid)
+              ? { ...(prevRun || {}), run_id: rid, task_id: tid || null, status: "waiting" }
+              : prevRun;
+            return {
+              ...prev,
+              pendingResume: pending,
+              needInputRecentRecords: recentRecords,
+              currentRun: nextCurrentRun,
+              lastRunMeta: {
+                ...(prev?.lastRunMeta || {}),
+                run_id: Number.isFinite(rid) && rid > 0 ? rid : (prev?.lastRunMeta?.run_id || null),
+                task_id: tid || null,
+                updated_at: String(prev?.lastRunMeta?.updated_at || ""),
+                status: "waiting"
+              }
+            };
+          },
           { reason: "need_input" }
         );
         renderWorldNeedInputChoicesUi(pending);
@@ -1695,6 +2355,17 @@ async function streamToWorld(makeRequest, options = {}) {
       onEvent: (obj) => {
         // 世界页发起的 SSE 事件本就在当前窗口：直接派发本地事件给各标签页订阅
         if (!isStreamActive(worldStream, mySeq)) return;
+        if (obj?.type === "replay_applied") {
+          const n = Number(obj?.applied);
+          if (Number.isFinite(n) && n > 0) {
+            worldSession.setState(
+              { streamingStatus: `连接已恢复，已从事件日志补齐 ${n} 条事件。` },
+              { reason: "stream_replay_applied" }
+            );
+            rerenderWorldThoughtsFromState();
+          }
+          return;
+        }
         if (obj?.type === "memory_item") {
           emitAgentEvent(obj, { broadcast: false });
           return;
@@ -1703,7 +2374,24 @@ async function streamToWorld(makeRequest, options = {}) {
           emitAgentEvent(obj, { broadcast: false });
         }
       },
-      onReviewDelta: () => "" // 世界页不展开评估明细，避免刷屏
+      onReviewDelta: () => "", // 世界页不展开评估明细，避免刷屏
+      replayFetch: enableAgentReplay
+        ? (runId, afterEventId, signal) => api.fetchAgentRunEvents(
+          runId,
+          {
+            after_event_id: afterEventId || undefined,
+            limit: 200
+          },
+          signal
+        )
+        : undefined,
+      getReplayRunId: enableAgentReplay
+        ? () => {
+          if (Number.isFinite(expectedRunId) && expectedRunId > 0) return expectedRunId;
+          const ridFromStream = Number(streamRunId);
+          return Number.isFinite(ridFromStream) && ridFromStream > 0 ? ridFromStream : null;
+        }
+        : undefined
     }
   );
 
@@ -1713,12 +2401,84 @@ async function streamToWorld(makeRequest, options = {}) {
     renderWorldNeedInputChoicesUi(worldSession.getState().pendingResume);
   }
 
-  return { transcript, hadError };
+  return { transcript, hadError, runId: streamRunId, taskId: streamTaskId, runStatus: streamRunStatus };
 }
 
 function extractVisibleResultText(transcript) {
-  const payload = extractResultPayloadText(transcript || "");
-  return String(payload || "").replace(/^【结果】/g, "").trim();
+  return extractVisibleResultTextFromTranscript(transcript || "");
+}
+
+async function buildWorldNoVisibleResultText(status, runId, fallbackLastError = null) {
+  const rid = Number(runId);
+  let normalizedStatus = normalizeRunStatusValue(status);
+  let lastError = fallbackLastError || null;
+  if (Number.isFinite(rid) && rid > 0 && (!lastError || !normalizedStatus)) {
+    const detail = await api.fetchAgentRunDetail(rid).catch(() => null);
+    if (!normalizedStatus) {
+      normalizedStatus = normalizeRunStatusValue(detail?.run?.status);
+    }
+    if (!lastError) {
+      lastError = extractRunLastError(detail);
+    }
+  }
+  return buildNoVisibleResultText(normalizedStatus, {
+    runId: Number.isFinite(rid) && rid > 0 ? rid : null,
+    lastError
+  });
+}
+
+function buildPendingFinalPlaceholderText(status) {
+  const normalized = normalizeRunStatusValue(status);
+  if (normalized === "failed") return "任务执行失败，评估中…";
+  if (normalized === "stopped" || normalized === "cancelled") return "任务已中止，评估中…";
+  return "任务执行完成，评估中…";
+}
+
+async function ensureWorldPendingResumeFromBackend(runId, fallbackTaskId = null) {
+  const rid = Number(runId);
+  if (!Number.isFinite(rid) || rid <= 0) return { waiting: false, question: "", taskId: null, status: "" };
+
+  const detail = await api.fetchAgentRunDetail(rid).catch(() => null);
+  const resolved = resolvePendingResumeFromRunDetail(rid, detail, {
+    fallbackTaskId,
+    normalizeChoices: normalizeNeedInputChoices
+  });
+  if (!resolved.waiting || !resolved.pending) {
+    return { waiting: false, question: "", taskId: null, status: resolved.status };
+  }
+
+  const state = worldSession.getState();
+  const current = state.pendingResume;
+  const recentRecords = pruneNeedInputRecentRecords(state.needInputRecentRecords, {
+    ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
+  });
+  if (shouldSuppressNeedInputPrompt(resolved.pending, recentRecords, { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS })) {
+    worldSession.setState({ needInputRecentRecords: recentRecords }, { reason: "need_input_recover_suppressed" });
+    clearWorldPendingResume({ runId: rid, reason: "need_input_recover_suppressed", emit: false });
+    return { waiting: false, question: "", taskId: null, status: resolved.status };
+  }
+
+  const currentRunId = Number(current?.runId);
+  const shouldRefreshPending = !Number.isFinite(currentRunId)
+    || currentRunId !== rid
+    || String(current?.question || "").trim() !== String(resolved.pending.question || "").trim()
+    || String(current?.kind || "").trim() !== String(resolved.pending.kind || "").trim()
+    || String(current?.promptToken || "").trim() !== String(resolved.pending.promptToken || "").trim()
+    || String(current?.sessionKey || "").trim() !== String(resolved.pending.sessionKey || "").trim();
+  if (shouldRefreshPending) {
+    worldSession.setState(
+      { pendingResume: resolved.pending, needInputRecentRecords: recentRecords },
+      { reason: "need_input_recover" }
+    );
+    renderWorldNeedInputChoicesUi(resolved.pending);
+  }
+
+  return {
+    waiting: true,
+    question: resolved.question,
+    taskId: resolved.taskId,
+    status: resolved.status
+  };
 }
 
 async function saveAndCommitWorldAssistantMessage(tempKey, payload) {
@@ -1756,72 +2516,161 @@ async function runWorldChatMode(userText) {
 async function runWorldDoMode(userText, options = {}) {
   const msg = String(userText || "").trim();
   if (!msg) return;
+  const requestedMode = String(options.mode || "do").trim().toLowerCase();
+  const agentMode = requestedMode === "think" ? "think" : "do";
 
   const resumeRunId = options.resumeRunId != null ? Number(options.resumeRunId) : null;
   const resumeTaskId = options.resumeTaskId != null ? Number(options.resumeTaskId) : null;
+  const resumePromptToken = String(options.resumePromptToken || "").trim() || null;
+  const resumeSessionKey = String(options.resumeSessionKey || "").trim() || null;
+  const resumeKind = String(options.resumeKind || "").trim();
   const isResume = !!(resumeRunId && resumeRunId > 0);
-
-  await createAndAppendChatMessage({
-    role: "user",
-    content: msg,
-    task_id: isResume ? resumeTaskId : null,
-    run_id: isResume ? resumeRunId : null,
-    metadata: { source: "panel", mode: isResume ? "resume" : "do" }
-  });
-
-  const assistantTemp = createTempWorldChatMessage(
-    "assistant",
-    UI_TEXT.PET_CHAT_SENDING || "…",
-    isResume ? { run_id: resumeRunId, task_id: resumeTaskId } : { metadata: { source: "panel", mode: "do" } }
-  );
-
-  const { transcript, hadError } = await streamToWorld(
-    (signal) => isResume
-      ? api.streamAgentResume({ run_id: resumeRunId, message: msg }, signal)
-      : api.streamAgentCommand({ message: msg }, signal),
-    { mode: "do", displayMode: "status", assistantKey: assistantTemp._tmpKey }
-  );
-  if (hadError) return;
-
-  // 若进入等待用户输入：把提问作为“assistant 消息”落库（不把规划/执行状态当作最终回答）
-  const pending = worldSession.getState().pendingResume;
-  if (pending && pending.runId) {
-    const q = String(pending.question || "").trim() || "需要你补充信息后才能继续执行。";
-    updateWorldChatMessageContent(assistantTemp._tmpKey, q);
-    await saveAndCommitWorldAssistantMessage(assistantTemp._tmpKey, {
-      role: "assistant",
-      content: q,
-      run_id: pending.runId,
-      task_id: pending.taskId || null,
-      metadata: { source: "panel", mode: "need_input" }
-    });
-    return;
+  const isTaskFeedbackResume = isResume && resumeKind === "task_feedback";
+  const currentRunMode = String(worldSession.getState()?.currentRun?.mode || "").trim().toLowerCase();
+  const executionMode = isResume
+    ? ((requestedMode === "think" || currentRunMode === "think") ? "think" : "do")
+    : agentMode;
+  let acquiredResumeLock = false;
+  if (isResume) {
+    if (worldResumeInFlight) return;
+    worldResumeInFlight = true;
+    acquiredResumeLock = true;
   }
 
-  const visible = extractVisibleResultText(transcript);
-  const finalVisible = visible || "任务已结束，但未产出可展示结果（缺少【结果】输出）。";
+  try {
+    await createAndAppendChatMessage({
+      role: "user",
+      content: msg,
+      task_id: isResume ? resumeTaskId : null,
+      run_id: isResume ? resumeRunId : null,
+      metadata: { source: "panel", mode: isResume ? "resume" : agentMode }
+    });
 
-  const lastRunMeta = worldSession.getState().lastRunMeta;
-  const runId = isResume ? resumeRunId : (lastRunMeta?.run_id || null);
-  const taskId = isResume ? resumeTaskId : (lastRunMeta?.task_id || null);
+    const assistantTemp = createTempWorldChatMessage(
+      "assistant",
+      UI_TEXT.PET_CHAT_SENDING || "…",
+      isResume
+        ? { run_id: resumeRunId, task_id: resumeTaskId }
+        : { metadata: { source: "panel", mode: agentMode } }
+    );
 
-  // 关键体验：在评估 plan-list 完成前，不输出最终总结（避免用户看到“结果”但评估仍在跑）
-  worldSession.setState(
-    {
-      pendingFinal: {
-        tmpKey: assistantTemp._tmpKey,
-        content: finalVisible,
-        run_id: runId,
-        task_id: taskId,
-        metadata: { source: "panel", mode: isResume ? "resume" : "do" },
-        startedAt: Date.now()
+    const streamResult = await streamToWorld(
+      (signal) => isResume
+        ? api.streamAgentResume(
+          {
+            run_id: resumeRunId,
+            message: msg,
+            prompt_token: resumePromptToken || undefined,
+            session_key: resumeSessionKey || undefined
+          },
+          signal
+        )
+        : api.streamAgentCommand({ message: msg, mode: agentMode }, signal),
+      {
+        mode: executionMode,
+        displayMode: "status",
+        assistantKey: assistantTemp._tmpKey,
+        enableAgentReplay: true,
+        expectedRunId: isResume ? resumeRunId : null
       }
-    },
-    { reason: "pending_final_set" }
-  );
-  updateWorldChatMessageContent(assistantTemp._tmpKey, "任务执行完成，评估中…");
-  // 主动刷新一次，减少用户等待一个 polling interval 才看到“评估计划”的延迟
-  updateWorldFromBackend(true).catch(() => {});
+    );
+    const { transcript, hadError } = streamResult;
+    if (hadError) return;
+
+    // 若进入等待用户输入：把提问作为“assistant 消息”落库（不把规划/执行状态当作最终回答）
+    const pending = worldSession.getState().pendingResume;
+    if (pending && pending.runId) {
+      const q = String(pending.question || "").trim() || "需要你补充信息后才能继续执行。";
+      updateWorldChatMessageContent(assistantTemp._tmpKey, q);
+      await saveAndCommitWorldAssistantMessage(assistantTemp._tmpKey, {
+        role: "assistant",
+        content: q,
+        run_id: pending.runId,
+        task_id: pending.taskId || null,
+        metadata: { source: "panel", mode: "need_input" }
+      });
+      return;
+    }
+
+    const lastRunMeta = worldSession.getState().lastRunMeta;
+    const streamRunId = Number(streamResult?.runId);
+    const streamTaskId = Number(streamResult?.taskId);
+    const runId = isResume
+      ? resumeRunId
+      : (Number.isFinite(streamRunId) && streamRunId > 0 ? streamRunId : (lastRunMeta?.run_id || null));
+    const taskId = isResume
+      ? resumeTaskId
+      : (Number.isFinite(streamTaskId) && streamTaskId > 0 ? streamTaskId : (lastRunMeta?.task_id || null));
+    let runStatus = normalizeRunStatusValue(streamResult?.runStatus);
+    if (runStatus === "waiting") {
+      await ensureWorldPendingResumeFromBackend(runId, taskId);
+      return;
+    }
+    if (!runStatus) {
+      const runState = await ensureWorldPendingResumeFromBackend(runId, taskId);
+      if (runState.waiting) return;
+      runStatus = normalizeRunStatusValue(runState.status);
+    }
+    if (!isTerminalRunStatus(runStatus)) return;
+
+    // 与桌宠页保持一致：task_feedback 的 resume 只展示反馈闭环结果，
+    // 不走“缺少可见结果”兜底，避免出现误导性提示。
+    if (isTaskFeedbackResume) {
+      const doneText = buildTaskFeedbackAckText(runStatus, runId);
+      updateWorldChatMessageContent(assistantTemp._tmpKey, doneText);
+      await saveAndCommitWorldAssistantMessage(assistantTemp._tmpKey, {
+        role: "assistant",
+        content: doneText,
+        run_id: runId,
+        task_id: taskId || null,
+        metadata: { source: "panel", mode: "resume", kind: "task_feedback" }
+      });
+      return;
+    }
+
+    const visible = extractVisibleResultText(transcript);
+    if (!visible) {
+      // 兜底：本地 pendingResume 丢失但 run 实际仍在 waiting 时，恢复等待输入态并避免写入错误 fallback。
+      const waitingRecovered = await ensureWorldPendingResumeFromBackend(runId, taskId);
+      if (waitingRecovered.waiting) {
+        const q = String(waitingRecovered.question || "").trim() || "需要你补充信息后才能继续执行。";
+        updateWorldChatMessageContent(assistantTemp._tmpKey, q);
+        await saveAndCommitWorldAssistantMessage(assistantTemp._tmpKey, {
+          role: "assistant",
+          content: q,
+          run_id: runId,
+          task_id: waitingRecovered.taskId || taskId || null,
+          metadata: { source: "panel", mode: "need_input" }
+        });
+        return;
+      }
+      runStatus = normalizeRunStatusValue(waitingRecovered.status) || runStatus;
+    }
+    const statusFallback = runStatus || String(worldSession.getState().currentRun?.status || "").trim().toLowerCase();
+    const finalVisible = visible || await buildWorldNoVisibleResultText(statusFallback, runId);
+
+    // 关键体验：在评估 plan-list 完成前，不输出最终总结（避免用户看到“结果”但评估仍在跑）
+    worldSession.setState(
+      {
+        pendingFinal: {
+          tmpKey: assistantTemp._tmpKey,
+          content: finalVisible,
+          run_id: runId,
+          task_id: taskId,
+          metadata: { source: "panel", mode: isResume ? "resume" : agentMode },
+          startedAt: Date.now()
+        }
+      },
+      { reason: "pending_final_set" }
+    );
+    updateWorldChatMessageContent(assistantTemp._tmpKey, buildPendingFinalPlaceholderText(statusFallback));
+    // 主动刷新一次，减少用户等待一个 polling interval 才看到“评估计划”的延迟
+    updateWorldFromBackend(true).catch(() => {});
+  } finally {
+    if (acquiredResumeLock) {
+      worldResumeInFlight = false;
+    }
+  }
 }
 
 async function submitWorldInput() {
@@ -1832,15 +2681,21 @@ async function submitWorldInput() {
   // 等待输入态：自动 resume
   const pending = worldSession.getState().pendingResume;
   if (pending && pending.runId) {
-    worldSession.setState({ pendingResume: null }, { reason: "resume_send" });
-    renderWorldNeedInputChoicesUi(null);
-    await runWorldDoMode(text, { resumeRunId: pending.runId, resumeTaskId: pending.taskId });
+    if (worldResumeInFlight) return;
+    clearWorldPendingResume({ runId: Number(pending.runId), reason: "resume_send" });
+    await runWorldDoMode(text, {
+      resumeRunId: pending.runId,
+      resumeTaskId: pending.taskId,
+      resumePromptToken: pending.promptToken,
+      resumeSessionKey: pending.sessionKey,
+      resumeKind: pending.kind
+    });
     return;
   }
 
   const cmd = parseSlashCommand(text);
   if (cmd?.cmd === "help") {
-    const tip = "可用命令：/chat <内容>、/do <指令>。不带 / 会让后端自动判断 chat/do。";
+    const tip = "可用命令：/chat <内容>、/do <指令>、/think <指令>。不带 / 会让后端自动判断 chat/do/think。";
     createTempWorldChatMessage("assistant", tip, { metadata: { source: "panel" } });
     return;
   }
@@ -1855,23 +2710,30 @@ async function submitWorldInput() {
   if (cmd?.cmd === "do") {
     const msg = String(cmd.args || "").trim();
     if (!msg) return;
-    await runWorldDoMode(msg);
+    await runWorldDoMode(msg, { mode: "do" });
     return;
   }
 
-  // 默认：后端路由 chat/do
+  if (cmd?.cmd === "think") {
+    const msg = String(cmd.args || "").trim();
+    if (!msg) return;
+    await runWorldDoMode(msg, { mode: "think" });
+    return;
+  }
+
+  // 默认：后端路由 chat/do/think
   let mode = "chat";
   try {
     const route = await api.routeAgentMode({ message: text });
     const m = String(route?.mode || "").trim().toLowerCase();
-    if (m === "do" || m === "chat") mode = m;
+    if (m === "do" || m === "chat" || m === "think") mode = m;
   } catch (e) {}
 
   if (mode === "chat") {
     await runWorldChatMode(text);
     return;
   }
-  await runWorldDoMode(text);
+  await runWorldDoMode(text, { mode });
 }
 
 function submitWorldInputWithHistory() {
@@ -2103,12 +2965,17 @@ function activatePage(pageId) {
     startWorldPolling();
   } else {
     stopWorldPolling();
-    // 离开世界页时中断可能仍在进行的流式请求，避免后台持续占用连接/写 DOM
-    abortStream(worldStream);
-    worldSession.setState(
-      { streaming: false, streamingMode: "", pendingResume: null, streamingStatus: "" },
-      { reason: "page_hide" }
-    );
+    const session = worldSession.getState();
+    const keepExecutionStream = !!session.streaming && String(session.streamingMode || "") !== "chat";
+    if (!keepExecutionStream) {
+      // chat/空闲态仍按原逻辑中断，避免无意义连接占用。
+      abortStream(worldStream);
+      clearWorldPendingResume({ reason: "page_hide", emit: false });
+      worldSession.setState(
+        { streaming: false, streamingMode: "", pendingResume: null, streamingStatus: "" },
+        { reason: "page_hide" }
+      );
+    }
   }
 }
 

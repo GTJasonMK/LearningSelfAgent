@@ -3,8 +3,9 @@ import json
 import threading
 import time
 import traceback
-from typing import AsyncGenerator, Generator, TypeVar
+from typing import AsyncGenerator, Callable, Generator, Optional, TypeVar
 
+from backend.src.common.utils import coerce_int
 from backend.src.constants import AGENT_SSE_PLAN_MIN_INTERVAL_SECONDS
 
 T = TypeVar("T")
@@ -69,12 +70,33 @@ def _sse_data_json(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _plan_delta_sort_key(change: object) -> int:
+    if not isinstance(change, dict):
+        return 0
+    return coerce_int(change.get("step_order") or 0, default=0)
+
+
+def _plan_delta_change_key(change: object) -> Optional[int]:
+    if not isinstance(change, dict):
+        return None
+    change_id = coerce_int(change.get("id") or 0, default=0)
+    if change_id > 0:
+        return change_id
+    step_order = coerce_int(change.get("step_order") or 0, default=0)
+    if step_order > 0:
+        return step_order
+    return None
+
+
 async def pump_sync_generator(
     *,
     inner: Generator[str, None, T],
     label: str,
-    poll_interval_seconds: int,
-    idle_timeout_seconds: int,
+    poll_interval_seconds: float,
+    idle_timeout_seconds: float,
+    heartbeat_builder: Optional[Callable[[], Optional[str]]] = None,
+    heartbeat_min_interval_seconds: float = 0.0,
+    heartbeat_trigger_debounce_seconds: float = 0.0,
 ) -> AsyncGenerator[tuple[str, object], None]:
     """
     将“同步 generator”的产出桥接为“异步事件流”。
@@ -116,15 +138,19 @@ async def pump_sync_generator(
     def _pump() -> None:
         sent = 0
         pump_error["phase"] = "start"
+
+        def _close_inner_if_possible() -> None:
+            try:
+                inner.close()
+            except (AttributeError, RuntimeError) as exc:
+                pump_error["close_error"] = f"{type(exc).__name__}: {exc}"
+                pump_error["close_trace"] = traceback.format_exc()
+
         try:
             while True:
                 if stop_event.is_set():
                     pump_error["phase"] = "cancelled"
-                    try:
-                        inner.close()
-                    except (AttributeError, RuntimeError) as exc:
-                        pump_error["close_error"] = f"{type(exc).__name__}: {exc}"
-                        pump_error["close_trace"] = traceback.format_exc()
+                    _close_inner_if_possible()
                     return
                 pump_error["phase"] = "next"
                 try:
@@ -139,11 +165,7 @@ async def pump_sync_generator(
                 pump_error["sent_count"] = str(sent)
                 if not _try_put("msg", item):
                     pump_error["phase"] = "cancelled"
-                    try:
-                        inner.close()
-                    except (AttributeError, RuntimeError) as exc:
-                        pump_error["close_error"] = f"{type(exc).__name__}: {exc}"
-                        pump_error["close_trace"] = traceback.format_exc()
+                    _close_inner_if_possible()
                     return
         except BaseException as exc:  # noqa: BLE001
             pump_error["phase"] = "exception"
@@ -156,6 +178,10 @@ async def pump_sync_generator(
     t.start()
 
     last_recv_at = time.monotonic()
+    heartbeat_active = False
+    heartbeat_min_interval = _normalize_interval_seconds(heartbeat_min_interval_seconds)
+    heartbeat_trigger_debounce = _normalize_interval_seconds(heartbeat_trigger_debounce_seconds)
+    last_heartbeat_emit_at = 0.0
     # plan 事件节流：
     # - plan payload 通常包含完整 plan_items，大计划下频繁广播会导致前端渲染抖动；
     # - 在 pump 层统一合并短时间内密集的 plan 事件（只保留最后一次），降低 JSON 洪泛；
@@ -180,11 +206,7 @@ async def pump_sync_generator(
             return None
         meta = dict(pending_plan_delta_meta)
         # 统一输出：按 step_order 排序，便于前端/调试稳定
-        changes = list(pending_plan_delta_changes.values())
-        try:
-            changes = sorted(changes, key=lambda it: int(it.get("step_order") or 0))
-        except (TypeError, ValueError, AttributeError):
-            pass
+        changes = sorted(list(pending_plan_delta_changes.values()), key=_plan_delta_sort_key)
         meta["changes"] = changes
         pending_plan_delta_meta = None
         pending_plan_delta_changes = {}
@@ -223,6 +245,7 @@ async def pump_sync_generator(
 
                 if kind == "msg":
                     msg_text = str(payload or "")
+                    heartbeat_active = True
 
                     if plan_min_interval <= 0:
                         yield "msg", msg_text
@@ -263,22 +286,7 @@ async def pump_sync_generator(
 
                         pending_plan_delta_meta = meta
                         for ch in changes:
-                            if not isinstance(ch, dict):
-                                continue
-                            key = None
-                            try:
-                                cid = int(ch.get("id") or 0)
-                            except (TypeError, ValueError):
-                                cid = 0
-                            if cid > 0:
-                                key = cid
-                            else:
-                                try:
-                                    order = int(ch.get("step_order") or 0)
-                                except (TypeError, ValueError):
-                                    order = 0
-                                if order > 0:
-                                    key = order
+                            key = _plan_delta_change_key(ch)
                             if key is None:
                                 continue
                             pending_plan_delta_changes[int(key)] = dict(ch)
@@ -315,6 +323,23 @@ async def pump_sync_generator(
 
             # tick：检查线程/回传异常，并让 loop 周期性 wake up
             tick_task = asyncio.create_task(asyncio.sleep(poll_interval_seconds))
+
+            # 双层 heartbeat：
+            # 1) trigger layer：收到业务消息后进入 active；
+            # 2) scheduler layer：仅在静默窗口/最小间隔达标时发心跳。
+            if heartbeat_active and callable(heartbeat_builder) and heartbeat_min_interval > 0:
+                now_value = time.monotonic()
+                silent_for = now_value - last_recv_at
+                heartbeat_due = (now_value - last_heartbeat_emit_at) >= heartbeat_min_interval
+                debounce_ok = silent_for >= heartbeat_trigger_debounce
+                if heartbeat_due and debounce_ok:
+                    try:
+                        heartbeat_msg = heartbeat_builder()
+                    except Exception:
+                        heartbeat_msg = None
+                    if isinstance(heartbeat_msg, str) and heartbeat_msg.strip():
+                        last_heartbeat_emit_at = now_value
+                        yield "msg", str(heartbeat_msg)
 
             # tick flush：避免 plan 在“短 burst 后长时间无后续 plan”时被永久吞掉
             if plan_min_interval > 0 and pending_plan_msg:

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from typing import List, Optional, Sequence
 
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import dump_json_list, now_iso
 from backend.src.repositories.repo_conn import provide_connection
 
 
@@ -32,7 +31,7 @@ def create_search_record(
 ) -> int:
     created = created_at or now_iso()
     sql = "INSERT INTO search_records (query, sources, result_count, task_id, created_at) VALUES (?, ?, ?, ?, ?)"
-    params: Sequence = (query, json.dumps(list(sources or []), ensure_ascii=False), int(result_count), task_id, created)
+    params: Sequence = (query, dump_json_list(sources), int(result_count), task_id, created)
     with provide_connection(conn) as inner:
         cursor = inner.execute(sql, params)
         return int(cursor.lastrowid)

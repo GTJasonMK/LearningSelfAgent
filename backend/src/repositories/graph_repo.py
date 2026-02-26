@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from backend.src.common.sql import in_clause_placeholders
 from backend.src.common.utils import now_iso
 from backend.src.repositories.repo_conn import provide_connection
 
@@ -147,7 +148,9 @@ def query_graph(
         if not node_ids:
             return nodes_map, []
 
-        placeholders = ",".join(["?"] * len(node_ids))
+        placeholders = in_clause_placeholders(node_ids)
+        if not placeholders:
+            return nodes_map, []
         rows = inner.execute(
             f"SELECT * FROM graph_edges WHERE source IN ({placeholders}) OR target IN ({placeholders})",
             node_ids + node_ids,
@@ -179,7 +182,9 @@ def list_graph_edges_for_node_ids(
     ids = [int(x) for x in (node_ids or []) if int(x) > 0]
     if not ids:
         return []
-    placeholders = ",".join(["?"] * len(ids))
+    placeholders = in_clause_placeholders(ids)
+    if not placeholders:
+        return []
     sql = f"SELECT * FROM graph_edges WHERE source IN ({placeholders}) OR target IN ({placeholders})"
     params = ids + ids
     with provide_connection(conn) as inner:
@@ -228,21 +233,22 @@ def update_graph_node(
 ) -> Optional[sqlite3.Row]:
     fields: List[str] = []
     params: List[Any] = []
-    if label is not None:
-        fields.append("label = ?")
-        params.append(label)
-    if node_type is not None:
-        fields.append("node_type = ?")
-        params.append(node_type)
+    plain_updates = [
+        ("label", label),
+        ("node_type", node_type),
+        ("evidence", evidence),
+    ]
+    for column, value in plain_updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(value)
     if attributes is not None:
         fields.append("attributes = ?")
         params.append(json.dumps(attributes, ensure_ascii=False))
     if task_id is not None:
         fields.append("task_id = ?")
         params.append(int(task_id))
-    if evidence is not None:
-        fields.append("evidence = ?")
-        params.append(evidence)
     with provide_connection(conn) as inner:
         existing = get_graph_node(node_id=node_id, conn=inner)
         if not existing:
@@ -266,15 +272,16 @@ def update_graph_edge(
 ) -> Optional[sqlite3.Row]:
     fields: List[str] = []
     params: List[Any] = []
-    if relation is not None:
-        fields.append("relation = ?")
-        params.append(relation)
-    if confidence is not None:
-        fields.append("confidence = ?")
-        params.append(confidence)
-    if evidence is not None:
-        fields.append("evidence = ?")
-        params.append(evidence)
+    updates = [
+        ("relation", relation),
+        ("confidence", confidence),
+        ("evidence", evidence),
+    ]
+    for column, value in updates:
+        if value is None:
+            continue
+        fields.append(f"{column} = ?")
+        params.append(value)
     with provide_connection(conn) as inner:
         existing = get_graph_edge(edge_id=edge_id, conn=inner)
         if not existing:
