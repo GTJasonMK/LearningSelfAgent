@@ -14,9 +14,52 @@ from backend.src.storage import init_db
 from backend.src.services.tasks.task_recovery import stop_running_task_records
 
 logger = logging.getLogger(__name__)
+_ACCESS_LOG_FILTER_INSTALLED_FLAG = "_agent_polling_filter_installed"
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+class _UvicornPollingAccessFilter(logging.Filter):
+    """
+    过滤高频轮询接口的 access log，避免业务日志被淹没。
+    可通过 AGENT_ACCESS_LOG_FILTER_POLLING=0 关闭。
+    """
+
+    _NOISY_PATTERNS = (
+        '"GET /api/agent/runs/current',
+        '"GET /api/tasks/summary',
+        '"GET /api/records/recent',
+        '"GET /api/health',
+        '"GET /api/agent/reviews',
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = str(record.getMessage() or "")
+        except Exception:
+            return True
+        return not any(pattern in message for pattern in self._NOISY_PATTERNS)
+
+
+def _install_access_log_filter_once() -> None:
+    if not _env_enabled("AGENT_ACCESS_LOG_FILTER_POLLING", default=True):
+        return
+    access_logger = logging.getLogger("uvicorn.access")
+    if bool(getattr(access_logger, _ACCESS_LOG_FILTER_INSTALLED_FLAG, False)):
+        return
+    access_logger.addFilter(_UvicornPollingAccessFilter())
+    setattr(access_logger, _ACCESS_LOG_FILTER_INSTALLED_FLAG, True)
+    logger.info("uvicorn access 轮询降噪过滤已启用（AGENT_ACCESS_LOG_FILTER_POLLING=0 可关闭）")
 
 
 def create_app() -> FastAPI:
+    _install_access_log_filter_once()
+
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
         _ = app

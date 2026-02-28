@@ -12,6 +12,7 @@ SSE（Server-Sent Events）流式解析器。
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, Optional
 
@@ -94,12 +95,17 @@ def iter_sse_stream(lines: Iterable[str]) -> Iterator[SseEvent]:
     参数:
         lines: 文本块迭代器（如 httpx response.iter_text()）
     """
+    separator_re = re.compile(r"\r?\n\r?\n")
     buffer = ""
     for chunk in lines:
         buffer += chunk
         # 循环提取所有已完成的事件块
-        while "\n\n" in buffer:
-            block_text, buffer = buffer.split("\n\n", 1)
+        while True:
+            match = separator_re.search(buffer)
+            if not match:
+                break
+            block_text = buffer[: match.start()]
+            buffer = buffer[match.end() :]
             stripped = block_text.strip()
             if stripped:
                 yield parse_event_block(stripped)

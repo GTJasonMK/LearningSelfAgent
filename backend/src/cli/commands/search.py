@@ -20,6 +20,14 @@ def search(ctx: click.Context, query: str, limit: int) -> None:
     client = ctx.obj["client"]
     try:
         data = client.get("/search", params={"q": query, "limit": limit})
+        if not isinstance(data, dict):
+            raise CliError("后端响应格式错误：/search 应返回对象", exit_code=1)
+        memory_items = data.get("memory")
+        skills_items = data.get("skills")
+        graph = data.get("graph")
+        graph_nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        if not isinstance(memory_items, list) or not isinstance(skills_items, list) or not isinstance(graph_nodes, list):
+            raise CliError("后端响应格式错误：/search 需包含 memory/skills/graph.nodes", exit_code=1)
         if ctx.obj["output_json"]:
             print_json(data)
         else:

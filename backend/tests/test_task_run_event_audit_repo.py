@@ -33,7 +33,7 @@ class TestTaskRunEventAuditRepo(unittest.TestCase):
         msg = emitter.emit_run_status("running")
         self.assertTrue(isinstance(msg, str))
 
-        path = os.path.join(self._tmpdir.name, "audit", "run_22.jsonl")
+        path = os.path.join(self._tmpdir.name, "audit", "run_22_sess_audit.jsonl")
         self.assertTrue(os.path.exists(path))
         with open(path, "r", encoding="utf-8") as fh:
             lines = [line.strip() for line in fh.readlines() if line.strip()]
@@ -63,4 +63,3 @@ class TestTaskRunEventAuditRepo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

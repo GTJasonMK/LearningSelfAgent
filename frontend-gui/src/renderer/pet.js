@@ -31,12 +31,12 @@ import {
 } from "./run_messages.js";
 import { pickLatestTaskRunMeta } from "./run_fallback.js";
 import {
+  computePendingResumeTransition,
   markNeedInputPromptHandled,
   normalizeNeedInputChoices,
-  pruneNeedInputRecentRecords,
   renderNeedInputQuestionThenChoices,
   resolvePendingResumeFromRunDetail,
-  shouldSuppressNeedInputPrompt
+  shouldClearPendingResumeOnRunStatus,
 } from "./need_input.js";
 
 // 初始化
@@ -118,50 +118,40 @@ async function refreshPetInputHistoryFromBackend(throttleMs = 3000) {
 }
 
 function setPendingAgentResume(payload) {
-  const runId = Number(payload?.run_id);
-  if (!Number.isFinite(runId) || runId <= 0) return { pending: null, changed: false };
-  const rawPromptToken = String(payload?.prompt_token || payload?.promptToken || "").trim();
-  const promptToken = rawPromptToken ? rawPromptToken.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 96) : "";
-  const rawSessionKey = String(payload?.session_key || payload?.sessionKey || "").trim();
-  const sessionKey = rawSessionKey ? rawSessionKey.replace(/[^a-zA-Z0-9._:-]/g, "").slice(0, 128) : "";
-
-  const next = {
-    runId,
-    taskId: Number(payload?.task_id) || null,
-    question: String(payload?.question || "").trim(),
-    kind: String(payload?.kind || "").trim() || null,
-    choices: normalizeNeedInputChoices(payload?.choices),
-    promptToken: promptToken || null,
-    sessionKey: sessionKey || null
-  };
-
   const session = petSession.getState();
-  const prev = session.pendingResume;
-  const isSamePending = !!prev
-    && Number(prev.runId) === Number(next.runId)
-    && Number(prev.taskId || 0) === Number(next.taskId || 0)
-    && String(prev.question || "") === String(next.question || "")
-    && String(prev.kind || "") === String(next.kind || "")
-    && String(prev.promptToken || "") === String(next.promptToken || "")
-    && String(prev.sessionKey || "") === String(next.sessionKey || "")
-    && JSON.stringify(Array.isArray(prev.choices) ? prev.choices : [])
-      === JSON.stringify(Array.isArray(next.choices) ? next.choices : []);
-  if (isSamePending) return { pending: prev, changed: false };
-
-  const recentRecords = pruneNeedInputRecentRecords(session.needInputRecentRecords, { ttlMs: NEED_INPUT_RECENT_TTL_MS });
-  if (shouldSuppressNeedInputPrompt(next, recentRecords, { ttlMs: NEED_INPUT_RECENT_TTL_MS })) {
-    petSession.setState({ needInputRecentRecords: recentRecords }, { reason: "need_input_suppress_refresh" });
-    return { pending: prev || null, changed: false, suppressed: true };
+  const transition = computePendingResumeTransition({
+    payload,
+    currentPending: session.pendingResume,
+    recentRecords: session.needInputRecentRecords,
+    ttlMs: NEED_INPUT_RECENT_TTL_MS,
+    normalizeChoices: normalizeNeedInputChoices,
+    defaultQuestion: "",
+    requireQuestion: false
+  });
+  if (!transition.valid || !transition.pending) {
+    return { pending: null, changed: false };
   }
+  if (transition.suppressed) {
+    petSession.setState(
+      { needInputRecentRecords: transition.recentRecords },
+      { reason: "need_input_suppress_refresh" }
+    );
+    return {
+      pending: session.pendingResume || null,
+      changed: false,
+      suppressed: true
+    };
+  }
+  if (!transition.changed) return { pending: session.pendingResume, changed: false, suppressed: false };
 
   petSession.setState(
     {
-      pendingResume: next,
-      needInputRecentRecords: recentRecords
+      pendingResume: transition.pending,
+      needInputRecentRecords: transition.recentRecords
     },
     { reason: "need_input" }
   );
-  return { pending: next, changed: true, suppressed: false };
+  return { pending: transition.pending, changed: true, suppressed: false };
 }
 
 function markNeedInputHandled(payload) {
@@ -231,6 +221,25 @@ function clearPendingAgentResumeForRun(runId, options = {}) {
   clearPendingAgentResume(options);
 }
 
+function clearPetPendingOnRunStatus(status, runId, options = {}) {
+  const pendingRunId = Number(petSession.getState().pendingResume?.runId);
+  if (!shouldClearPendingResumeOnRunStatus(status, runId, pendingRunId)) return false;
+  const rid = Number(runId);
+  const continueReason = String(options?.continueReason || "run_status_continue");
+  const terminalReason = String(options?.terminalReason || "run_status_terminal_fallback");
+  const emit = options?.emit;
+  if (Number.isFinite(rid) && rid > 0) {
+    if (options?.forRun === true) {
+      clearPendingAgentResumeForRun(rid, { reason: continueReason, emit });
+    } else {
+      clearPendingAgentResume({ reason: continueReason, emit });
+    }
+    return true;
+  }
+  clearPendingAgentResume({ reason: terminalReason, emit });
+  return true;
+}
+
 function applyRemoteRunCreated(obj) {
   const runId = Number(obj?.run_id);
   const taskId = Number(obj?.task_id);
@@ -251,14 +260,12 @@ function applyRemoteRunStatus(obj) {
       task_id: Number.isFinite(taskId) && taskId > 0 ? taskId : null
     });
   }
-  if (!status || status === "waiting") return;
-  if (Number.isFinite(runId) && runId > 0) {
-    clearPendingAgentResumeForRun(runId, { reason: "run_status_remote_continue", emit: false });
-    return;
-  }
-  if (isTerminalRunStatus(status)) {
-    clearPendingAgentResume({ reason: "run_status_remote_terminal", emit: false });
-  }
+  clearPetPendingOnRunStatus(status, runId, {
+    forRun: true,
+    emit: false,
+    continueReason: "run_status_remote_continue",
+    terminalReason: "run_status_remote_terminal"
+  });
 }
 
 function applyRemoteNeedInput(obj) {
@@ -1298,18 +1305,12 @@ async function streamAndShow(makeRequest, options = {}) {
           streamRunId = rid;
           setLastAgentRun({ run_id: rid, task_id: Number.isFinite(tid) && tid > 0 ? tid : null });
         }
-        if (status && status !== "waiting") {
-          const pending = petSession.getState().pendingResume;
-          const pendingRunId = Number(pending?.runId);
-          if (Number.isFinite(rid) && rid > 0) {
-            if (pending && pendingRunId === rid) {
-              clearPendingAgentResume({ reason: "run_status_continue" });
-            }
-          } else if (isTerminalRunStatus(status)) {
-            // 兜底：极少数情况下 run_status 事件缺少 run_id，终态时仍应清理残留选择框。
-            clearPendingAgentResume({ reason: "run_status_terminal_fallback" });
-          }
-        }
+        clearPetPendingOnRunStatus(status, rid, {
+          forRun: false,
+          continueReason: "run_status_continue",
+          // 兜底：极少数情况下 run_status 事件缺少 run_id，终态时仍应清理残留选择框。
+          terminalReason: "run_status_terminal_fallback"
+        });
       },
       onNeedInput: (obj) => {
         if (!isStreamActive(chatStream, mySeq)) return;

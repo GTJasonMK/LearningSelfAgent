@@ -1,4 +1,4 @@
-import { normalizeRunStatusValue } from "./run_status.js";
+import { isTerminalRunStatus, normalizeRunStatusValue } from "./run_status.js";
 
 export const NEED_INPUT_CHOICES_LIMIT_DEFAULT = 12;
 
@@ -149,6 +149,52 @@ export function markNeedInputPromptHandled(payload, rawRecords, options = {}) {
   return pruneNeedInputRecentRecords(next, { ...options, nowMs });
 }
 
+/**
+ * 统一计算 pendingResume 的更新结果：
+ * - 构建 pending
+ * - recentRecords 归一化
+ * - suppress 判定
+ * - changed 判定
+ */
+export function computePendingResumeTransition(params = {}) {
+  const ttlMs = Number.isFinite(params?.ttlMs) ? Number(params.ttlMs) : 20000;
+  const pending = buildPendingResumeFromPayload(params?.payload, {
+    normalizeChoices: params?.normalizeChoices,
+    defaultQuestion: params?.defaultQuestion,
+    requireQuestion: params?.requireQuestion === true,
+    limit: params?.limit
+  });
+  const recentRecords = pruneNeedInputRecentRecords(params?.recentRecords, { ttlMs });
+  if (!pending) {
+    return {
+      pending: null,
+      recentRecords,
+      suppressed: false,
+      changed: false,
+      valid: false
+    };
+  }
+
+  if (shouldSuppressNeedInputPrompt(pending, recentRecords, { ttlMs })) {
+    return {
+      pending,
+      recentRecords,
+      suppressed: true,
+      changed: false,
+      valid: true
+    };
+  }
+
+  const changed = !isSamePendingResume(params?.currentPending, pending);
+  return {
+    pending,
+    recentRecords,
+    suppressed: false,
+    changed,
+    valid: true
+  };
+}
+
 export function resolvePendingResumeFromRunDetail(runId, detail, options = {}) {
   const rid = Number(runId);
   if (!Number.isFinite(rid) || rid <= 0) {
@@ -200,4 +246,70 @@ export function renderNeedInputQuestionThenChoices(options = {}) {
   if (renderChoices) {
     renderChoices(options?.payload);
   }
+}
+
+function normalizeNeedInputTaskId(raw) {
+  const id = Number(raw);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+/**
+ * 统一构建 pendingResume 数据结构，避免 pet/panel 双实现漂移。
+ */
+export function buildPendingResumeFromPayload(payload, options = {}) {
+  const runId = normalizeNeedInputRunId(payload?.runId ?? payload?.run_id);
+  if (!runId) return null;
+
+  const normalizeChoices = typeof options?.normalizeChoices === "function"
+    ? options.normalizeChoices
+    : (raw) => normalizeNeedInputChoices(raw, { limit: options?.limit });
+  const rawQuestion = payload?.question;
+  const defaultQuestion = options?.defaultQuestion;
+  const question = normalizeQuestionText(rawQuestion || defaultQuestion || "");
+  if (options?.requireQuestion === true && !question) return null;
+
+  const pending = {
+    runId,
+    taskId: normalizeNeedInputTaskId(payload?.taskId ?? payload?.task_id),
+    question,
+    kind: String(payload?.kind || "").trim() || null,
+    choices: normalizeChoices(payload?.choices),
+    promptToken: normalizePromptToken(payload?.promptToken ?? payload?.prompt_token) || null,
+    sessionKey: normalizeSessionKey(payload?.sessionKey ?? payload?.session_key) || null
+  };
+  return pending;
+}
+
+/**
+ * pendingResume 等价性判断（对 choices 做值比较）。
+ */
+export function isSamePendingResume(a, b) {
+  if (!a || !b) return false;
+  return (
+    Number(a.runId) === Number(b.runId)
+    && Number(a.taskId || 0) === Number(b.taskId || 0)
+    && String(a.question || "") === String(b.question || "")
+    && String(a.kind || "") === String(b.kind || "")
+    && String(a.promptToken || "") === String(b.promptToken || "")
+    && String(a.sessionKey || "") === String(b.sessionKey || "")
+    && JSON.stringify(Array.isArray(a.choices) ? a.choices : [])
+      === JSON.stringify(Array.isArray(b.choices) ? b.choices : [])
+  );
+}
+
+/**
+ * run_status 到来时，是否应清理 pendingResume。
+ */
+export function shouldClearPendingResumeOnRunStatus(status, eventRunId, pendingRunId) {
+  const normalized = normalizeRunStatusValue(status);
+  if (!normalized || normalized === "waiting") return false;
+
+  const rid = Number(eventRunId);
+  const pid = Number(pendingRunId);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+
+  if (Number.isFinite(rid) && rid > 0) {
+    return rid === pid;
+  }
+  return isTerminalRunStatus(normalized);
 }

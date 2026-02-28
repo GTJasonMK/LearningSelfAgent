@@ -170,6 +170,18 @@ class TestStreamEarlyReturnCleanup(unittest.IsolatedAsyncioTestCase):
         from backend.src.api.schemas import AgentCommandResumeStreamRequest
         from backend.src.constants import RUN_STATUS_WAITING
 
+        class _NoGetRow:
+            """模拟 sqlite3.Row：支持下标访问，但不提供 dict.get。"""
+
+            def __init__(self, data):
+                self._data = dict(data or {})
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __bool__(self):
+                return True
+
         plan_payload = {
             "titles": ["user_prompt:补充信息"],
             "allows": [["user_prompt"]],
@@ -211,7 +223,7 @@ class TestStreamEarlyReturnCleanup(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "backend.src.agent.runner.stream_resume_run.get_task_run",
-            return_value=dict(run_row),
+            return_value=_NoGetRow(run_row),
         ), patch(
             "backend.src.agent.runner.stream_resume_run.get_task",
             return_value={"title": "resume test task"},

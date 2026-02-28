@@ -49,6 +49,36 @@ class TestStreamEventMeta(unittest.TestCase):
         self.assertFalse(attached)
         self.assertEqual(out, raw)
 
+    def test_attach_meta_derives_type_from_error_event_name(self):
+        raw = sse_json({"message": "boom"}, event="error")
+        out, attached = attach_stream_event_meta(
+            raw,
+            task_id=1,
+            run_id=2,
+            session_key="sess_abc",
+            event_seq=2,
+        )
+        self.assertTrue(attached)
+        obj = _parse_sse_data_json(out)
+        self.assertIsNotNone(obj)
+        self.assertEqual(obj.get("type"), "error")
+        self.assertTrue(bool(str(obj.get("event_id") or "").strip()))
+
+    def test_attach_meta_derives_type_from_done_event_name(self):
+        raw = sse_json({}, event="done")
+        out, attached = attach_stream_event_meta(
+            raw,
+            task_id=1,
+            run_id=2,
+            session_key="sess_abc",
+            event_seq=4,
+        )
+        self.assertTrue(attached)
+        obj = _parse_sse_data_json(out)
+        self.assertIsNotNone(obj)
+        self.assertEqual(obj.get("type"), "stream_end")
+        self.assertTrue(bool(str(obj.get("event_id") or "").strip()))
+
     def test_parse_stream_event_chunk_rejects_unsupported_schema(self):
         from backend.src.agent.contracts.stream_events import parse_stream_event_chunk
 

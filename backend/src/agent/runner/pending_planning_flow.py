@@ -180,7 +180,15 @@ async def enter_pending_planning_waiting(
         normalized_mode = "do"
 
     plan_titles = [f"user_prompt: {question}"]
-    plan_items: List[dict] = [{"id": 1, "brief": "补充信息", "status": "pending"}]
+    plan_items: List[dict] = [
+        {
+            "id": 1,
+            "brief": "补充信息",
+            "status": "pending",
+            "kind": ACTION_TYPE_USER_PROMPT,
+            "prompt": {"question": question, "kind": AGENT_KNOWLEDGE_SUFFICIENCY_KIND},
+        }
+    ]
     plan_allows = [[ACTION_TYPE_USER_PROMPT]]
     plan_artifacts: List[str] = []
     plan_struct = _normalize_plan(
@@ -245,7 +253,7 @@ async def enter_pending_planning_waiting(
         workdir=workdir,
         yield_func=yield_func,
     )
-    yield_done_event(yield_func)
+    yield_done_event(yield_func, run_status=str(run_status or ""))
     return str(run_status)
 
 
@@ -475,7 +483,19 @@ async def resume_pending_planning_after_user_input(
         from backend.src.agent.runner.react_step_executor import handle_user_prompt_action
 
         new_plan_titles = [pending_prompt_title, f"user_prompt: {user_prompt_question}"]
-        new_plan_items = [pending_prompt_item, {"id": 2, "brief": "补充信息", "status": "pending"}]
+        new_plan_items = [
+            pending_prompt_item,
+            {
+                "id": 2,
+                "brief": "补充信息",
+                "status": "pending",
+                "kind": ACTION_TYPE_USER_PROMPT,
+                "prompt": {
+                    "question": user_prompt_question,
+                    "kind": AGENT_KNOWLEDGE_SUFFICIENCY_KIND,
+                },
+            },
+        ]
         new_plan_allows = [list(pending_prompt_allow), [ACTION_TYPE_USER_PROMPT]]
         new_plan_artifacts: List[str] = []
         new_plan_struct = _normalize_plan(
@@ -518,7 +538,7 @@ async def resume_pending_planning_after_user_input(
                     yield_func(str(msg))
         except StopIteration:
             pass
-        yield_done_event(yield_func)
+        yield_done_event(yield_func, run_status="waiting")
         return {
             "outcome": "waiting",
             "message": str(message_for_planning or "").strip(),

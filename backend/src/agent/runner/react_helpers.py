@@ -51,6 +51,74 @@ def _extract_prefixed_value(title: str, prefix: str) -> str:
     return value
 
 
+def normalize_allow_actions(raw_actions: object) -> list[str]:
+    """
+    归一化计划 allow 列表：
+    - 统一小写
+    - 去空/去重
+    - 保持原始顺序（首个出现优先）
+    """
+    if not isinstance(raw_actions, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_actions:
+        text = normalize_action_type(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _normalize_direct_user_prompt_payload(raw_payload: object) -> Optional[dict]:
+    if not isinstance(raw_payload, dict):
+        return None
+    question = str(raw_payload.get("question") or "").strip()
+    if not question:
+        return None
+    payload: dict = {"question": question}
+    kind = str(raw_payload.get("kind") or "").strip()
+    if kind:
+        payload["kind"] = kind
+    choices = raw_payload.get("choices")
+    if isinstance(choices, list) and choices:
+        payload["choices"] = list(choices)
+    return payload
+
+
+def resolve_direct_user_prompt_payload(
+    *,
+    step_title: str,
+    allowed_actions: object,
+    step_prompt: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    判定是否可走“确定性 user_prompt 直通”分支。
+
+    约束：
+    - allow 仅包含 user_prompt；
+    - step_title 明确以 user_prompt: 前缀声明问题文本。
+    """
+    normalized_allow = normalize_allow_actions(allowed_actions)
+    if normalized_allow != [ACTION_TYPE_USER_PROMPT]:
+        return None
+    prompt_payload = _normalize_direct_user_prompt_payload(step_prompt)
+    if prompt_payload:
+        return prompt_payload
+
+    raw_title = str(step_title or "").strip()
+    if not raw_title:
+        return None
+    m = re.match(r"^user_prompt\s*[:：]\s*(.+)$", raw_title, re.IGNORECASE)
+    if not m:
+        return None
+    question = str(m.group(1) or "").strip()
+    if not question:
+        return None
+    return {"question": question}
+
+
 def _looks_like_url(value: str) -> bool:
     raw = str(value or "").strip()
     if not raw:

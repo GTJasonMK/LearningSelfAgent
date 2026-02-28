@@ -5,7 +5,7 @@
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
-    "test:renderer": "node --loader ./tests/esm-loader.mjs --test tests/agent_text.test.mjs tests/need_input.test.mjs tests/streaming.test.mjs tests/pending_final.test.mjs tests/run_fallback.test.mjs tests/run_messages.test.mjs tests/tasks_state.test.mjs"
+    "test:renderer": "node --loader ./tests/esm-loader.mjs --test tests/agent_text.test.mjs tests/need_input.test.mjs tests/streaming.test.mjs tests/pending_final.test.mjs tests/run_fallback.test.mjs tests/run_messages.test.mjs tests/tasks_state.test.mjs tests/world_state.test.mjs"
   },
   "devDependencies": {
     "electron": "*"

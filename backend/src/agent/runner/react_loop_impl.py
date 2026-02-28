@@ -20,6 +20,7 @@ from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_helpers import (
     build_react_step_prompt,
     call_llm_for_text,
+    resolve_direct_user_prompt_payload,
     validate_and_normalize_action_text,
 )
 from backend.src.agent.runner.capability_router import build_capability_hint, resolve_step_capability
@@ -240,6 +241,8 @@ def run_react_loop_impl(
         last_step_order = step_order
         step = plan_struct.get_step(idx)
         title = step.title if step else ""
+        step_kind = str(getattr(step, "kind", "") or "").strip().lower()
+        is_feedback_step = bool(step_kind == "task_feedback" or is_task_feedback_step_title(title))
 
         # 结算上一步状态
         plan_struct.mark_running_as_done()
@@ -270,7 +273,7 @@ def run_react_loop_impl(
                 step_react_params.update(step_llm_overrides)
 
         # 评估门闩
-        if is_task_feedback_step_title(title) and (not bool(agent_state.get("task_feedback_asked"))) and idx > 0:
+        if is_feedback_step and (not bool(agent_state.get("task_feedback_asked"))) and idx > 0:
             inserted = yield from maybe_apply_review_gate_before_feedback(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -289,7 +292,7 @@ def run_react_loop_impl(
                 continue
 
         # 任务闭环：确认满意度
-        if is_task_feedback_step_title(title):
+        if is_feedback_step:
             outcome = yield from handle_task_feedback_step(
                 task_id=int(task_id),
                 run_id=int(run_id),
@@ -370,6 +373,36 @@ def run_react_loop_impl(
         )
 
         yield sse_json({"delta": f"{STREAM_TAG_STEP} {title}\n"})
+
+        # 确定性步骤直通：allow 仅 user_prompt 且标题已携带问题时，不再调用 LLM 生成 action。
+        direct_user_prompt_payload = resolve_direct_user_prompt_payload(
+            step_title=title,
+            allowed_actions=allowed,
+            step_prompt=(step.prompt if step is not None else None),
+        )
+        if isinstance(direct_user_prompt_payload, dict):
+            _safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.user_prompt.short_circuit",
+                data={"step_order": int(step_order), "title": str(title)},
+                level="info",
+            )
+            status, should_break = yield from handle_user_prompt_action(
+                task_id=task_id,
+                run_id=run_id,
+                step_order=step_order,
+                title=title,
+                payload_obj=direct_user_prompt_payload,
+                plan_struct=plan_struct,
+                agent_state=agent_state,
+                safe_write_debug=_safe_write_debug,
+            )
+            if should_break:
+                run_status = status
+                break
+            idx += 1
+            continue
 
         obs_text = "\n".join(f"- {_truncate_observation(o)}" for o in observations[-3:]) or "(无)"
         source_failure_summary = summarize_recent_source_failures_for_prompt(

@@ -19,16 +19,36 @@ import { setMarkdownContent } from "./markdown.js";
 import { AGENT_EVENT_NAME, emitAgentEvent, initAgentEventBridge } from "./agent_events.js";
 import { bindPetImageFallback } from "./pet_image.js";
 import { isTerminalRunStatus, normalizeRunStatusValue } from "./run_status.js";
+import {
+  applyWorldAgentPlanDeltaState,
+  applyWorldAgentPlanState,
+  applyWorldAgentStageState,
+  applyWorldCurrentRunState,
+  applyWorldNeedInputRecentRecordsState,
+  applyWorldNoRunState,
+  applyWorldPageHideState,
+  applyWorldPendingFinalState,
+  applyWorldPendingResumeClearedState,
+  applyWorldPendingResumeState,
+  applyWorldRunDetailState,
+  applyWorldRunStatusState,
+  applyWorldStreamStartState,
+  applyWorldStreamStopState,
+  applyWorldStreamingStatusState,
+  applyWorldTraceFetchedAtState,
+  applyWorldTraceLinesState
+} from "./world_state.js";
 import { buildTaskFeedbackAckText, extractRunLastError } from "./run_messages.js";
 import { shouldFinalizePendingFinal } from "./pending_final.js";
 import {
+  computePendingResumeTransition,
   inferNeedInputChoices,
   markNeedInputPromptHandled,
   NEED_INPUT_CHOICES_LIMIT_DEFAULT,
   normalizeNeedInputChoices as normalizeSharedNeedInputChoices,
   pruneNeedInputRecentRecords,
   resolvePendingResumeFromRunDetail,
-  shouldSuppressNeedInputPrompt
+  shouldClearPendingResumeOnRunStatus,
 } from "./need_input.js";
 import {
   formatAgentStageLabel,
@@ -146,14 +166,16 @@ function normalizeNeedInputChoices(rawChoices) {
 
 function markWorldNeedInputHandled(payload) {
   worldSession.setState(
-    (prev) => ({
-      ...prev,
-      needInputRecentRecords: markNeedInputPromptHandled(
-        payload,
-        prev?.needInputRecentRecords,
-        { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
-      )
-    }),
+    (prev) => applyWorldNeedInputRecentRecordsState(
+      prev,
+      {
+        recentRecords: markNeedInputPromptHandled(
+          payload,
+          prev?.needInputRecentRecords,
+          { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
+        )
+      }
+    ),
     { reason: "need_input_handled" }
   );
 }
@@ -186,15 +208,16 @@ function clearWorldPendingResume(options = {}) {
   if (Number.isFinite(targetRunId) && targetRunId > 0 && Number(current?.runId) !== targetRunId) return;
 
   worldSession.setState(
-    (prev) => ({
-      ...prev,
-      pendingResume: null,
-      needInputRecentRecords: markNeedInputPromptHandled(
-        current,
-        prev?.needInputRecentRecords,
-        { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
-      )
-    }),
+    (prev) => applyWorldPendingResumeClearedState(
+      prev,
+      {
+        recentRecords: markNeedInputPromptHandled(
+          current,
+          prev?.needInputRecentRecords,
+          { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
+        )
+      }
+    ),
     { reason: options?.reason || "need_input_clear" }
   );
   renderWorldNeedInputChoicesUi(null);
@@ -207,26 +230,13 @@ function applyRemoteRunCreatedToWorld(obj) {
   const rid = Number(obj?.run_id);
   const tid = Number(obj?.task_id);
   if (!Number.isFinite(rid) || rid <= 0) return;
+  syncWorldRunStatusState("running", rid, tid, "run_created_remote");
+}
 
+function syncWorldRunStatusState(status, rid, tid, reason) {
   worldSession.setState(
-    (prev) => ({
-      ...prev,
-      currentRun: {
-        ...(prev?.currentRun || {}),
-        run_id: rid,
-        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
-        status: "running",
-        is_current: true
-      },
-      lastRunMeta: {
-        ...(prev?.lastRunMeta || {}),
-        run_id: rid,
-        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
-        updated_at: String(prev?.lastRunMeta?.updated_at || ""),
-        status: "running"
-      }
-    }),
-    { reason: "run_created_remote" }
+    (prev) => applyWorldRunStatusState(prev, { status, runId: rid, taskId: tid }),
+    { reason: reason || "run_status" }
   );
 }
 
@@ -236,63 +246,13 @@ function applyRemoteRunStatusToWorld(obj) {
   const rid = Number(obj?.run_id);
   const tid = Number(obj?.task_id);
 
-  worldSession.setState(
-    (prev) => {
-      const prevRun = prev?.currentRun && typeof prev.currentRun === "object" ? prev.currentRun : null;
-      const prevRunId = Number(prevRun?.run_id);
-      const prevTaskId = Number(prevRun?.task_id);
-      const nextRunId = Number.isFinite(rid) && rid > 0
-        ? rid
-        : (Number.isFinite(prevRunId) && prevRunId > 0 ? prevRunId : null);
-      const nextTaskId = Number.isFinite(tid) && tid > 0
-        ? tid
-        : (Number.isFinite(prevTaskId) && prevTaskId > 0 ? prevTaskId : null);
-      const nextStatus = status || normalizeRunStatusValue(prevRun?.status) || "running";
+  syncWorldRunStatusState(status, rid, tid, "run_status_remote");
 
-      let nextCurrentRun = prevRun;
-      if (nextRunId && (!Number.isFinite(prevRunId) || prevRunId <= 0 || prevRunId === nextRunId)) {
-        nextCurrentRun = {
-          ...(prevRun || {
-            task_title: "",
-            summary: null,
-            mode: null,
-            started_at: "",
-            finished_at: "",
-            created_at: "",
-            updated_at: "",
-            is_current: true
-          }),
-          run_id: nextRunId,
-          task_id: nextTaskId || null,
-          status: nextStatus
-        };
-      }
-
-      const prevMeta = prev?.lastRunMeta && typeof prev.lastRunMeta === "object" ? prev.lastRunMeta : {};
-      let nextLastRunMeta = prev.lastRunMeta;
-      if (nextRunId) {
-        nextLastRunMeta = {
-          ...prevMeta,
-          run_id: nextRunId,
-          task_id: nextTaskId || null,
-          status: nextStatus,
-          updated_at: String(prevMeta.updated_at || "")
-        };
-      }
-
-      return {
-        ...prev,
-        currentRun: nextCurrentRun,
-        lastRunMeta: nextLastRunMeta
-      };
-    },
-    { reason: "run_status_remote" }
-  );
-
-  if (status !== "waiting") {
+  const pendingRunId = Number(worldSession.getState()?.pendingResume?.runId);
+  if (shouldClearPendingResumeOnRunStatus(status, rid, pendingRunId)) {
     if (Number.isFinite(rid) && rid > 0) {
       clearWorldPendingResume({ runId: rid, reason: "run_status_remote_continue", emit: false });
-    } else if (isTerminalRunStatus(status)) {
+    } else {
       clearWorldPendingResume({ reason: "run_status_remote_terminal", emit: false });
     }
   }
@@ -302,71 +262,57 @@ function applyRemoteRunStatusToWorld(obj) {
   }
 }
 
-function applyRemoteNeedInputToWorld(obj) {
-  const rid = Number(obj?.run_id);
-  const tid = Number(obj?.task_id);
-  const q = String(obj?.question || "").trim();
-  if (!Number.isFinite(rid) || rid <= 0) return;
-  if (!q) return;
-
-  const pending = {
-    runId: rid,
-    taskId: Number.isFinite(tid) && tid > 0 ? tid : null,
-    question: q,
-    kind: String(obj?.kind || "").trim() || null,
-    choices: normalizeNeedInputChoices(obj?.choices),
-    promptToken: String(obj?.prompt_token || obj?.promptToken || "").trim() || null,
-    sessionKey: String(obj?.session_key || obj?.sessionKey || "").trim() || null
-  };
-
-  const state = worldSession.getState();
-  const recentRecords = pruneNeedInputRecentRecords(state?.needInputRecentRecords, {
-    ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
+function resolveWorldNeedInputTransition(payload, options = {}) {
+  const state = options?.state || worldSession.getState();
+  const transition = computePendingResumeTransition({
+    payload,
+    currentPending: state?.pendingResume,
+    recentRecords: state?.needInputRecentRecords,
+    ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS,
+    normalizeChoices: normalizeNeedInputChoices,
+    defaultQuestion: options?.defaultQuestion,
+    requireQuestion: options?.requireQuestion === true
   });
-  if (shouldSuppressNeedInputPrompt(pending, recentRecords, { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS })) {
+  if (!transition.valid || !transition.pending) {
+    return { ok: false, transition, pending: null, rid: 0, tid: null, question: "" };
+  }
+  const pending = transition.pending;
+  const rid = Number(pending.runId);
+  const tid = Number(pending.taskId);
+  return {
+    ok: true,
+    transition,
+    pending,
+    rid,
+    tid,
+    question: String(pending.question || "").trim()
+  };
+}
+
+function applyRemoteNeedInputToWorld(obj) {
+  const resolved = resolveWorldNeedInputTransition(obj, { requireQuestion: true });
+  if (!resolved.ok) return;
+  const { transition, pending, rid } = resolved;
+
+  if (transition.suppressed) {
     worldSession.setState(
-      { needInputRecentRecords: recentRecords },
+      (prev) => applyWorldNeedInputRecentRecordsState(prev, { recentRecords: transition.recentRecords }),
       { reason: "need_input_remote_suppressed" }
     );
     clearWorldPendingResume({ runId: rid, reason: "need_input_remote_suppressed", emit: false });
     return;
   }
+  if (!transition.changed) return;
 
-  const currentPending = state?.pendingResume;
-  const isSamePending = !!currentPending
-    && Number(currentPending.runId) === Number(pending.runId)
-    && Number(currentPending.taskId || 0) === Number(pending.taskId || 0)
-    && String(currentPending.question || "") === String(pending.question || "")
-    && String(currentPending.kind || "") === String(pending.kind || "")
-    && String(currentPending.promptToken || "") === String(pending.promptToken || "")
-    && String(currentPending.sessionKey || "") === String(pending.sessionKey || "")
-    && JSON.stringify(Array.isArray(currentPending.choices) ? currentPending.choices : [])
-      === JSON.stringify(Array.isArray(pending.choices) ? pending.choices : []);
-  if (isSamePending) return;
-
-  worldSession.setState(
-    (prev) => ({
-      ...prev,
-      pendingResume: pending,
-      needInputRecentRecords: recentRecords,
-      currentRun: {
-        ...(prev?.currentRun || {}),
-        run_id: rid,
-        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
-        status: "waiting",
-        is_current: true
-      },
-      lastRunMeta: {
-        ...(prev?.lastRunMeta || {}),
-        run_id: rid,
-        task_id: Number.isFinite(tid) && tid > 0 ? tid : null,
-        updated_at: String(prev?.lastRunMeta?.updated_at || ""),
-        status: "waiting"
-      }
-    }),
-    { reason: "need_input_remote" }
-  );
+  upsertWorldPendingResumeState(pending, transition.recentRecords, "need_input_remote");
   renderWorldNeedInputChoicesUi(pending);
+}
+
+function upsertWorldPendingResumeState(pending, recentRecords, reason = "need_input") {
+  worldSession.setState(
+    (prev) => applyWorldPendingResumeState(prev, { pending, recentRecords }),
+    { reason }
+  );
 }
 
 function renderWorldNeedInputChoicesUi(pending) {
@@ -449,33 +395,7 @@ function applyAgentStageEventToWorld(payload) {
   if (Number.isFinite(currentRunId) && currentRunId > 0 && currentRunId !== runId) return;
 
   worldSession.setState(
-    (prev) => {
-      const prevSnapshot = prev?.currentAgentSnapshot && typeof prev.currentAgentSnapshot === "object"
-        ? prev.currentAgentSnapshot
-        : {};
-      const nextSnapshot = { ...prevSnapshot, stage };
-
-      // 若世界页尚未轮询到 currentRun，则先用最小元信息占位，保证“阶段”可立即渲染。
-      const prevRunId = Number(prev?.currentRun?.run_id);
-      let nextRun = prev?.currentRun;
-      if (!Number.isFinite(prevRunId) || prevRunId <= 0) {
-        nextRun = {
-          run_id: runId,
-          task_id: Number.isFinite(taskId) && taskId > 0 ? taskId : null,
-          task_title: "",
-          status: "running",
-          summary: null,
-          mode: null,
-          started_at: "",
-          finished_at: "",
-          created_at: "",
-          updated_at: "",
-          is_current: true
-        };
-      }
-
-      return { ...prev, currentRun: nextRun, currentAgentSnapshot: nextSnapshot };
-    },
+    (prev) => applyWorldAgentStageState(prev, { runId, taskId, stage }),
     { reason: "agent_stage_event" }
   );
 
@@ -556,35 +476,7 @@ function applyAgentPlanEventToWorld(payload) {
   const planSnapshot = computePlanSnapshotFromItems(normalizedItems, session?.currentAgentState, session?.currentAgentSnapshot);
 
   worldSession.setState(
-    (prev) => {
-      const prevRunId = Number(prev?.currentRun?.run_id);
-      let nextRun = prev?.currentRun;
-      if (!Number.isFinite(prevRunId) || prevRunId <= 0) {
-        nextRun = {
-          run_id: runId,
-          task_id: Number.isFinite(taskId) && taskId > 0 ? taskId : null,
-          task_title: "",
-          status: "running",
-          summary: null,
-          mode: null,
-          started_at: "",
-          finished_at: "",
-          created_at: "",
-          updated_at: "",
-          is_current: true
-        };
-      }
-
-      const prevPlan = prev?.currentAgentPlan && typeof prev.currentAgentPlan === "object" ? prev.currentAgentPlan : {};
-      const nextPlan = { ...prevPlan, items: normalizedItems };
-
-      const prevSnapshot = prev?.currentAgentSnapshot && typeof prev.currentAgentSnapshot === "object"
-        ? prev.currentAgentSnapshot
-        : {};
-      const nextSnapshot = { ...prevSnapshot, plan: planSnapshot };
-
-      return { ...prev, currentRun: nextRun, currentAgentPlan: nextPlan, currentAgentSnapshot: nextSnapshot };
-    },
+    (prev) => applyWorldAgentPlanState(prev, { runId, taskId, status: "running", items: normalizedItems, planSnapshot }),
     { reason: "agent_plan_event" }
   );
 
@@ -618,17 +510,7 @@ function applyAgentPlanDeltaEventToWorld(payload) {
   );
 
   worldSession.setState(
-    (prev) => {
-      const prevPlan = prev?.currentAgentPlan && typeof prev.currentAgentPlan === "object" ? prev.currentAgentPlan : {};
-      const nextPlan = { ...prevPlan, items: Array.isArray(worldTaskPlanItems) ? worldTaskPlanItems.map((it) => ({ ...(it || {}) })) : [] };
-
-      const prevSnapshot = prev?.currentAgentSnapshot && typeof prev.currentAgentSnapshot === "object"
-        ? prev.currentAgentSnapshot
-        : {};
-      const nextSnapshot = { ...prevSnapshot, plan: nextPlanSnapshot };
-
-      return { ...prev, currentAgentPlan: nextPlan, currentAgentSnapshot: nextSnapshot };
-    },
+    (prev) => applyWorldAgentPlanDeltaState(prev, { items: worldTaskPlanItems, planSnapshot: nextPlanSnapshot }),
     { reason: "agent_plan_delta_event" }
   );
 
@@ -1610,7 +1492,10 @@ async function updateWorldTrace(taskId, runId, force = false) {
   const now = Date.now();
   const session = worldSession.getState();
   if (!force && now - Number(session.traceFetchedAt || 0) < 900) return;
-  worldSession.setState({ traceFetchedAt: now }, { reason: "trace_throttle" });
+  worldSession.setState(
+    (prev) => applyWorldTraceFetchedAtState(prev, { at: now }),
+    { reason: "trace_throttle" }
+  );
 
   try {
     const resp = await api.fetchRecentRecords({ limit: 120, offset: 0 });
@@ -1632,7 +1517,10 @@ async function updateWorldTrace(taskId, runId, force = false) {
       if (line) lines.push(line);
     });
 
-    worldSession.setState({ traceLines: lines }, { reason: "trace_update" });
+    worldSession.setState(
+      (prev) => applyWorldTraceLinesState(prev, { lines }),
+      { reason: "trace_update" }
+    );
     rerenderWorldThoughtsFromState();
   } catch (e) {
     // 忽略：后端可能暂时不可用
@@ -1867,14 +1755,10 @@ async function _updateWorldFromBackendImpl(force = false) {
     const run = current?.run;
     if (!run) {
       renderWorldPlan({ items: [] });
-      worldSession.setState(
-        { currentRun: null, currentAgentPlan: null, currentAgentState: null, currentAgentSnapshot: null, traceLines: [], streamingStatus: "" },
-        { reason: "no_run" }
-      );
+      worldSession.setState((prev) => applyWorldNoRunState(prev), { reason: "no_run" });
       clearWorldPendingResume({ reason: "no_run", emit: false });
       renderWorldThoughts(null, null);
       renderWorldEvalPlan(null);
-      worldSession.setState({ lastRunMeta: null }, { reason: "no_run" });
       worldLastReviewId = null;
       worldLastReviewSignature = "";
       return;
@@ -1883,7 +1767,10 @@ async function _updateWorldFromBackendImpl(force = false) {
     const runId = Number(run.run_id);
     const taskId = Number(run.task_id);
     const updatedAt = String(run.updated_at || "").trim();
-    worldSession.setState({ currentRun: run }, { reason: "current_run" });
+    worldSession.setState(
+      (prev) => applyWorldCurrentRunState(prev, { run }),
+      { reason: "current_run" }
+    );
 
     const lastRunMeta = worldSession.getState().lastRunMeta;
     const shouldRefreshDetail = force
@@ -1894,15 +1781,22 @@ async function _updateWorldFromBackendImpl(force = false) {
     if (shouldRefreshDetail) {
       const detail = await api.fetchAgentRunDetail(runId);
       worldSession.setState(
-        { currentAgentPlan: detail?.agent_plan || null, currentAgentState: detail?.agent_state || null, currentAgentSnapshot: detail?.snapshot || null },
+        (prev) => applyWorldRunDetailState(
+          prev,
+          {
+            detail,
+            lastRunMeta: {
+              run_id: runId,
+              task_id: taskId,
+              updated_at: updatedAt,
+              status: run.status
+            }
+          }
+        ),
         { reason: "agent_detail" }
       );
       renderWorldPlan(detail?.agent_plan || {});
       rerenderWorldThoughtsFromState();
-      worldSession.setState(
-        { lastRunMeta: { run_id: runId, task_id: taskId, updated_at: updatedAt, status: run.status } },
-        { reason: "refresh_detail" }
-      );
     }
 
     // 思考轨迹：从最近动态里提取当前任务/run 的关键信息（tool/skill/memory/debug 等）
@@ -1913,41 +1807,41 @@ async function _updateWorldFromBackendImpl(force = false) {
     if (!latest.streaming) {
       const statusLower = String(run.status || "").trim().toLowerCase();
       const paused = latest?.currentAgentState?.paused;
-      const question = String(paused?.question || "").trim();
-      if (statusLower === "waiting" && question) {
-        const existing = latest.pendingResume;
-        const nextPending = {
-          runId,
-          taskId: Number.isFinite(taskId) && taskId > 0 ? taskId : null,
-          question,
-          kind: String(paused?.kind || "").trim() || null,
-          choices: normalizeNeedInputChoices(paused?.choices),
-          promptToken: String(paused?.prompt_token || "").trim() || null,
-          sessionKey: String(paused?.session_key || latest?.currentAgentState?.session_key || "").trim() || null
-        };
-        const recentRecords = pruneNeedInputRecentRecords(latest?.needInputRecentRecords, {
-          ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
-        });
-        const suppressed = shouldSuppressNeedInputPrompt(nextPending, recentRecords, {
-          ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
-        });
-        const shouldSet = !existing
-          || Number(existing.runId) !== runId
-          || String(existing.question || "") !== question
-          || String(existing.kind || "") !== String(nextPending.kind || "")
-          || String(existing.promptToken || "") !== String(nextPending.promptToken || "")
-          || String(existing.sessionKey || "") !== String(nextPending.sessionKey || "");
-        if (suppressed) {
-          worldSession.setState({ needInputRecentRecords: recentRecords }, { reason: "need_input_poll_suppressed" });
-          clearWorldPendingResume({ runId, reason: "need_input_poll_suppressed", emit: false });
-        } else if (shouldSet) {
+      if (statusLower === "waiting") {
+        const resolved = resolveWorldNeedInputTransition(
+          {
+            run_id: runId,
+            task_id: Number.isFinite(taskId) && taskId > 0 ? taskId : null,
+            question: paused?.question,
+            kind: paused?.kind,
+            choices: paused?.choices,
+            prompt_token: paused?.prompt_token,
+            session_key: paused?.session_key || latest?.currentAgentState?.session_key
+          },
+          {
+            state: latest,
+            requireQuestion: true
+          }
+        );
+        if (!resolved.ok) {
+          const existing = latest.pendingResume;
+          if (existing) {
+            clearWorldPendingResume({ runId, reason: "need_input_clear", emit: false });
+          }
+        } else if (resolved.transition.suppressed) {
           worldSession.setState(
-            { pendingResume: nextPending, needInputRecentRecords: recentRecords },
-            { reason: "need_input_poll" }
+            (prev) => applyWorldNeedInputRecentRecordsState(
+              prev,
+              { recentRecords: resolved.transition.recentRecords }
+            ),
+            { reason: "need_input_poll_suppressed" }
           );
-          renderWorldNeedInputChoicesUi(nextPending);
+          clearWorldPendingResume({ runId, reason: "need_input_poll_suppressed", emit: false });
+        } else if (resolved.transition.changed) {
+          upsertWorldPendingResumeState(resolved.pending, resolved.transition.recentRecords, "need_input_poll");
+          renderWorldNeedInputChoicesUi(resolved.pending);
         } else {
-          renderWorldNeedInputChoicesUi(existing);
+          renderWorldNeedInputChoicesUi(latest.pendingResume);
         }
       } else {
         const existing = latest.pendingResume;
@@ -2022,7 +1916,10 @@ async function _updateWorldFromBackendImpl(force = false) {
           task_id: pendingFinal.task_id,
           metadata: pendingFinal.metadata || { source: "panel", mode: "do" }
         });
-        worldSession.setState({ pendingFinal: null }, { reason: "pending_final_done" });
+        worldSession.setState(
+          (prev) => applyWorldPendingFinalState(prev, { pendingFinal: null }),
+          { reason: "pending_final_done" }
+        );
       }
     }
 
@@ -2117,17 +2014,16 @@ async function streamToWorld(makeRequest, options = {}) {
   // 取消上一次请求（并发保护：旧请求的 finally 不应覆盖新请求状态）
   const { seq: mySeq, controller } = startStream(worldStream);
   worldSession.setState(
-    (prev) => ({
-      ...prev,
-      streaming: true,
-      streamingMode: mode,
-      pendingResume: null,
-      streamingStatus: "",
-      needInputRecentRecords: pruneNeedInputRecentRecords(
-        prev?.needInputRecentRecords,
-        { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
-      )
-    }),
+    (prev) => applyWorldStreamStartState(
+      prev,
+      {
+        mode,
+        recentRecords: pruneNeedInputRecentRecords(
+          prev?.needInputRecentRecords,
+          { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS }
+        )
+      }
+    ),
     { reason: "stream_start" }
   );
   renderWorldNeedInputChoicesUi(null);
@@ -2148,14 +2044,20 @@ async function streamToWorld(makeRequest, options = {}) {
         }
 
         // do 模式：status 是“思考/执行状态”，只写入右上角思考框，不进入中间对话区
-        worldSession.setState({ streamingStatus: String(text || "") }, { reason: "stream_status" });
+        worldSession.setState(
+          (prev) => applyWorldStreamingStatusState(prev, { statusText: String(text || "") }),
+          { reason: "stream_status" }
+        );
         rerenderWorldThoughtsFromState();
       },
       onError: (msg) => {
         if (!isStreamActive(worldStream, mySeq)) return;
         const text = String(msg || "请求失败");
         if (assistantKey) updateWorldChatMessageContent(assistantKey, text);
-        worldSession.setState({ streamingStatus: text }, { reason: "stream_error" });
+        worldSession.setState(
+          (prev) => applyWorldStreamingStatusState(prev, { statusText: text }),
+          { reason: "stream_error" }
+        );
         rerenderWorldThoughtsFromState();
       },
       onRunCreated: (obj) => {
@@ -2169,23 +2071,7 @@ async function streamToWorld(makeRequest, options = {}) {
         if (Number.isFinite(rid) && rid > 0) streamRunId = rid;
         if (Number.isFinite(tid) && tid > 0) streamTaskId = tid;
         streamRunStatus = "running";
-        const runMeta = {
-          run_id: Number(obj.run_id),
-          task_id: Number(obj.task_id),
-          task_title: "",
-          status: "running",
-          summary: null,
-          mode: null,
-          started_at: "",
-          finished_at: "",
-          created_at: "",
-          updated_at: "",
-          is_current: true
-        };
-        worldSession.setState(
-          { currentRun: runMeta, lastRunMeta: { run_id: obj.run_id, task_id: obj.task_id, updated_at: "", status: "running" } },
-          { reason: "run_created" }
-        );
+        syncWorldRunStatusState("running", rid, tid, "run_created");
         updateWorldFromBackend(true);
       },
       onRunStatus: (obj) => {
@@ -2203,70 +2089,19 @@ async function streamToWorld(makeRequest, options = {}) {
 
         const state = worldSession.getState();
         const pending = state?.pendingResume;
-        const shouldClearPending = !!(
-          status
-          && status !== "waiting"
-          && Number.isFinite(rid)
-          && rid > 0
-          && Number(pending?.runId) === rid
+        const shouldClearPending = shouldClearPendingResumeOnRunStatus(
+          status,
+          rid,
+          Number(pending?.runId)
         );
 
-        worldSession.setState(
-          (prev) => {
-            const prevRun = prev?.currentRun && typeof prev.currentRun === "object" ? prev.currentRun : null;
-            const prevRunId = Number(prevRun?.run_id);
-            const prevTaskId = Number(prevRun?.task_id);
-            const nextRunId = Number.isFinite(rid) && rid > 0
-              ? rid
-              : (Number.isFinite(prevRunId) && prevRunId > 0 ? prevRunId : null);
-            const nextTaskId = Number.isFinite(tid) && tid > 0
-              ? tid
-              : (Number.isFinite(prevTaskId) && prevTaskId > 0 ? prevTaskId : null);
-            const nextStatus = status || normalizeRunStatusValue(prevRun?.status) || "running";
-
-            let nextCurrentRun = prevRun;
-            if (nextRunId && (!Number.isFinite(prevRunId) || prevRunId <= 0 || prevRunId === nextRunId)) {
-              nextCurrentRun = {
-                ...(prevRun || {
-                  task_title: "",
-                  summary: null,
-                  mode: null,
-                  started_at: "",
-                  finished_at: "",
-                  created_at: "",
-                  updated_at: "",
-                  is_current: true
-                }),
-                run_id: nextRunId,
-                task_id: nextTaskId || null,
-                status: nextStatus
-              };
-            }
-
-            const prevMeta = prev?.lastRunMeta && typeof prev.lastRunMeta === "object" ? prev.lastRunMeta : {};
-            let nextLastRunMeta = prev.lastRunMeta;
-            if (nextRunId) {
-              nextLastRunMeta = {
-                ...prevMeta,
-                run_id: nextRunId,
-                task_id: nextTaskId || null,
-                status: nextStatus,
-                updated_at: String(prevMeta.updated_at || "")
-              };
-            }
-
-            return {
-              ...prev,
-              currentRun: nextCurrentRun,
-              lastRunMeta: nextLastRunMeta
-            };
-          },
-          { reason: "run_status_event" }
-        );
+        syncWorldRunStatusState(status, rid, tid, "run_status_event");
         if (shouldClearPending) {
-          clearWorldPendingResume({ runId: rid, reason: "run_status_continue" });
-        } else if (status && status !== "waiting" && isTerminalRunStatus(status)) {
-          clearWorldPendingResume({ reason: "run_status_terminal_fallback" });
+          if (Number.isFinite(rid) && rid > 0) {
+            clearWorldPendingResume({ runId: rid, reason: "run_status_continue" });
+          } else {
+            clearWorldPendingResume({ reason: "run_status_terminal_fallback" });
+          }
         }
         if (pageWorldEl?.classList?.contains("is-visible")) {
           rerenderWorldThoughtsFromState();
@@ -2278,68 +2113,30 @@ async function streamToWorld(makeRequest, options = {}) {
           { ...(obj || {}), type: "need_input", _source: AGENT_EVENT_SOURCE_PANEL },
           { broadcast: true }
         );
-        const rid = Number(obj?.run_id);
-        const tid = Number(obj?.task_id);
+        const resolved = resolveWorldNeedInputTransition(obj, {
+          defaultQuestion: "需要你补充信息后才能继续执行。",
+          requireQuestion: true
+        });
+        if (!resolved.ok) return;
+
+        const { transition, pending, rid, tid, question: q } = resolved;
         if (Number.isFinite(rid) && rid > 0) streamRunId = rid;
         if (Number.isFinite(tid) && tid > 0) streamTaskId = tid;
         streamRunStatus = "waiting";
-        const q = String(obj?.question || "").trim();
-        const pending = {
-          runId: rid,
-          taskId: tid || null,
-          question: q,
-          kind: String(obj?.kind || "").trim() || null,
-          choices: normalizeNeedInputChoices(obj?.choices),
-          promptToken: String(obj?.prompt_token || obj?.promptToken || "").trim() || null,
-          sessionKey: String(obj?.session_key || obj?.sessionKey || "").trim() || null
-        };
 
-        const state = worldSession.getState();
-        const recentRecords = pruneNeedInputRecentRecords(state?.needInputRecentRecords, {
-          ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
-        });
-        if (shouldSuppressNeedInputPrompt(pending, recentRecords, { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS })) {
+        if (transition.suppressed) {
           worldSession.setState(
-            { needInputRecentRecords: recentRecords },
+            (prev) => applyWorldNeedInputRecentRecordsState(
+              prev,
+              { recentRecords: transition.recentRecords }
+            ),
             { reason: "need_input_suppressed" }
           );
           return;
         }
-        const currentPending = state?.pendingResume;
-        const isSamePending = !!currentPending
-          && Number(currentPending.runId) === Number(pending.runId)
-          && Number(currentPending.taskId || 0) === Number(pending.taskId || 0)
-          && String(currentPending.question || "") === String(pending.question || "")
-          && String(currentPending.kind || "") === String(pending.kind || "")
-          && String(currentPending.promptToken || "") === String(pending.promptToken || "")
-          && String(currentPending.sessionKey || "") === String(pending.sessionKey || "")
-          && JSON.stringify(Array.isArray(currentPending.choices) ? currentPending.choices : [])
-            === JSON.stringify(Array.isArray(pending.choices) ? pending.choices : []);
-        if (isSamePending) return;
+        if (!transition.changed) return;
 
-        worldSession.setState(
-          (prev) => {
-            const prevRun = prev?.currentRun && typeof prev.currentRun === "object" ? prev.currentRun : null;
-            const prevRunId = Number(prevRun?.run_id);
-            const nextCurrentRun = Number.isFinite(rid) && rid > 0 && (!Number.isFinite(prevRunId) || prevRunId <= 0 || prevRunId === rid)
-              ? { ...(prevRun || {}), run_id: rid, task_id: tid || null, status: "waiting" }
-              : prevRun;
-            return {
-              ...prev,
-              pendingResume: pending,
-              needInputRecentRecords: recentRecords,
-              currentRun: nextCurrentRun,
-              lastRunMeta: {
-                ...(prev?.lastRunMeta || {}),
-                run_id: Number.isFinite(rid) && rid > 0 ? rid : (prev?.lastRunMeta?.run_id || null),
-                task_id: tid || null,
-                updated_at: String(prev?.lastRunMeta?.updated_at || ""),
-                status: "waiting"
-              }
-            };
-          },
-          { reason: "need_input" }
-        );
+        upsertWorldPendingResumeState(pending, transition.recentRecords, "need_input");
         renderWorldNeedInputChoicesUi(pending);
         updateWorldFromBackend(true);
         if (q && assistantKey) updateWorldChatMessageContent(assistantKey, q);
@@ -2359,7 +2156,10 @@ async function streamToWorld(makeRequest, options = {}) {
           const n = Number(obj?.applied);
           if (Number.isFinite(n) && n > 0) {
             worldSession.setState(
-              { streamingStatus: `连接已恢复，已从事件日志补齐 ${n} 条事件。` },
+              (prev) => applyWorldStreamingStatusState(
+                prev,
+                { statusText: `连接已恢复，已从事件日志补齐 ${n} 条事件。` }
+              ),
               { reason: "stream_replay_applied" }
             );
             rerenderWorldThoughtsFromState();
@@ -2396,7 +2196,10 @@ async function streamToWorld(makeRequest, options = {}) {
   );
 
   if (stopStream(worldStream, mySeq)) {
-    worldSession.setState({ streaming: false, streamingMode: "", streamingStatus: "" }, { reason: "stream_stop" });
+    worldSession.setState(
+      (prev) => applyWorldStreamStopState(prev),
+      { reason: "stream_stop" }
+    );
     updateWorldFromBackend(true);
     renderWorldNeedInputChoicesUi(worldSession.getState().pendingResume);
   }
@@ -2447,30 +2250,30 @@ async function ensureWorldPendingResumeFromBackend(runId, fallbackTaskId = null)
     return { waiting: false, question: "", taskId: null, status: resolved.status };
   }
 
-  const state = worldSession.getState();
-  const current = state.pendingResume;
-  const recentRecords = pruneNeedInputRecentRecords(state.needInputRecentRecords, {
-    ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS
-  });
-  if (shouldSuppressNeedInputPrompt(resolved.pending, recentRecords, { ttlMs: WORLD_NEED_INPUT_RECENT_TTL_MS })) {
-    worldSession.setState({ needInputRecentRecords: recentRecords }, { reason: "need_input_recover_suppressed" });
+  const resolvedTransition = resolveWorldNeedInputTransition(
+    resolved.pending,
+    {
+      state: worldSession.getState(),
+      requireQuestion: true
+    }
+  );
+  if (!resolvedTransition.ok) {
+    return { waiting: false, question: "", taskId: null, status: resolved.status };
+  }
+  const { transition, pending } = resolvedTransition;
+
+  if (transition.suppressed) {
+    worldSession.setState(
+      (prev) => applyWorldNeedInputRecentRecordsState(prev, { recentRecords: transition.recentRecords }),
+      { reason: "need_input_recover_suppressed" }
+    );
     clearWorldPendingResume({ runId: rid, reason: "need_input_recover_suppressed", emit: false });
     return { waiting: false, question: "", taskId: null, status: resolved.status };
   }
 
-  const currentRunId = Number(current?.runId);
-  const shouldRefreshPending = !Number.isFinite(currentRunId)
-    || currentRunId !== rid
-    || String(current?.question || "").trim() !== String(resolved.pending.question || "").trim()
-    || String(current?.kind || "").trim() !== String(resolved.pending.kind || "").trim()
-    || String(current?.promptToken || "").trim() !== String(resolved.pending.promptToken || "").trim()
-    || String(current?.sessionKey || "").trim() !== String(resolved.pending.sessionKey || "").trim();
-  if (shouldRefreshPending) {
-    worldSession.setState(
-      { pendingResume: resolved.pending, needInputRecentRecords: recentRecords },
-      { reason: "need_input_recover" }
-    );
-    renderWorldNeedInputChoicesUi(resolved.pending);
+  if (transition.changed) {
+    upsertWorldPendingResumeState(pending, transition.recentRecords, "need_input_recover");
+    renderWorldNeedInputChoicesUi(pending);
   }
 
   return {
@@ -2651,16 +2454,19 @@ async function runWorldDoMode(userText, options = {}) {
 
     // 关键体验：在评估 plan-list 完成前，不输出最终总结（避免用户看到“结果”但评估仍在跑）
     worldSession.setState(
-      {
-        pendingFinal: {
-          tmpKey: assistantTemp._tmpKey,
-          content: finalVisible,
-          run_id: runId,
-          task_id: taskId,
-          metadata: { source: "panel", mode: isResume ? "resume" : agentMode },
-          startedAt: Date.now()
+      (prev) => applyWorldPendingFinalState(
+        prev,
+        {
+          pendingFinal: {
+            tmpKey: assistantTemp._tmpKey,
+            content: finalVisible,
+            run_id: runId,
+            task_id: taskId,
+            metadata: { source: "panel", mode: isResume ? "resume" : agentMode },
+            startedAt: Date.now()
+          }
         }
-      },
+      ),
       { reason: "pending_final_set" }
     );
     updateWorldChatMessageContent(assistantTemp._tmpKey, buildPendingFinalPlaceholderText(statusFallback));
@@ -2972,7 +2778,7 @@ function activatePage(pageId) {
       abortStream(worldStream);
       clearWorldPendingResume({ reason: "page_hide", emit: false });
       worldSession.setState(
-        { streaming: false, streamingMode: "", pendingResume: null, streamingStatus: "" },
+        (prev) => applyWorldPageHideState(prev),
         { reason: "page_hide" }
       );
     }

@@ -117,8 +117,12 @@ async def iter_execution_exception_events(
             yield str(event_payload)
 
 
-def done_sse_event() -> str:
-    return sse_json({"type": "done"}, event="done")
+def done_sse_event(*, run_status: Optional[str] = None) -> str:
+    payload = {"type": "stream_end", "kind": "stream_end"}
+    status_text = str(run_status or "").strip().lower()
+    if status_text:
+        payload["run_status"] = status_text
+    return sse_json(payload, event="done")
 
 
 def chunk_has_visible_result_tag(chunk_text: str) -> bool:

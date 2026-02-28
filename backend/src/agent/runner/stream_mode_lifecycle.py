@@ -149,6 +149,6 @@ async def iter_stream_done_tail(
         status_event = lifecycle.emit_run_status(normalized_status)
         if status_event:
             yield status_event
-        yield done_sse_event()
+        yield lifecycle.emit(done_sse_event(run_status=str(normalized_status or "")))
     except BaseException:
         return

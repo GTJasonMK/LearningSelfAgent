@@ -431,6 +431,112 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         self.assertEqual(obj["payload"]["tool_name"], "web_fetch")
         self.assertEqual(obj["payload"]["input"], "https://wttr.in/Chengdu?format=j1")
 
+    def test_user_prompt_only_step_short_circuits_without_llm(self):
+        from backend.src.agent.core.plan_structure import PlanStructure
+        from backend.src.agent.runner.react_loop import run_react_loop
+        from backend.src.constants import RUN_STATUS_WAITING
+
+        task_id, run_id = self._create_task_and_run()
+        workdir = os.getcwd()
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=["user_prompt:请确认价格口径"],
+            plan_items=[{"id": 1, "brief": "确认口径", "status": "pending"}],
+            plan_allows=[["user_prompt"]],
+            plan_artifacts=[],
+        )
+
+        chunks: list[str] = []
+        with patch(
+            "backend.src.agent.runner.react_loop.create_llm_call",
+            side_effect=AssertionError("user_prompt 直通不应调用 llm"),
+        ):
+            gen = run_react_loop(
+                task_id=task_id,
+                run_id=run_id,
+                message="m",
+                workdir=workdir,
+                model="gpt-4o-mini",
+                parameters={"temperature": 0},
+                plan_struct=plan_struct,
+                tools_hint="(无)",
+                skills_hint="(无)",
+                memories_hint="(无)",
+                graph_hint="(无)",
+                agent_state={},
+                context={"last_llm_response": None},
+                observations=[],
+                start_step_order=1,
+                variables_source="test",
+            )
+            try:
+                while True:
+                    chunks.append(str(next(gen)))
+            except StopIteration as exc:
+                result = exc.value
+
+        self.assertEqual(result.run_status, RUN_STATUS_WAITING)
+        self.assertTrue(any('"type": "need_input"' in c or '"type":"need_input"' in c for c in chunks))
+        self.assertTrue(any("请确认价格口径" in c for c in chunks))
+
+    def test_user_prompt_short_circuit_uses_structured_prompt_when_title_has_no_prefix(self):
+        from backend.src.agent.core.plan_structure import PlanStructure
+        from backend.src.agent.runner.react_loop import run_react_loop
+        from backend.src.constants import RUN_STATUS_WAITING
+
+        task_id, run_id = self._create_task_and_run()
+        workdir = os.getcwd()
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=["确认信息"],
+            plan_items=[
+                {
+                    "id": 1,
+                    "brief": "确认",
+                    "status": "pending",
+                    "kind": "user_prompt",
+                    "prompt": {
+                        "question": "请选择口径",
+                        "kind": "knowledge_sufficiency",
+                        "choices": [{"label": "继续", "value": "proceed"}],
+                    },
+                }
+            ],
+            plan_allows=[["user_prompt"]],
+            plan_artifacts=[],
+        )
+
+        chunks: list[str] = []
+        with patch(
+            "backend.src.agent.runner.react_loop.create_llm_call",
+            side_effect=AssertionError("结构化 user_prompt 直通不应调用 llm"),
+        ):
+            gen = run_react_loop(
+                task_id=task_id,
+                run_id=run_id,
+                message="m",
+                workdir=workdir,
+                model="gpt-4o-mini",
+                parameters={"temperature": 0},
+                plan_struct=plan_struct,
+                tools_hint="(无)",
+                skills_hint="(无)",
+                memories_hint="(无)",
+                graph_hint="(无)",
+                agent_state={},
+                context={"last_llm_response": None},
+                observations=[],
+                start_step_order=1,
+                variables_source="test",
+            )
+            try:
+                while True:
+                    chunks.append(str(next(gen)))
+            except StopIteration as exc:
+                result = exc.value
+
+        self.assertEqual(result.run_status, RUN_STATUS_WAITING)
+        self.assertTrue(any("请选择口径" in c for c in chunks))
+        self.assertTrue(any("knowledge_sufficiency" in c for c in chunks))
+
 
 if __name__ == "__main__":
     unittest.main()

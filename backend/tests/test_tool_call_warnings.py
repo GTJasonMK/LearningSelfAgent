@@ -240,6 +240,98 @@ class TestToolCallWarnings(unittest.TestCase):
         self.assertIn("rate_limited", str(error))
         self.assertIn("too_many_requests", str(error))
 
+    def test_tool_structured_failed_status_returns_error(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:script_analyze_optimize 执行"}
+        structured_output = (
+            '{'
+            '"status":"failed",'
+            '"error_code":"optimizer_llm_failed",'
+            '"summary":"LLM 返回非 JSON",'
+            '"errors":[{"code":"llm_failed","message":"invalid_json"}]'
+            '}'
+        )
+        payload = {
+            "tool_name": "script_analyze_optimize",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "python scripts/script_optimizer.py --input-stdin", "workdir": "/tmp"},
+            },
+            "input": '{"target_paths":["scripts/demo.py"],"mode":"analyze"}',
+            "output": "",
+        }
+
+        with patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 10, "name": "script_analyze_optimize", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            return_value=(structured_output, None),
+        ), patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            return_value={
+                "record": {
+                    "tool_id": 10,
+                    "tool_name": "script_analyze_optimize",
+                    "input": payload["input"],
+                    "output": structured_output,
+                }
+            },
+        ):
+            _record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNotNone(error)
+        self.assertIn("optimizer_llm_failed", str(error))
+        self.assertIn("返回失败状态", str(error))
+
+    def test_tool_structured_partial_without_applied_returns_error(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:script_analyze_optimize 执行"}
+        structured_output = (
+            '{'
+            '"status":"partial",'
+            '"summary":"2 个文件失败",'
+            '"errors":[{"code":"file_not_found","message":"x.py"}],'
+            '"applied":[]'
+            '}'
+        )
+        payload = {
+            "tool_name": "script_analyze_optimize",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "python scripts/script_optimizer.py --input-stdin", "workdir": "/tmp"},
+            },
+            "input": '{"target_paths":["x.py"],"mode":"apply_patch"}',
+            "output": "",
+        }
+
+        with patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 10, "name": "script_analyze_optimize", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            return_value=(structured_output, None),
+        ), patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            return_value={
+                "record": {
+                    "tool_id": 10,
+                    "tool_name": "script_analyze_optimize",
+                    "input": payload["input"],
+                    "output": structured_output,
+                }
+            },
+        ):
+            _record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNotNone(error)
+        self.assertIn("tool_partial_failed", str(error))
+        self.assertIn("partial", str(error))
+
 
 if __name__ == "__main__":
     unittest.main()

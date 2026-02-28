@@ -366,12 +366,16 @@ async def handle_execution_exception(
         pass
 
 
-def yield_done_event(yield_func: Callable) -> None:
+def yield_done_event(yield_func: Callable, *, run_status: str = "") -> None:
     """
     发送 done 事件，若客户端已断开则忽略。
     """
+    payload = {"type": "stream_end", "kind": "stream_end"}
+    status_text = str(run_status or "").strip().lower()
+    if status_text:
+        payload["run_status"] = status_text
     try:
-        yield_func(sse_json({"type": "done"}, event="done"))
+        yield_func(sse_json(payload, event="done"))
     except BaseException:
         pass
 

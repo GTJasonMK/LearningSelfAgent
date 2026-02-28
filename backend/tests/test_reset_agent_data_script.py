@@ -3,6 +3,8 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 
@@ -12,7 +14,7 @@ class TestResetAgentDataScript(unittest.TestCase):
         回归：reset_agent_data 应该
         - 仅保留 config_store，清空包括 chat_messages 在内的业务数据
         - 清空 FTS 索引（delete-all），避免“主表为空但 FTS 仍残留”
-        - 清理 prompt_root 下的业务 md 文件（保留 README）
+        - 清理 prompt_root 下的业务 md 文件（保留 README 与系统 skill）
         - 删除 backend/.agent 工作目录
         """
         from backend.src.common.utils import now_iso
@@ -39,6 +41,9 @@ class TestResetAgentDataScript(unittest.TestCase):
                 "tools/keep_tool.md",
                 "skills/README.md",
                 "skills/s1.md",
+                "skills/misc/curated.md",
+                "skills/system/core.md",
+                "skills/misc/system_meta.md",
                 "graph/nodes/README.md",
                 "graph/nodes/n1.md",
                 "graph/edges/README.md",
@@ -79,6 +84,53 @@ class TestResetAgentDataScript(unittest.TestCase):
                             ensure_ascii=False,
                         )
                         + "\n---\n\n",
+                        encoding="utf-8",
+                    )
+                elif rel == "skills/system/core.md":
+                    # 按路径判定的系统 skill：reset 后应保留
+                    p.write_text(
+                        "---\n"
+                        "name: system_core_skill\n"
+                        "description: core\n"
+                        "category: system.core\n"
+                        "tags: [system]\n"
+                        "---\n\n",
+                        encoding="utf-8",
+                    )
+                elif rel == "skills/misc/system_meta.md":
+                    # 按元数据判定的系统 skill：即使不在 skills/system 目录也应保留
+                    p.write_text(
+                        "---\n"
+                        "name: system_meta_skill\n"
+                        "description: meta\n"
+                        "category: misc\n"
+                        "scope: system.global\n"
+                        "tags: [domain:system]\n"
+                        "---\n\n",
+                        encoding="utf-8",
+                    )
+                elif rel == "skills/s1.md":
+                    # 自动生成 skill：reset 后应删除
+                    p.write_text(
+                        "---\n"
+                        "name: auto_skill_generated\n"
+                        "description: generated\n"
+                        "category: misc\n"
+                        "source_task_id: 101\n"
+                        "source_run_id: 202\n"
+                        "tags: [task:101, run:202]\n"
+                        "---\n\n",
+                        encoding="utf-8",
+                    )
+                elif rel == "skills/misc/curated.md":
+                    # 手工维护 skill：无 generated 标记，reset 后应保留
+                    p.write_text(
+                        "---\n"
+                        "name: curated_skill\n"
+                        "description: curated\n"
+                        "category: misc\n"
+                        "tags: [manual]\n"
+                        "---\n\n",
                         encoding="utf-8",
                     )
                 else:
@@ -126,20 +178,46 @@ class TestResetAgentDataScript(unittest.TestCase):
 
                 # 将 reset_script 的 PROJECT_ROOT 指向临时目录，避免清理真实仓库
                 reset_script.PROJECT_ROOT = root
-                reset_script.main()
+                output_buffer = StringIO()
+                with redirect_stdout(output_buffer):
+                    reset_script.main()
+                reset_output = output_buffer.getvalue()
 
                 # DB：仅保留 config_store
                 con3 = sqlite3.connect(db_path)
                 cur3 = con3.cursor()
                 self.assertEqual(int(cur3.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]), 0)
                 self.assertEqual(int(cur3.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0]), 0)
-                self.assertEqual(int(cur3.execute("SELECT COUNT(*) FROM skills_items").fetchone()[0]), 0)
+                # skills_items：保留系统 skill（从保留的 skills 文件同步回 DB）
+                self.assertGreaterEqual(int(cur3.execute("SELECT COUNT(*) FROM skills_items").fetchone()[0]), 1)
+                self.assertEqual(
+                    int(cur3.execute("SELECT COUNT(*) FROM skills_items WHERE name = ?", ("s1",)).fetchone()[0]),
+                    0,
+                )
+                self.assertGreaterEqual(
+                    int(
+                        cur3.execute(
+                            "SELECT COUNT(*) FROM skills_items WHERE name IN (?, ?)",
+                            ("system_core_skill", "system_meta_skill"),
+                        ).fetchone()[0]
+                    ),
+                    2,
+                )
+                self.assertEqual(
+                    int(cur3.execute("SELECT COUNT(*) FROM skills_items WHERE name = ?", ("auto_skill_generated",)).fetchone()[0]),
+                    0,
+                )
+                self.assertEqual(
+                    int(cur3.execute("SELECT COUNT(*) FROM skills_items WHERE name = ?", ("curated_skill",)).fetchone()[0]),
+                    1,
+                )
                 # config 保留；chat_messages 清空
                 self.assertGreaterEqual(int(cur3.execute("SELECT COUNT(*) FROM config_store").fetchone()[0]), 1)
                 self.assertEqual(int(cur3.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0]), 0)
                 # FTS 索引清空
                 self.assertEqual(int(cur3.execute("SELECT COUNT(*) FROM memory_items_fts").fetchone()[0]), 0)
-                self.assertEqual(int(cur3.execute("SELECT COUNT(*) FROM skills_items_fts").fetchone()[0]), 0)
+                # skills FTS 会由系统 skill 回灌触发重建，不再强制为 0
+                self.assertGreaterEqual(int(cur3.execute("SELECT COUNT(*) FROM skills_items_fts").fetchone()[0]), 1)
                 con3.close()
 
                 # backend/.agent 被删
@@ -151,11 +229,28 @@ class TestResetAgentDataScript(unittest.TestCase):
                 self.assertFalse((prompt_root / "memory" / "sub" / "bar.md").exists())
                 self.assertTrue((prompt_root / "skills" / "README.md").exists())
                 self.assertFalse((prompt_root / "skills" / "s1.md").exists())
+                self.assertTrue((prompt_root / "skills" / "misc" / "curated.md").exists())
+                self.assertTrue((prompt_root / "skills" / "system" / "core.md").exists())
+                self.assertTrue((prompt_root / "skills" / "misc" / "system_meta.md").exists())
                 self.assertFalse((prompt_root / "memory" / ".trash").exists())
                 # tools：仅 draft 删除，非 draft 保留
                 self.assertTrue((prompt_root / "tools" / "README.md").exists())
                 self.assertFalse((prompt_root / "tools" / "t1.md").exists())
                 self.assertTrue((prompt_root / "tools" / "keep_tool.md").exists())
+
+                # skills 判定日志可观测：每个 skill 给出 KEEP/DELETE 原因
+                self.assertIn("memory 判定：", reset_output)
+                self.assertIn("KEEP memory/README.md [readme]", reset_output)
+                self.assertIn("DELETE memory/foo.md [memory_data]", reset_output)
+                self.assertIn("DELETE memory/sub/bar.md [memory_data]", reset_output)
+                self.assertIn("tools 判定：", reset_output)
+                self.assertIn("KEEP tools/README.md [readme]", reset_output)
+                self.assertIn("DELETE tools/t1.md [draft_tool]", reset_output)
+                self.assertIn("KEEP tools/keep_tool.md [approved_or_builtin]", reset_output)
+                self.assertIn("skills 判定：", reset_output)
+                self.assertIn("DELETE skills/s1.md [generated_non_system]", reset_output)
+                self.assertIn("KEEP skills/misc/curated.md [non_generated_or_curated]", reset_output)
+                self.assertIn("KEEP skills/system/core.md [system_skill]", reset_output)
             finally:
                 if old_db is None:
                     os.environ.pop(DB_ENV_VAR, None)

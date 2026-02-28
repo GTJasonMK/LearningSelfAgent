@@ -198,6 +198,56 @@ def _detect_web_fetch_semantic_error(output_text: str) -> Optional[str]:
     return "semantic_error"
 
 
+def _detect_structured_tool_error(
+    *,
+    tool_name: str,
+    output_text: str,
+) -> Optional[Tuple[str, str]]:
+    """
+    通用结构化失败识别：
+    - 工具返回 JSON 且显式声明失败时，不能继续当作“成功输出”。
+    - 重点兜底：status=failed / success=false / ok=false。
+    - 对 status=partial：若存在 errors 且没有 applied，视为失败（避免“部分失败”被误报完成）。
+    """
+    payload = parse_json_dict(output_text)
+    if not isinstance(payload, dict):
+        return None
+
+    status_text = str(payload.get("status") or "").strip().lower()
+    success_value = payload.get("success")
+    ok_value = payload.get("ok")
+    errors = payload.get("errors")
+    applied = payload.get("applied")
+    error_code = str(payload.get("error_code") or "").strip().lower()
+    summary = truncate_inline_text(payload.get("summary") or "", 220)
+
+    has_errors = isinstance(errors, list) and any(isinstance(item, dict) or str(item or "").strip() for item in errors)
+    has_applied = isinstance(applied, list) and any(bool(item) for item in applied)
+
+    explicit_failed = (
+        (success_value is False)
+        or (ok_value is False)
+        or (status_text in {"error", "failed", "fail"})
+    )
+    if explicit_failed:
+        code = error_code or "tool_semantic_failed"
+        message = f"{tool_name or 'tool'} 返回失败状态"
+        if status_text:
+            message += f"（status={status_text}）"
+        if summary:
+            message += f"：{summary}"
+        return code, message
+
+    if status_text == "partial" and has_errors and not has_applied:
+        code = error_code or "tool_partial_failed"
+        message = f"{tool_name or 'tool'} 返回 partial 且包含错误"
+        if summary:
+            message += f"：{summary}"
+        return code, message
+
+    return None
+
+
 def _normalize_exec_spec(exec_spec: dict) -> dict:
     """
     tool_metadata.exec 兼容归一化：
@@ -501,6 +551,13 @@ def _enforce_tool_exec_script_dependency(
         return None
     if not isinstance(exec_spec, dict):
         return None
+    require_binding_value = exec_spec.get("require_file_write_binding")
+    if require_binding_value is not None:
+        if isinstance(require_binding_value, bool) and not require_binding_value:
+            return None
+        lowered = str(require_binding_value).strip().lower()
+        if lowered in {"0", "false", "no", "off"}:
+            return None
 
     workdir = normalize_windows_abs_path_on_posix(str(exec_spec.get("workdir") or "").strip())
     if not workdir:
@@ -926,6 +983,14 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
                 code=error_code,
                 message=f"web_fetch 返回错误响应（{semantic_error}）：{url_text}",
             )
+
+    structured_error = _detect_structured_tool_error(
+        tool_name=tool_name_value,
+        output_text=output_text,
+    )
+    if structured_error:
+        code, message = structured_error
+        return record, format_task_error(code=code, message=message)
 
     # 新工具：此处只负责“真实执行 + 记录调用”，不直接沉淀为 skill。
     # 说明：

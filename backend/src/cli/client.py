@@ -8,12 +8,31 @@
 
 from __future__ import annotations
 
-import json
 import os
-import sys
 from typing import Any, Dict, Iterator, Optional
 
-import httpx
+try:
+    import httpx  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - 依赖缺失时给出可读错误
+    class _MissingHttpxModule:
+        class ConnectError(Exception):
+            pass
+
+        class TimeoutException(Exception):
+            pass
+
+        class RequestError(Exception):
+            pass
+
+        class Timeout:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        class Client:  # noqa: D401 - 占位类型，实际不会使用
+            def __init__(self, *args, **kwargs):
+                raise ModuleNotFoundError("No module named 'httpx'")
+
+    httpx = _MissingHttpxModule()  # type: ignore[assignment]
 
 from backend.src.cli.sse import SseEvent, iter_sse_stream
 
@@ -45,7 +64,7 @@ def _resolve_port(port_arg: Optional[int] = None) -> int:
     return 8123
 
 
-def _extract_error_message(response: httpx.Response) -> str:
+def _extract_error_message(response: Any) -> str:
     """从后端错误响应中提取可读错误信息。"""
     try:
         data = response.json()
@@ -111,6 +130,13 @@ class ApiClient:
             raise CliError(
                 f"请求超时 ({self._timeout}s)。可通过 --timeout 增大超时时间。",
                 exit_code=1,
+            )
+        except httpx.RequestError as exc:
+            raise CliError(f"网络请求失败: {exc}", exit_code=1)
+        except ModuleNotFoundError:
+            raise CliError(
+                "缺少依赖 httpx，请先运行: python scripts/install.py",
+                exit_code=2,
             )
 
         if response.status_code >= 400:
@@ -183,3 +209,10 @@ class ApiClient:
             )
         except httpx.TimeoutException:
             raise CliError("连接超时。", exit_code=1)
+        except httpx.RequestError as exc:
+            raise CliError(f"流式请求失败: {exc}", exit_code=1)
+        except ModuleNotFoundError:
+            raise CliError(
+                "缺少依赖 httpx，请先运行: python scripts/install.py",
+                exit_code=2,
+            )

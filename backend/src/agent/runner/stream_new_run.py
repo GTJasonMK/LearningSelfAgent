@@ -96,6 +96,13 @@ logger = logging.getLogger(__name__)
 NON_FATAL_STREAM_ERRORS = (sqlite3.Error, RuntimeError, TypeError, ValueError, OSError, AttributeError)
 
 
+def _log_text_brief(value: object, limit: int = 120) -> str:
+    text = str(value or "").strip().replace("\n", "\\n")
+    if len(text) <= int(limit):
+        return text
+    return f"{text[: int(limit)]}..."
+
+
 @require_write_permission_stream
 def stream_agent_command(payload: AgentCommandStreamRequest):
     """
@@ -153,6 +160,14 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
             task_id = int(startup.task_id)
             run_id = int(startup.run_id)
             run_ctx = startup.run_ctx
+            logger.info(
+                "[agent.do] start task_id=%s run_id=%s model=%s max_steps=%s dry_run=%s",
+                task_id,
+                run_id,
+                model,
+                normalized_max_steps,
+                dry_run,
+            )
             for event in startup.emitted_events:
                 yield str(event)
             # 工具清单会在“方案匹配”之后汇总（方案提到的工具优先）
@@ -278,6 +293,12 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                     wait_result = event_payload
                 if wait_result is None:
                     raise RuntimeError("pending_planning waiting 结果为空")
+                logger.info(
+                    "[agent.do] waiting_user_input task_id=%s run_id=%s question=%s",
+                    task_id,
+                    run_id,
+                    _log_text_brief(user_prompt_question),
+                )
                 await lifecycle.release_queue_ticket_once()
                 return
 
@@ -398,6 +419,13 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                 plan_artifacts=list(plan_artifacts or []),
             )
             plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
+            logger.info(
+                "[agent.do] plan_ready task_id=%s run_id=%s steps=%s artifacts=%s",
+                task_id,
+                run_id,
+                len(plan_titles or []),
+                len(plan_artifacts or []),
+            )
 
             yield lifecycle.emit(sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items}))
 
@@ -462,6 +490,12 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                     status_event = lifecycle.emit_run_status(RUN_STATUS_DONE)
                     if status_event:
                         yield status_event
+                    logger.info(
+                        "[agent.do] done_dry_run task_id=%s run_id=%s status=%s",
+                        task_id,
+                        run_id,
+                        RUN_STATUS_DONE,
+                    )
                 except NON_FATAL_STREAM_ERRORS as exc:
                     logger.exception("agent.dry_run.finalize_failed: %s", exc)
                     _safe_write_debug(
@@ -528,6 +562,12 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
             if react_result is None:
                 raise RuntimeError("do execution 结果为空")
             run_status = str(react_result.run_status or "")
+            logger.info(
+                "[agent.do] execution_done task_id=%s run_id=%s status=%s",
+                task_id,
+                run_id,
+                run_status,
+            )
             if not isinstance(getattr(react_result, "plan_struct", None), PlanStructure):
                 raise RuntimeError("do 执行器返回缺少有效 plan_struct")
             plan_struct = react_result.plan_struct
@@ -550,14 +590,22 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                     status_event = lifecycle.emit_run_status(run_status)
                     if status_event:
                         yield status_event
+            logger.info(
+                "[agent.do] finalized task_id=%s run_id=%s status=%s",
+                task_id,
+                run_id,
+                run_status,
+            )
 
         except (asyncio.CancelledError, GeneratorExit):
             # SSE 连接被关闭（客户端断开/窗口退出）时不要再尝试继续 yield，否则会触发
             # “async generator ignored GeneratorExit/CancelledError” 类错误并留下 running 状态。
+            logger.info("[agent.do] cancelled task_id=%s run_id=%s", task_id, run_id)
             handle_stream_cancellation(task_id=task_id, run_id=run_id, reason="agent_stream_cancelled")
             await lifecycle.release_queue_ticket_once()
             raise
         except Exception as exc:
+            logger.exception("[agent.do] exception task_id=%s run_id=%s error=%s", task_id, run_id, exc)
             async for chunk in iter_stream_exception_tail(
                 lifecycle=lifecycle,
                 exc=exc,

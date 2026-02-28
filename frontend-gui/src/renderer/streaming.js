@@ -87,6 +87,7 @@ export async function streamSse(makeRequest, options = {}) {
   let pending = "";
   let streamDone = false;
   let streamCompletedByDoneEvent = false;
+  let sawBusinessStateEvent = false;
   let hadError = false;
   let wasAborted = false;
   let deferredErrorMessage = "";
@@ -133,7 +134,7 @@ export async function streamSse(makeRequest, options = {}) {
     const taskPart = Number.isFinite(taskId) && taskId > 0 ? String(taskId) : "0";
 
     if (type === "run_created") return `k:${type}:${taskPart}:${runPart}`;
-    if (type === "done") return `k:${type}:${taskPart}:${runPart}`;
+    if (type === "done" || type === "stream_end") return `k:${type}:${taskPart}:${runPart}`;
     return "";
   }
 
@@ -293,7 +294,8 @@ export async function streamSse(makeRequest, options = {}) {
       try { options.onEvent?.(obj); } catch (e) {}
     }
 
-    if (obj.type === "done") {
+    if (obj.type === "done" || obj.type === "stream_end") {
+      if (String(obj.run_status || "").trim()) sawBusinessStateEvent = true;
       streamDone = true;
       streamCompletedByDoneEvent = true;
       return { consumed: true, delta: "", stop: true };
@@ -303,10 +305,12 @@ export async function streamSse(makeRequest, options = {}) {
       return { consumed: true, delta: "" };
     }
     if (obj.type === "run_status") {
+      sawBusinessStateEvent = true;
       try { options.onRunStatus?.(obj); } catch (e) {}
       return { consumed: true, delta: "" };
     }
     if (obj.type === "need_input") {
+      sawBusinessStateEvent = true;
       try { options.onNeedInput?.(obj); } catch (e) {}
       await maybeYieldToPaint(true);
       return { consumed: true, delta: "" };
@@ -476,7 +480,13 @@ export async function streamSse(makeRequest, options = {}) {
     }
   }
 
-  const needReplay = !wasAborted && (hadError || !streamCompletedByDoneEvent);
+  const needReplay = !wasAborted
+    && (
+      hadError
+      || !streamCompletedByDoneEvent
+      // 仅收到 done 但未看到 run_status/need_input 时，不足以判定业务链路已收敛。
+      || (streamCompletedByDoneEvent && !sawBusinessStateEvent)
+    );
   if (needReplay) {
     const replay = await replayEventsIfNeeded(hadError ? "stream_error" : "stream_closed");
     replayApplied = Number(replay?.applied || 0);

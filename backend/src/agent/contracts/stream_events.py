@@ -12,6 +12,7 @@ STREAM_EVENT_TYPE_NEED_INPUT = "need_input"
 STREAM_EVENT_TYPE_PLAN = "plan"
 STREAM_EVENT_TYPE_PLAN_DELTA = "plan_delta"
 STREAM_EVENT_TYPE_DONE = "done"
+STREAM_EVENT_TYPE_STREAM_END = "stream_end"
 STREAM_EVENT_TYPE_ERROR = "error"
 STREAM_EVENT_SCHEMA_NAME = "lsa_stream_event"
 STREAM_EVENT_SCHEMA_VERSION = 2
@@ -155,6 +156,17 @@ def attach_stream_event_meta(
     if not isinstance(obj, dict):
         return str(chunk or ""), False
     event_type = str(obj.get("type") or "").strip()
+    if not event_type:
+        # 兼容历史流：部分事件只带 SSE event（例如 event:error / event:done）而无 data.type。
+        # 为保证事件可观测性（落库/审计/回放），这里做最小语义补齐。
+        normalized_event_name = str(event_name or "").strip().lower()
+        if normalized_event_name in {STREAM_EVENT_TYPE_DONE, STREAM_EVENT_TYPE_ERROR}:
+            event_type = (
+                STREAM_EVENT_TYPE_STREAM_END
+                if normalized_event_name == STREAM_EVENT_TYPE_DONE
+                else STREAM_EVENT_TYPE_ERROR
+            )
+            obj["type"] = event_type
     if not event_type:
         return str(chunk or ""), False
 

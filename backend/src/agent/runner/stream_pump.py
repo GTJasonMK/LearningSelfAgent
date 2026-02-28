@@ -302,7 +302,7 @@ async def pump_sync_generator(
 
                     # need_input/done/error 等关键事件前强制 flush plan
                     if (
-                        msg_type in {"need_input", "done", "review"}
+                        msg_type in {"need_input", "done", "stream_end", "review"}
                         or "event: error" in msg_text
                         or "event: done" in msg_text
                     ):

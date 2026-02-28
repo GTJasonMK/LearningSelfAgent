@@ -49,6 +49,11 @@ class TestStreamModeLifecycleDoneTail(unittest.IsolatedAsyncioTestCase):
         run_status = next((p for p in payloads if str(p.get("type") or "") == "run_status"), None)
         self.assertIsNotNone(run_status)
         self.assertEqual(str(run_status.get("status") or ""), "failed")
+        done = next((p for p in payloads if str(p.get("type") or "") == "stream_end"), None)
+        self.assertIsNotNone(done)
+        self.assertEqual(str(done.get("kind") or ""), "stream_end")
+        self.assertEqual(str(done.get("run_status") or ""), "failed")
+        self.assertTrue(bool(str(done.get("event_id") or "").strip()))
 
     async def test_done_tail_does_not_emit_observability_error_when_status_present(self):
         from backend.src.agent.runner.stream_mode_lifecycle import (
@@ -65,6 +70,12 @@ class TestStreamModeLifecycleDoneTail(unittest.IsolatedAsyncioTestCase):
         mocked_get.assert_not_called()
         self.assertTrue(any("event: done" in c for c in chunks))
         self.assertFalse(any("stream_missing_terminal_status" in c for c in chunks))
+        payloads = [_parse_sse_data_json(c) for c in chunks]
+        payloads = [p for p in payloads if isinstance(p, dict)]
+        done = next((p for p in payloads if str(p.get("type") or "") == "stream_end"), None)
+        self.assertIsNotNone(done)
+        self.assertEqual(str(done.get("kind") or ""), "stream_end")
+        self.assertEqual(str(done.get("run_status") or ""), "done")
 
 
 if __name__ == "__main__":

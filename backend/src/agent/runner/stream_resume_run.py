@@ -110,6 +110,13 @@ _RESUME_TOKEN_STATE: dict[tuple[int, str], dict] = {}
 _RESUME_TOKEN_TTL_SECONDS = 600
 
 
+def _log_text_brief(value: object, limit: int = 120) -> str:
+    text = str(value or "").strip().replace("\n", "\\n")
+    if len(text) <= int(limit):
+        return text
+    return f"{text[: int(limit)]}..."
+
+
 def _cleanup_resume_token_state(now: float) -> None:
     expired_keys = []
     for key, info in list(_RESUME_TOKEN_STATE.items()):
@@ -169,16 +176,29 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
     request_session_key = coerce_session_key(getattr(payload, "session_key", ""))
     run_row = get_task_run(run_id=run_id)
     if not run_row:
+        logger.warning("[agent.resume] invalid_run run_id=%s reason=not_found", run_id)
         return error_response(ERROR_CODE_INVALID_REQUEST, "run 不存在", HTTP_STATUS_BAD_REQUEST)
     if run_row["status"] not in {RUN_STATUS_WAITING, RUN_STATUS_STOPPED, RUN_STATUS_FAILED}:
+        logger.warning(
+            "[agent.resume] invalid_status run_id=%s status=%s",
+            run_id,
+            str(run_row["status"] or ""),
+        )
         return error_response(
             ERROR_CODE_INVALID_REQUEST,
             f"run 当前状态不支持继续执行: {run_row['status']}",
             HTTP_STATUS_BAD_REQUEST,
         )
+    logger.info(
+        "[agent.resume] request run_id=%s status=%s has_prompt_token=%s has_session_key=%s",
+        run_id,
+        str(run_row["status"] or ""),
+        bool(request_prompt_token),
+        bool(request_session_key),
+    )
 
     if str(run_row["status"] or "").strip() == RUN_STATUS_WAITING:
-        paused = _extract_json_object(run_row.get("agent_state") or "")
+        paused = _extract_json_object(run_row["agent_state"] or "")
         paused_obj = paused.get("paused") if isinstance(paused, dict) and isinstance(paused.get("paused"), dict) else {}
         required_session_key = coerce_session_key((paused or {}).get("session_key"))
         required_token = str(paused_obj.get("prompt_token") or "").strip()
@@ -189,6 +209,11 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
             request_prompt_token=str(request_prompt_token or ""),
         )
         if contract_error:
+            logger.warning(
+                "[agent.resume] contract_rejected run_id=%s reason=%s",
+                run_id,
+                _log_text_brief(contract_error),
+            )
             return error_response(
                 ERROR_CODE_INVALID_REQUEST,
                 str(contract_error),
@@ -197,6 +222,12 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
         if required_token:
             claimed, state = _claim_resume_prompt_token(run_id=int(run_id), token=request_prompt_token)
             if not claimed:
+                logger.warning(
+                    "[agent.resume] duplicate_submit run_id=%s prompt_token=%s state=%s",
+                    run_id,
+                    _log_text_brief(request_prompt_token, limit=48),
+                    state,
+                )
                 return error_response(
                     ERROR_CODE_INVALID_REQUEST,
                     f"该输入已提交（state={state}），请等待当前执行完成",
@@ -207,6 +238,7 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
         task_id: Optional[int] = None
         session_key: str = ""
         run_status: str = ""
+        last_step_order: int = 0
         stream_state = StreamRunStateEmitter()
         token_finalized = False
         queue_ticket: Optional[StreamQueueTicket] = None
@@ -251,6 +283,12 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                 await _cleanup_resume_resources_once(RUN_STATUS_FAILED)
                 return
             task_id = int(run["task_id"])
+            logger.info(
+                "[agent.resume] start task_id=%s run_id=%s from_status=%s",
+                task_id,
+                run_id,
+                str(run["status"] or ""),
+            )
             stream_state.bind_run(task_id=int(task_id), run_id=int(run_id), session_key=session_key)
             task_row = await asyncio.to_thread(get_task, task_id=int(task_id))
 
@@ -287,6 +325,11 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
             plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
 
             if not plan_titles:
+                logger.warning(
+                    "[agent.resume] missing_plan task_id=%s run_id=%s",
+                    task_id,
+                    run_id,
+                )
                 yield _emit(sse_json({"message": "agent_plan 缺失，无法 resume"}, event="error"))
                 await _cleanup_resume_resources_once(RUN_STATUS_FAILED)
                 return
@@ -340,7 +383,7 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                 agent_state=state_obj,
                 task_id=int(task_id),
                 run_id=int(run_id),
-                created_at=str(run.get("created_at") or ""),
+                created_at=str(run["created_at"] or ""),
             )
             state_obj = apply_session_key_to_state(state_obj, session_key)
             state_obj = apply_run_config_snapshot_if_missing(
@@ -362,7 +405,7 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
             paused_step_order: Optional[int] = parse_optional_int(paused_step_order_raw, default=None)
 
             feedback_canonicalized = realign_feedback_step_for_resume(
-                run_status=str(run.get("status") or ""),
+                run_status=str(run["status"] or ""),
                 plan_titles=plan_titles,
                 plan_items=plan_items,
                 plan_allows=plan_allows,
@@ -424,9 +467,15 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
             plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
 
             run_status = RUN_STATUS_FAILED
-            last_step_order: int = 0
+            last_step_order = 0
             if skip_execution:
                 last_step_order = int(plan_total_steps)
+                logger.info(
+                    "[agent.resume] skip_execution task_id=%s run_id=%s plan_total=%s",
+                    task_id,
+                    run_id,
+                    plan_total_steps,
+                )
                 _safe_write_debug(
                     task_id,
                     run_id,
@@ -458,7 +507,7 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                 missing_visible_result = stream_state.build_missing_visible_result_if_needed(normalized_status)
                 if missing_visible_result:
                     yield missing_visible_result
-                yield done_sse_event()
+                yield _emit(done_sse_event(run_status=str(normalized_status or "")))
                 await _cleanup_resume_resources_once(normalized_status or run_status)
                 return
 
@@ -548,6 +597,12 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                     raise RuntimeError("pending_planning resume 结果为空")
                 outcome = str(pending_result.get("outcome") or "").strip()
                 if outcome in {"waiting", "failed"}:
+                    logger.info(
+                        "[agent.resume] pending_planning_outcome task_id=%s run_id=%s outcome=%s",
+                        task_id,
+                        run_id,
+                        outcome,
+                    )
                     if outcome == "waiting":
                         status_event = _emit_run_status(RUN_STATUS_WAITING)
                         if status_event:
@@ -574,6 +629,11 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                     return
 
                 # outcome == planned：用新 plan/状态继续后续执行
+                logger.info(
+                    "[agent.resume] pending_planning_outcome task_id=%s run_id=%s outcome=planned",
+                    task_id,
+                    run_id,
+                )
                 plan_titles = list(pending_result.get("plan_titles") or plan_titles)
                 plan_items = list(pending_result.get("plan_items") or plan_items)
                 plan_allows = list(pending_result.get("plan_allows") or plan_allows)
@@ -599,7 +659,7 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
 
             mode = str(state_obj.get("mode") or "").strip().lower()
             run_status = RUN_STATUS_FAILED
-            last_step_order: int = 0
+            last_step_order = 0
             mode_result = None
             async for event_type, event_payload in iter_resume_mode_execution_events(
                 config=ResumeModeExecutionConfig(
@@ -633,6 +693,12 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                 raise RuntimeError("resume mode execution 结果为空")
 
             run_status = str(mode_result.get("run_status") or "")
+            logger.info(
+                "[agent.resume] execution_done task_id=%s run_id=%s status=%s",
+                task_id,
+                run_id,
+                run_status,
+            )
             last_step_order = coerce_int(mode_result.get("last_step_order"), default=0)
             state_obj = dict(mode_result.get("state_obj") or state_obj)
             mode_plan_struct = mode_result.get("plan_struct")
@@ -671,10 +737,12 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
         except (asyncio.CancelledError, GeneratorExit):
             # SSE 连接被关闭（客户端断开/窗口退出）时不要再尝试继续 yield，否则会触发
             # “async generator ignored GeneratorExit/CancelledError” 类错误并留下 running 状态。
+            logger.info("[agent.resume] cancelled task_id=%s run_id=%s", task_id, run_id)
             enqueue_stop_task_run_records(task_id=task_id, run_id=int(run_id), reason="agent_stream_cancelled")
             await _cleanup_resume_resources_once("cancelled")
             raise
         except Exception as exc:
+            logger.exception("[agent.resume] exception task_id=%s run_id=%s error=%s", task_id, run_id, exc)
             # 兜底：任何未捕获异常都必须把状态收敛到 failed，避免 UI 永久显示 running
             if task_id is not None:
                 try:
@@ -785,7 +853,14 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
             status_event = _emit_run_status(normalized_status)
             if status_event:
                 yield status_event
-            yield done_sse_event()
+            yield _emit(done_sse_event(run_status=str(normalized_status or "")))
+            logger.info(
+                "[agent.resume] finalized task_id=%s run_id=%s status=%s last_step=%s",
+                task_id,
+                run_id,
+                normalized_status,
+                last_step_order,
+            )
             _finalize_token_once(normalized_status or "done")
         except BaseException:
             return

@@ -19,12 +19,6 @@ let petRecoveryTimer = null;
 let petWindowCreating = false;
 let quitting = false;
 const BACKEND_DEFAULT_PORT = 8123;
-const HIDE_PET_ON_PANEL_OPEN_ENV = "LSA_HIDE_PET_ON_PANEL_OPEN";
-
-function shouldHidePetOnPanelOpen() {
-  const raw = String(process.env[HIDE_PET_ON_PANEL_OPEN_ENV] || "").trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
-}
 
 function parseBackendPort(raw) {
   const value = Number.parseInt(String(raw || "").trim(), 10);
@@ -488,6 +482,7 @@ ipcMain.on("panel-window-control", (event, payload) => {
   const action = payload?.action;
   if (action === "minimize") {
     try { panelWindow.minimize(); } catch (e) {}
+    restorePetWindow();
     return;
   }
   if (action === "toggle-maximize") {
@@ -524,6 +519,20 @@ function createPanelWindow() {
 
   // 主面板直接加载 panel.html（世界/状态两页都在这里），避免入口页多一步跳转
   panelWindow.loadFile(path.join(__dirname, "..", "renderer", "panel.html"));
+  panelWindow.on("show", () => {
+    hidePetWindow();
+  });
+  panelWindow.on("restore", () => {
+    hidePetWindow();
+  });
+  panelWindow.on("minimize", () => {
+    if (quitting) return;
+    restorePetWindow();
+  });
+  panelWindow.on("hide", () => {
+    if (quitting) return;
+    restorePetWindow();
+  });
   // 关闭主面板窗口时不要直接退出：隐藏面板并恢复桌宠窗口，符合“桌面伴生”使用习惯。
   panelWindow.on("close", (event) => {
     if (quitting) return;
@@ -533,7 +542,6 @@ function createPanelWindow() {
     try {
       panelWindow.hide();
     } catch (e) {}
-    restorePetWindow();
   });
   panelWindow.on("closed", () => {
     panelWindow = null;
@@ -591,17 +599,15 @@ function togglePanel() {
   }
   if (panelWindow.isVisible()) {
     panelWindow.hide();
-    // 退出主面板时恢复桌宠悬浮窗口，便于继续交互
-    restorePetWindow();
   } else {
-    panelWindow.show();
-    panelWindow.focus();
-    // 默认保留悬浮桌宠，避免“打开面板后桌宠形态消失”的体感回归。
-    // 如需旧行为（打开面板即隐藏悬浮桌宠），可设置环境变量：
-    // LSA_HIDE_PET_ON_PANEL_OPEN=1
-    if (shouldHidePetOnPanelOpen()) {
+    try {
+      if (panelWindow.isMinimized()) {
+        panelWindow.restore();
+      }
       hidePetWindow();
-    } else {
+      panelWindow.show();
+      panelWindow.focus();
+    } catch (e) {
       restorePetWindow();
     }
   }

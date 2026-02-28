@@ -12,12 +12,11 @@ import sys
 import click
 
 from backend.src.cli.client import CliError
+from backend.src.cli.commands.stream_render import render_stream_event
 from backend.src.cli.output import (
     console,
     print_error,
     print_json,
-    print_sse_delta,
-    print_sse_status,
     print_success,
     print_summary,
     print_task_detail,
@@ -46,13 +45,15 @@ def task_list(ctx: click.Context, date: str | None, days: int | None) -> None:
         params["days"] = days
     try:
         data = client.get("/tasks", params=params or None)
-        tasks = data.get("tasks", data) if isinstance(data, dict) else data
-        if isinstance(tasks, dict):
-            tasks = tasks.get("tasks", [])
+        if not isinstance(data, dict):
+            raise CliError("后端响应格式错误：/tasks 应返回对象", exit_code=1)
+        tasks = data.get("items")
+        if not isinstance(tasks, list):
+            raise CliError("后端响应格式错误：/tasks 缺少 items 列表", exit_code=1)
         if ctx.obj["output_json"]:
             print_json(data)
         else:
-            print_tasks_table(tasks if isinstance(tasks, list) else [])
+            print_tasks_table(tasks)
     except CliError as exc:
         print_error(str(exc))
         sys.exit(exc.exit_code)
@@ -66,10 +67,17 @@ def create(ctx: click.Context, title: str) -> None:
     client = ctx.obj["client"]
     try:
         data = client.post("/tasks", json_data={"title": title})
+        if not isinstance(data, dict):
+            raise CliError("后端响应格式错误：POST /tasks 应返回对象", exit_code=1)
+        task = data.get("task")
+        if not isinstance(task, dict):
+            raise CliError("后端响应格式错误：POST /tasks 缺少 task 对象", exit_code=1)
+        task_id = task.get("id")
+        if task_id is None:
+            raise CliError("后端响应格式错误：POST /tasks 的 task.id 缺失", exit_code=1)
         if ctx.obj["output_json"]:
             print_json(data)
         else:
-            task_id = data.get("id", "?")
             print_success(f"任务已创建 (ID: {task_id})")
     except CliError as exc:
         print_error(str(exc))
@@ -84,10 +92,15 @@ def get(ctx: click.Context, task_id: int) -> None:
     client = ctx.obj["client"]
     try:
         data = client.get(f"/tasks/{task_id}")
+        if not isinstance(data, dict):
+            raise CliError(f"后端响应格式错误：/tasks/{task_id} 应返回对象", exit_code=1)
+        task = data.get("task")
+        if not isinstance(task, dict):
+            raise CliError(f"后端响应格式错误：/tasks/{task_id} 缺少 task 对象", exit_code=1)
         if ctx.obj["output_json"]:
             print_json(data)
         else:
-            print_task_detail(data)
+            print_task_detail(task)
     except CliError as exc:
         print_error(str(exc))
         sys.exit(exc.exit_code)
@@ -111,6 +124,8 @@ def update(ctx: click.Context, task_id: int, status: str | None, title: str | No
         return
     try:
         data = client.patch(f"/tasks/{task_id}", json_data=payload)
+        if not isinstance(data, dict) or not isinstance(data.get("task"), dict):
+            raise CliError(f"后端响应格式错误：PATCH /tasks/{task_id} 缺少 task 对象", exit_code=1)
         if ctx.obj["output_json"]:
             print_json(data)
         else:
@@ -122,15 +137,42 @@ def update(ctx: click.Context, task_id: int, status: str | None, title: str | No
 
 @task.command()
 @click.argument("task_id", type=int)
+@click.option("--run-summary", default=None, help="执行摘要（对应 run_summary）")
+@click.option("--max-retries", default=None, type=int, help="失败重试次数（对应 max_retries）")
+@click.option("--on-failure", default=None, help="失败策略（对应 on_failure）")
 @click.pass_context
-def execute(ctx: click.Context, task_id: int) -> None:
+def execute(
+    ctx: click.Context,
+    task_id: int,
+    run_summary: str | None,
+    max_retries: int | None,
+    on_failure: str | None,
+) -> None:
     """执行任务（SSE 流式输出）"""
     client = ctx.obj["client"]
+    payload: dict = {}
+    if run_summary is not None:
+        payload["run_summary"] = run_summary
+    if max_retries is not None:
+        payload["max_retries"] = max_retries
+    if on_failure is not None:
+        payload["on_failure"] = on_failure
     try:
-        for event in client.stream_post(f"/tasks/{task_id}/execute/stream"):
-            _render_stream_event(event, ctx.obj["output_json"])
+        seen_done = False
+        seen_error = False
+        for event in client.stream_post(f"/tasks/{task_id}/execute/stream", json_data=payload):
+            outcome = _render_stream_event(event, ctx.obj["output_json"])
+            if outcome == "done":
+                seen_done = True
+            elif outcome == "error":
+                seen_error = True
         # 流结束后换行
         console.print()
+        if seen_error:
+            sys.exit(1)
+        if not seen_done:
+            print_error("任务流已结束，但未收到 done 事件（执行状态不可信）")
+            sys.exit(1)
     except CliError as exc:
         print_error(str(exc))
         sys.exit(exc.exit_code)
@@ -155,54 +197,6 @@ def summary(ctx: click.Context) -> None:
         sys.exit(exc.exit_code)
 
 
-def _render_stream_event(event, output_json: bool) -> None:
+def _render_stream_event(event, output_json: bool):
     """渲染 SSE 流式事件。"""
-    from backend.src.cli.output import print_json as pj
-
-    if output_json and event.json_data:
-        pj(event.json_data)
-        return
-
-    if event.event == "error":
-        msg = ""
-        if event.json_data:
-            msg = event.json_data.get("message", event.data)
-        print_error(msg or event.data)
-        return
-
-    if event.event == "done" or (event.json_data and event.json_data.get("type") == "done"):
-        print_sse_status("完成", "任务执行完毕", "green")
-        return
-
-    if not event.json_data:
-        return
-
-    data = event.json_data
-    event_type = data.get("type", "")
-
-    if "delta" in data:
-        print_sse_delta(data["delta"])
-    elif event_type == "run_created":
-        print_sse_status("创建", f"任务 #{data.get('task_id', '')} 运行 #{data.get('run_id', '')}")
-    elif event_type == "run_status":
-        status = data.get("status", "")
-        style = "green" if status == "done" else "yellow" if status == "running" else "red"
-        print_sse_status("状态", f"{status}", style)
-    elif event_type == "plan":
-        items = data.get("items", [])
-        if items:
-            print_sse_status("规划", f"{len(items)} 个步骤")
-            for item in items:
-                brief = item.get("brief", item.get("title", ""))
-                console.print(f"  [dim]{item.get('id', '')}.[/dim] {brief}")
-    elif event_type == "plan_delta":
-        step_id = data.get("id", "")
-        status = data.get("status", "")
-        title = data.get("title", data.get("brief", ""))
-        style = "green" if status == "done" else "yellow" if status == "running" else "red"
-        print_sse_status("步骤", f"{step_id}. {title} [{status}]", style)
-    elif event_type == "need_input":
-        message = data.get("message", "需要输入")
-        print_sse_status("输入", message, "magenta")
-    elif event_type == "memory_item":
-        print_sse_status("记忆", f"已沉淀记忆: {data.get('content', '')[:50]}", "green")
+    return render_stream_event(event, output_json, done_message="任务执行完毕")

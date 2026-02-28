@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """CLI 命令集成测试（使用 mock ApiClient）。"""
 
-import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from backend.src.cli.client import ApiClient, CliError
+from backend.src.cli.client import ApiClient
 from backend.src.cli.main import cli
+from backend.src.cli.sse import SseEvent
 
 
 class _MockClient:
@@ -16,6 +16,8 @@ class _MockClient:
 
     def __init__(self, responses: dict | None = None):
         self._responses = responses or {}
+        self.last_stream_path = None
+        self.last_stream_json = None
 
     def _lookup(self, path: str) -> dict:
         for key, val in self._responses.items():
@@ -35,16 +37,25 @@ class _MockClient:
     def delete(self, path):
         return self._lookup(path)
 
+    def stream_post(self, path, json_data=None):
+        self.last_stream_path = path
+        self.last_stream_json = json_data
+        stream = self._lookup(path)
+        if isinstance(stream, list):
+            for event in stream:
+                yield event
+
 
 def _invoke(args: list, responses: dict | None = None, catch_exceptions: bool = False):
     """辅助函数：使用 CliRunner 调用 CLI 并注入 mock client。"""
+    result, _ = _invoke_with_client(args, responses=responses, catch_exceptions=catch_exceptions)
+    return result
+
+
+def _invoke_with_client(args: list, responses: dict | None = None, catch_exceptions: bool = False):
+    """辅助函数：返回 CLI 结果和 mock client，便于断言请求参数。"""
     runner = CliRunner()
     mock_client = _MockClient(responses)
-
-    def inject_client(ctx):
-        ctx.ensure_object(dict)
-        ctx.obj["client"] = mock_client
-        ctx.obj["output_json"] = "--json" in args
 
     # 注入 mock client 到 click context
     with patch.object(ApiClient, "__init__", lambda self, **kw: None):
@@ -52,8 +63,9 @@ def _invoke(args: list, responses: dict | None = None, catch_exceptions: bool = 
             with patch.object(ApiClient, "post", mock_client.post):
                 with patch.object(ApiClient, "patch", mock_client.patch):
                     with patch.object(ApiClient, "delete", mock_client.delete):
-                        result = runner.invoke(cli, args, catch_exceptions=catch_exceptions)
-    return result
+                        with patch.object(ApiClient, "stream_post", mock_client.stream_post):
+                            result = runner.invoke(cli, args, catch_exceptions=catch_exceptions)
+    return result, mock_client
 
 
 class TestHealthCommand(unittest.TestCase):
@@ -143,21 +155,42 @@ class TestTaskCommands(unittest.TestCase):
         tasks = [
             {"id": 1, "title": "测试任务", "status": "queued", "created_at": "2026-01-01T00:00:00"},
         ]
-        result = _invoke(["task", "list"], responses={"/tasks": {"tasks": tasks}})
+        result = _invoke(["task", "list"], responses={"/tasks": {"items": tasks}})
         self.assertEqual(result.exit_code, 0)
         self.assertIn("测试任务", result.output)
 
     def test_task_create(self):
-        result = _invoke(["task", "create", "新任务"], responses={"/tasks": {"id": 5}})
+        result = _invoke(["task", "create", "新任务"], responses={"/tasks": {"task": {"id": 5, "title": "新任务"}}})
         self.assertEqual(result.exit_code, 0)
         self.assertIn("5", result.output)
+
+    def test_task_get(self):
+        task = {"id": 2, "title": "详情任务", "status": "queued", "created_at": "2026-01-01T00:00:00"}
+        result = _invoke(["task", "get", "2"], responses={"/tasks/2": {"task": task}})
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("详情任务", result.output)
 
     def test_task_summary(self):
         result = _invoke(
             ["task", "summary"],
-            responses={"/tasks/summary": {"total": 10, "done": 5}},
+            responses={"/tasks/summary": {"count": 10, "current": "doing"}},
         )
         self.assertEqual(result.exit_code, 0)
+
+    def test_task_list_invalid_shape_fails(self):
+        result = _invoke(["task", "list"], responses={"/tasks": {"tasks": []}})
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("缺少 items 列表", result.output)
+
+    def test_task_create_invalid_shape_fails(self):
+        result = _invoke(["task", "create", "新任务"], responses={"/tasks": {"id": 1}})
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("缺少 task 对象", result.output)
+
+    def test_task_get_invalid_shape_fails(self):
+        result = _invoke(["task", "get", "1"], responses={"/tasks/1": {"id": 1}})
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("缺少 task 对象", result.output)
 
 
 class TestSkillCommands(unittest.TestCase):
@@ -192,19 +225,108 @@ class TestSearchCommand(unittest.TestCase):
 
     def test_search(self):
         results = {
-            "memories": [{"id": 1, "content": "Python 记忆"}],
+            "memory": [{"id": 1, "content": "Python 记忆"}],
             "skills": [],
-            "graph_nodes": [],
+            "graph": {"nodes": [], "edges": []},
         }
         result = _invoke(["search", "Python"], responses={"/search": results})
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Python", result.output)
 
     def test_search_no_results(self):
-        results = {"memories": [], "skills": [], "graph_nodes": []}
+        results = {"memory": [], "skills": [], "graph": {"nodes": [], "edges": []}}
         result = _invoke(["search", "不存在"], responses={"/search": results})
         self.assertEqual(result.exit_code, 0)
         self.assertIn("未找到", result.output)
+
+
+class TestStreamCommands(unittest.TestCase):
+    def test_ask_stream_renders_plan_delta_and_need_input(self):
+        events = [
+            SseEvent(
+                event="message",
+                data='{"type":"plan_delta","changes":[{"id":1,"step_order":1,"status":"running","title":"步骤A"}]}',
+                json_data={
+                    "type": "plan_delta",
+                    "changes": [{"id": 1, "step_order": 1, "status": "running", "title": "步骤A"}],
+                },
+            ),
+            SseEvent(
+                event="message",
+                data='{"type":"need_input","question":"请选择方案","choices":[{"label":"默认方案","value":"default"}]}',
+                json_data={
+                    "type": "need_input",
+                    "question": "请选择方案",
+                    "choices": [{"label": "默认方案", "value": "default"}],
+                    "prompt_token": "tok_1",
+                    "session_key": "sess_1",
+                },
+            ),
+            SseEvent(event="done", data='{"type":"done"}', json_data={"type": "done"}),
+        ]
+        result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("步骤A [running]", result.output)
+        self.assertIn("请选择方案", result.output)
+        self.assertIn("默认方案", result.output)
+        self.assertIn("prompt_token: tok_1", result.output)
+
+    def test_ask_stream_without_done_fails(self):
+        events = [
+            SseEvent(event="message", data='{"delta":"still running"}', json_data={"delta": "still running"}),
+        ]
+        result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("未收到 done 事件", result.output)
+
+    def test_resume_stream_command_exists(self):
+        events = [
+            SseEvent(event="message", data='{"delta":"running..."}', json_data={"delta": "running..."}),
+            SseEvent(event="done", data='{"type":"done"}', json_data={"type": "done"}),
+        ]
+        result = _invoke(
+            ["resume", "12", "继续执行", "--prompt-token", "tok", "--session-key", "sess"],
+            responses={"/agent/command/resume/stream": events},
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("恢复执行完毕", result.output)
+
+    def test_ask_stream_payload_supports_parameters_and_think_config(self):
+        events = [SseEvent(event="done", data='{"type":"done"}', json_data={"type": "done"})]
+        result, mock_client = _invoke_with_client(
+            [
+                "ask",
+                "测试",
+                "--parameters-json",
+                '{"temperature":0.2}',
+                "--think-config-json",
+                '{"parallel":2}',
+            ],
+            responses={"/agent/command/stream": events},
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_client.last_stream_path, "/agent/command/stream")
+        self.assertEqual(mock_client.last_stream_json.get("parameters"), {"temperature": 0.2})
+        self.assertEqual(mock_client.last_stream_json.get("think_config"), {"parallel": 2})
+
+    def test_task_execute_stream_payload_supports_options(self):
+        events = [SseEvent(event="done", data='{"type":"done"}', json_data={"type": "done"})]
+        result, mock_client = _invoke_with_client(
+            ["task", "execute", "9", "--run-summary", "ok", "--max-retries", "2", "--on-failure", "continue"],
+            responses={"/tasks/9/execute/stream": events},
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_client.last_stream_path, "/tasks/9/execute/stream")
+        self.assertEqual(
+            mock_client.last_stream_json,
+            {"run_summary": "ok", "max_retries": 2, "on_failure": "continue"},
+        )
+
+    def test_task_execute_stream_without_done_fails(self):
+        events = [SseEvent(event="message", data='{"delta":"running"}', json_data={"delta": "running"})]
+        result = _invoke(["task", "execute", "9"], responses={"/tasks/9/execute/stream": events})
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("未收到 done 事件", result.output)
 
 
 class TestConfigCommands(unittest.TestCase):

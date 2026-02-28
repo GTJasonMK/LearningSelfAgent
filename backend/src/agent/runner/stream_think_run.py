@@ -107,6 +107,13 @@ logger = logging.getLogger(__name__)
 NON_FATAL_STREAM_ERRORS = (sqlite3.Error, RuntimeError, TypeError, ValueError, OSError, AttributeError, ImportError)
 
 
+def _log_text_brief(value: object, limit: int = 120) -> str:
+    text = str(value or "").strip().replace("\n", "\\n")
+    if len(text) <= int(limit):
+        return text
+    return f"{text[: int(limit)]}..."
+
+
 @require_write_permission_stream
 def stream_agent_think_command(payload: AgentCommandStreamRequest):
     """
@@ -189,6 +196,15 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
             task_id = int(startup.task_id)
             run_id = int(startup.run_id)
             run_ctx = startup.run_ctx
+            logger.info(
+                "[agent.think] start task_id=%s run_id=%s model=%s max_steps=%s dry_run=%s planners=%s",
+                task_id,
+                run_id,
+                model,
+                normalized_max_steps,
+                dry_run,
+                think_config.get_planner_count(),
+            )
             for event in startup.emitted_events:
                 yield str(event)
             # 工具清单会在“方案匹配”之后汇总（方案提到的工具优先）
@@ -279,6 +295,12 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                     wait_result = event_payload
                 if wait_result is None:
                     raise RuntimeError("think pending_planning waiting 结果为空")
+                logger.info(
+                    "[agent.think] waiting_user_input task_id=%s run_id=%s question=%s",
+                    task_id,
+                    run_id,
+                    _log_text_brief(user_prompt_question),
+                )
                 await lifecycle.release_queue_ticket_once()
                 return
 
@@ -367,6 +389,11 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 if status_event:
                     yield status_event
                 yield lifecycle.emit(sse_json({"message": "Think 模式规划失败：未生成有效计划"}, event="error"))
+                logger.warning(
+                    "[agent.think] planning_failed_empty task_id=%s run_id=%s",
+                    task_id,
+                    run_id,
+                )
                 await lifecycle.release_queue_ticket_once()
                 return
 
@@ -418,6 +445,14 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 plan_artifacts=list(plan_artifacts or []),
             )
             plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
+            logger.info(
+                "[agent.think] plan_ready task_id=%s run_id=%s steps=%s artifacts=%s winner=%s",
+                task_id,
+                run_id,
+                len(plan_titles or []),
+                len(plan_artifacts or []),
+                str(think_plan_result.winning_planner_id or ""),
+            )
 
             yield lifecycle.emit(sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items}))
 
@@ -474,6 +509,12 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 status_event = lifecycle.emit_run_status(run_status)
                 if status_event:
                     yield status_event
+                logger.info(
+                    "[agent.think] done_dry_run task_id=%s run_id=%s status=%s",
+                    task_id,
+                    run_id,
+                    RUN_STATUS_DONE,
+                )
                 await lifecycle.release_queue_ticket_once()
                 return
 
@@ -544,6 +585,12 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
             if think_result is None:
                 raise RuntimeError("think execution 结果为空")
             run_status = str(think_result.run_status or "")
+            logger.info(
+                "[agent.think] execution_done task_id=%s run_id=%s status=%s",
+                task_id,
+                run_id,
+                run_status,
+            )
             if not isinstance(getattr(think_result, "plan_struct", None), PlanStructure):
                 raise RuntimeError("think 执行器返回缺少有效 plan_struct")
             plan_struct = think_result.plan_struct
@@ -568,12 +615,20 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                     status_event = lifecycle.emit_run_status(run_status)
                     if status_event:
                         yield status_event
+            logger.info(
+                "[agent.think] finalized task_id=%s run_id=%s status=%s",
+                task_id,
+                run_id,
+                run_status,
+            )
 
         except (asyncio.CancelledError, GeneratorExit):
+            logger.info("[agent.think] cancelled task_id=%s run_id=%s", task_id, run_id)
             handle_stream_cancellation(task_id=task_id, run_id=run_id, reason="agent_think_stream_cancelled")
             await lifecycle.release_queue_ticket_once()
             raise
         except Exception as exc:
+            logger.exception("[agent.think] exception task_id=%s run_id=%s error=%s", task_id, run_id, exc)
             async for chunk in iter_stream_exception_tail(
                 lifecycle=lifecycle,
                 exc=exc,

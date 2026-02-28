@@ -79,16 +79,44 @@ def remove_path(path: Path, removed: list[str]) -> None:
         removed.append(str(path))
 
 
-def remove_glob(root: Path, pattern: str, keep_names: set[str], removed: list[str]) -> None:
+def _rel_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root)).replace("\\", "/")
+    except Exception:
+        return str(path).replace("\\", "/")
+
+
+def remove_glob(
+    root: Path,
+    pattern: str,
+    keep_names: set[str],
+    removed: list[str],
+    decisions: list[str] | None = None,
+    keep_reason: str = "kept_by_name",
+    delete_reason: str = "matched_pattern",
+) -> None:
+    if not root.exists():
+        return
     for item in root.glob(pattern):
+        rel = _rel_path(item, root)
         if item.name in keep_names:
+            if decisions is not None:
+                decisions.append(f"KEEP {rel} [{keep_reason}]")
             continue
-        if item.is_file():
-            item.unlink(missing_ok=True)
-            removed.append(str(item))
-        elif item.is_dir():
-            shutil.rmtree(item, ignore_errors=True)
-            removed.append(str(item))
+        try:
+            if item.is_file():
+                item.unlink(missing_ok=True)
+                removed.append(str(item))
+                if decisions is not None:
+                    decisions.append(f"DELETE {rel} [{delete_reason}]")
+            elif item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+                removed.append(str(item))
+                if decisions is not None:
+                    decisions.append(f"DELETE {rel} [{delete_reason}]")
+        except Exception:
+            if decisions is not None:
+                decisions.append(f"KEEP {rel} [delete_failed]")
 
 
 def _read_frontmatter_meta(path: Path) -> dict:
@@ -133,25 +161,194 @@ def _is_draft_tool_file(path: Path) -> bool:
     return str(approval.get("status") or "").strip().lower() == "draft"
 
 
-def remove_draft_tool_files(prompt_root: Path, removed: list[str]) -> None:
+def remove_draft_tool_files(
+    prompt_root: Path,
+    removed: list[str],
+    tool_decisions: list[str],
+) -> None:
     tools_root = prompt_root / "tools"
     if not tools_root.exists():
         return
     for path in tools_root.rglob("*.md"):
         if not path.is_file():
             continue
+        rel = _rel_path(path, prompt_root)
         name = path.name.lower()
         if name in {"readme.md", "_readme.md"}:
+            tool_decisions.append(f"KEEP {rel} [readme]")
             continue
         # 跳过隐藏目录/文件（例如 .trash）
         if any(part.startswith(".") for part in path.parts):
+            tool_decisions.append(f"KEEP {rel} [hidden_path]")
             continue
         if _is_draft_tool_file(path):
             try:
                 path.unlink(missing_ok=True)
                 removed.append(str(path))
+                tool_decisions.append(f"DELETE {rel} [draft_tool]")
             except Exception:
-                pass
+                tool_decisions.append(f"KEEP {rel} [delete_failed]")
+        else:
+            tool_decisions.append(f"KEEP {rel} [approved_or_builtin]")
+
+
+def _as_lowered_text_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            text = str(item or "").strip().lower()
+            if text:
+                out.append(text)
+        return out
+    text = str(value or "").strip().lower()
+    if not text:
+        return []
+    if "," in text:
+        return [s.strip().lower() for s in text.split(",") if s.strip()]
+    return [text]
+
+
+def _parse_positive_int(value: object) -> int:
+    try:
+        num = int(value)
+    except Exception:
+        return 0
+    return num if num > 0 else 0
+
+
+def _is_system_skill_file(path: Path, skills_root: Path) -> bool:
+    """
+    判断 skills/*.md 是否为系统技能文件（reset 时保留）。
+
+    判定规则（任一命中即保留）：
+    1) 路径位于 skills/system/**；
+    2) frontmatter 的 scope/category/domain(_id) 以 system 开头；
+    3) tags 包含 system / system:* / domain:system。
+    """
+    try:
+        rel = path.relative_to(skills_root)
+        parts = [str(p).strip().lower() for p in rel.parts if str(p).strip()]
+    except Exception:
+        parts = [str(path.name).strip().lower()]
+    if parts and parts[0] == "system":
+        return True
+
+    meta = _read_frontmatter_meta(path)
+    if not isinstance(meta, dict):
+        return False
+
+    scope = str(meta.get("scope") or "").strip().lower()
+    category = str(meta.get("category") or "").strip().lower()
+    domain = str(meta.get("domain_id") or meta.get("domain") or "").strip().lower()
+    for value in (scope, category, domain):
+        if value == "system" or value.startswith("system."):
+            return True
+
+    tags = _as_lowered_text_list(meta.get("tags"))
+    for tag in tags:
+        if tag == "system" or tag.startswith("system:") or tag.startswith("domain:system"):
+            return True
+
+    return False
+
+
+def _is_generated_skill_file(path: Path) -> bool:
+    """
+    判断 skill 是否由运行期自动生成（reset 时可清理）。
+
+    判定规则（任一命中即视为 generated）：
+    1) source_task_id/source_run_id 为正整数；
+    2) scope 以 tool: 或 solution:run: 开头；
+    3) tags 包含 task:* 或 run:*。
+    """
+    meta = _read_frontmatter_meta(path)
+    if not isinstance(meta, dict):
+        return False
+
+    if _parse_positive_int(meta.get("source_task_id")) > 0:
+        return True
+    if _parse_positive_int(meta.get("source_run_id")) > 0:
+        return True
+
+    scope = str(meta.get("scope") or "").strip().lower()
+    if scope.startswith("tool:") or scope.startswith("solution:run:"):
+        return True
+
+    tags = _as_lowered_text_list(meta.get("tags"))
+    for tag in tags:
+        if tag.startswith("task:") or tag.startswith("run:"):
+            return True
+
+    return False
+
+
+def remove_non_system_skill_files(
+    prompt_root: Path,
+    removed: list[str],
+    skill_decisions: list[str],
+) -> None:
+    """
+    清理 skills 目录中的“自动生成且非系统”的技能文件。
+
+    说明：
+    - 系统 skill 始终保留；
+    - 未标记为 generated 的 skill 默认保留（避免误删手工维护/内置技能）。
+    """
+    skills_root = prompt_root / "skills"
+    if not skills_root.exists():
+        return
+
+    for path in skills_root.rglob("*.md"):
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if name in {"readme.md", "_readme.md"}:
+            continue
+        if any(part.startswith(".") for part in path.parts):
+            continue
+        rel = _rel_path(path, prompt_root)
+        if _is_system_skill_file(path, skills_root):
+            skill_decisions.append(f"KEEP {rel} [system_skill]")
+            continue
+        if not _is_generated_skill_file(path):
+            skill_decisions.append(f"KEEP {rel} [non_generated_or_curated]")
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed.append(str(path))
+            skill_decisions.append(f"DELETE {rel} [generated_non_system]")
+        except Exception:
+            skill_decisions.append(f"KEEP {rel} [delete_failed]")
+            pass
+
+
+def restore_system_skills_into_db(prompt_root: Path, removed: list[str], warnings: list[str]) -> None:
+    """
+    将保留下来的系统 skill 文件同步回 DB，避免 reset 后 skills_items 全空。
+    """
+    skills_root = prompt_root / "skills"
+    if not skills_root.exists():
+        return
+    try:
+        from backend.src.services.skills.skills_sync import sync_skills_from_files
+    except Exception as exc:
+        warnings.append(f"skills_sync_import_failed: {exc}")
+        return
+
+    try:
+        result = sync_skills_from_files(base_dir=skills_root, prune=True)
+        inserted = int(result.get("inserted") or 0)
+        updated = int(result.get("updated") or 0)
+        deleted = int(result.get("deleted") or 0)
+        if inserted > 0 or updated > 0 or deleted > 0:
+            removed.append(
+                "skills_items 同步完成"
+                f" (inserted={inserted}, updated={updated}, deleted={deleted})"
+            )
+    except Exception as exc:
+        warnings.append(f"skills_sync_failed: {exc}")
 
 
 def _now_tag() -> str:
@@ -326,6 +523,9 @@ def _rebuild_db_with_preserved_tables(
 def main() -> None:
     removed: list[str] = []
     warnings: list[str] = []
+    memory_decisions: list[str] = []
+    tool_decisions: list[str] = []
+    skill_decisions: list[str] = []
 
     # 清理 SQLite 数据库（仅保留配置）
     db_path = resolve_target_db_path()
@@ -431,16 +631,43 @@ def main() -> None:
     # 清理 prompt 数据（保留 README）
     prompt_root = resolve_target_prompt_root()
     # memory：允许层级目录（未来扩展），统一用 **/*.md
-    remove_glob(prompt_root, "memory/**/*.md", {"README.md"}, removed)
+    remove_glob(
+        prompt_root,
+        "memory/**/*.md",
+        {"README.md"},
+        removed,
+        decisions=memory_decisions,
+        keep_reason="readme",
+        delete_reason="memory_data",
+    )
     # tools：只清理 draft 工具，保留内置/已批准工具（避免系统资源被 reset 掉）
-    remove_draft_tool_files(prompt_root, removed)
-    remove_glob(prompt_root, "skills/**/*.md", {"README.md"}, removed)
+    remove_draft_tool_files(prompt_root, removed, tool_decisions)
+    # skills：仅清理“自动生成且非系统”的技能，保留系统/手工维护技能
+    remove_non_system_skill_files(prompt_root, removed, skill_decisions)
     remove_glob(prompt_root, "graph/nodes/**/*.md", {"README.md"}, removed)
     remove_glob(prompt_root, "graph/edges/**/*.md", {"README.md"}, removed)
 
     # 清理 .trash
     for trash_dir in prompt_root.rglob(".trash"):
         remove_path(trash_dir, removed)
+
+    # 回灌系统 skill 到 DB（保证 reset 后系统技能可立即检索）
+    restore_system_skills_into_db(prompt_root, removed, warnings)
+
+    if memory_decisions:
+        print("memory 判定：")
+        for item in memory_decisions:
+            print(f"- {item}")
+
+    if tool_decisions:
+        print("tools 判定：")
+        for item in tool_decisions:
+            print(f"- {item}")
+
+    if skill_decisions:
+        print("skills 判定：")
+        for item in skill_decisions:
+            print(f"- {item}")
 
     print("已清理 Agent 数据，恢复初始状态。")
     if removed:

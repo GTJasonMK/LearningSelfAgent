@@ -37,6 +37,35 @@ class TestPlanStructure(unittest.TestCase):
         self.assertEqual(allows[0], ["tool_call"])
         self.assertEqual(allows[1], [])
 
+    def test_user_prompt_step_prefers_structured_prompt_over_title(self):
+        plan = PlanStructure.from_agent_plan_payload(
+            {
+                "titles": ["确认信息"],
+                "items": [
+                    {
+                        "title": "确认信息",
+                        "brief": "补充信息",
+                        "allow": ["user_prompt"],
+                        "status": "pending",
+                        "kind": "user_prompt",
+                        "prompt": {
+                            "question": "请确认价格口径",
+                            "kind": "knowledge_sufficiency",
+                            "choices": [{"label": "继续", "value": "proceed"}],
+                        },
+                    }
+                ],
+                "allows": [["user_prompt"]],
+                "artifacts": [],
+            }
+        )
+        _, items, _, _ = plan.to_legacy_lists()
+        self.assertEqual(items[0].get("kind"), "user_prompt")
+        prompt = items[0].get("prompt") if isinstance(items[0].get("prompt"), dict) else {}
+        self.assertEqual(prompt.get("question"), "请确认价格口径")
+        self.assertEqual(prompt.get("kind"), "knowledge_sufficiency")
+        self.assertTrue(isinstance(prompt.get("choices"), list) and len(prompt.get("choices")) == 1)
+
 
 class TestPlanStructureMutationAPI(unittest.TestCase):
     """PlanStructure 变更 API 测试。"""

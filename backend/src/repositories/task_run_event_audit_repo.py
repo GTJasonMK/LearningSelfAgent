@@ -29,6 +29,17 @@ def _resolve_audit_dir(explicit_dir: Optional[str] = None) -> str:
     return str((base / "run_events_audit").resolve())
 
 
+def _normalize_session_part(session_key: Optional[str]) -> str:
+    raw = str(session_key or "").strip()
+    if not raw:
+        return ""
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw)
+    safe = safe.strip("._")
+    if not safe:
+        return ""
+    return safe[:64]
+
+
 def append_task_run_event_audit(
     *,
     task_id: int,
@@ -59,7 +70,9 @@ def append_task_run_event_audit(
 
     run_value = int(run_id)
     task_value = int(task_id)
-    output_path = Path(out_dir) / f"run_{run_value}.jsonl"
+    session_part = _normalize_session_part(session_key)
+    filename = f"run_{run_value}_{session_part}.jsonl" if session_part else f"run_{run_value}.jsonl"
+    output_path = Path(out_dir) / filename
 
     row = {
         "row_id": int(row_id) if row_id is not None else None,
@@ -79,4 +92,3 @@ def append_task_run_event_audit(
             fh.write(json.dumps(row, ensure_ascii=False))
             fh.write("\n")
     return str(output_path)
-

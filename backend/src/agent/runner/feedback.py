@@ -55,7 +55,18 @@ def append_task_feedback_step(
 
     plan_titles.append(title)
     plan_allows.append([ACTION_TYPE_USER_PROMPT])
-    plan_items.append({"id": 0, "brief": brief, "status": "pending"})
+    plan_items.append(
+        {
+            "id": 0,
+            "brief": brief,
+            "status": "pending",
+            "kind": "task_feedback",
+            "prompt": {
+                "question": build_task_feedback_question(),
+                "kind": task_feedback_need_input_kind(),
+            },
+        }
+    )
 
     # 重新编号：保持 plan_items.id 与顺序一致
     for idx, item in enumerate(plan_items, start=1):

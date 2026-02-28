@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,24 @@ _PLAN_STATUS_ALLOWED = {
     "done",
     "failed",
     "skipped",
+}
+
+
+_PLAN_STEP_KIND_ALLOWED = {
+    "user_prompt",
+    "task_feedback",
+    "tool_call",
+    "shell_command",
+    "task_output",
+    "llm_call",
+    "file_write",
+    "file_read",
+    "file_append",
+    "file_list",
+    "file_delete",
+    "http_request",
+    "json_parse",
+    "memory_write",
 }
 
 # 合法的状态转移表：key 为当前状态，value 为允许的目标状态集合。
@@ -80,6 +99,58 @@ def _normalize_allow_list(raw_allow: object) -> List[str]:
     return result
 
 
+def _normalize_step_kind(raw_kind: object, *, allow: List[str], title: str) -> str:
+    direct = str(raw_kind or "").strip()
+    if direct:
+        normalized = normalize_action_type(direct)
+        if normalized:
+            return normalized
+        lowered = direct.lower()
+        if lowered in _PLAN_STEP_KIND_ALLOWED:
+            return lowered
+    if len(allow or []) == 1:
+        only = str((allow or [])[0] or "").strip().lower()
+        if only:
+            return only
+    title_text = str(title or "").strip()
+    match = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*[:：]", title_text)
+    if match:
+        prefix = str(match.group(1) or "").strip()
+        normalized_prefix = normalize_action_type(prefix)
+        if normalized_prefix:
+            return normalized_prefix
+    return ""
+
+
+def _normalize_prompt_payload(raw_prompt: object) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_prompt, dict):
+        return None
+    question = str(raw_prompt.get("question") or "").strip()
+    if not question:
+        return None
+    payload: Dict[str, Any] = {"question": question}
+    kind = str(raw_prompt.get("kind") or "").strip()
+    if kind:
+        payload["kind"] = kind
+    choices = raw_prompt.get("choices")
+    if isinstance(choices, list) and choices:
+        payload["choices"] = list(choices)
+    return payload
+
+
+def _prompt_from_user_prompt_title(title: str) -> Optional[Dict[str, Any]]:
+    text = str(title or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^user_prompt\s*[:：]\s*(.+)$", text, re.IGNORECASE)
+    if not match:
+        return None
+    question = str(match.group(1) or "").strip()
+    if not question:
+        return None
+    return {"question": question}
+
+
 def _normalize_artifacts(values: Optional[Iterable[object]]) -> List[str]:
     out: List[str] = []
     for item in values or []:
@@ -109,15 +180,24 @@ class PlanStep:
     brief: str
     allow: List[str]
     status: str = "pending"
+    kind: str = ""
+    prompt: Optional[Dict[str, Any]] = None
 
     def to_item(self) -> dict:
-        return {
+        item = {
             "id": int(self.id),
             "title": str(self.title),
             "brief": str(self.brief),
             "allow": list(self.allow or []),
             "status": str(self.status),
         }
+        kind_value = str(self.kind or "").strip()
+        if kind_value:
+            item["kind"] = kind_value
+        prompt_value = _normalize_prompt_payload(self.prompt)
+        if prompt_value:
+            item["prompt"] = prompt_value
+        return item
 
 
 @dataclass
@@ -154,6 +234,8 @@ class PlanStructure:
             brief = str(item.get("brief") or "").strip() or _fallback_brief_from_title(title)
             allow = allows[idx - 1] if idx - 1 < len(allows) else _normalize_allow_list(item.get("allow"))
             status = _normalize_status(item.get("status"))
+            kind = _normalize_step_kind(item.get("kind"), allow=list(allow or []), title=title)
+            prompt = _normalize_prompt_payload(item.get("prompt"))
             steps.append(
                 PlanStep(
                     id=idx,
@@ -161,6 +243,8 @@ class PlanStructure:
                     brief=brief,
                     allow=list(allow or []),
                     status=status,
+                    kind=kind,
+                    prompt=prompt,
                 )
             )
 
@@ -172,7 +256,19 @@ class PlanStructure:
                 brief = str(item.get("brief") or "").strip() or _fallback_brief_from_title(title)
                 allow = _normalize_allow_list(item.get("allow"))
                 status = _normalize_status(item.get("status"))
-                steps.append(PlanStep(id=idx, title=title, brief=brief, allow=allow, status=status))
+                kind = _normalize_step_kind(item.get("kind"), allow=list(allow or []), title=title)
+                prompt = _normalize_prompt_payload(item.get("prompt"))
+                steps.append(
+                    PlanStep(
+                        id=idx,
+                        title=title,
+                        brief=brief,
+                        allow=allow,
+                        status=status,
+                        kind=kind,
+                        prompt=prompt,
+                    )
+                )
 
         normalized_artifacts = _normalize_artifacts(artifacts_raw if isinstance(artifacts_raw, list) else [])
         plan = cls(steps=steps, artifacts=normalized_artifacts)
@@ -198,6 +294,8 @@ class PlanStructure:
             brief = str(item.get("brief") or "").strip() or _fallback_brief_from_title(title)
             allow = _normalize_allow_list(allows[idx - 1] if idx - 1 < len(allows) else item.get("allow"))
             status = _normalize_status(item.get("status"))
+            kind = _normalize_step_kind(item.get("kind"), allow=list(allow or []), title=title)
+            prompt = _normalize_prompt_payload(item.get("prompt"))
             steps.append(
                 PlanStep(
                     id=idx,
@@ -205,6 +303,8 @@ class PlanStructure:
                     brief=brief,
                     allow=list(allow or []),
                     status=status,
+                    kind=kind,
+                    prompt=prompt,
                 )
             )
 
@@ -229,6 +329,13 @@ class PlanStructure:
 
             step.allow = _normalize_allow_list(step.allow)
             step.status = _normalize_status(step.status)
+            step.kind = _normalize_step_kind(step.kind, allow=list(step.allow or []), title=title)
+            step.prompt = _normalize_prompt_payload(step.prompt)
+            if step.kind == "user_prompt" and not step.prompt:
+                step.prompt = _prompt_from_user_prompt_title(title)
+            if step.kind not in {"user_prompt", "task_feedback"} and step.prompt:
+                # 仅交互类步骤维护 prompt 结构，避免语义漂移。
+                step.prompt = None
             step.id = idx
 
         self.artifacts = _normalize_artifacts(self.artifacts)
@@ -242,6 +349,8 @@ class PlanStructure:
                     brief=str(step.brief),
                     allow=list(step.allow or []),
                     status=str(step.status or "pending"),
+                    kind=str(step.kind or ""),
+                    prompt=dict(step.prompt) if isinstance(step.prompt, dict) else None,
                 )
                 for step in (self.steps or [])
             ],
@@ -256,15 +365,20 @@ class PlanStructure:
         for step in self.steps:
             titles.append(str(step.title))
             allows.append(list(step.allow or []))
-            items.append(
-                {
-                    "id": int(step.id),
-                    "title": str(step.title),
-                    "brief": str(step.brief),
-                    "allow": list(step.allow or []),
-                    "status": str(step.status),
-                }
-            )
+            item = {
+                "id": int(step.id),
+                "title": str(step.title),
+                "brief": str(step.brief),
+                "allow": list(step.allow or []),
+                "status": str(step.status),
+            }
+            kind_value = str(step.kind or "").strip()
+            if kind_value:
+                item["kind"] = kind_value
+            prompt_value = _normalize_prompt_payload(step.prompt)
+            if prompt_value:
+                item["prompt"] = prompt_value
+            items.append(item)
         return titles, items, allows, list(self.artifacts or [])
 
     def to_agent_plan_payload(self) -> dict:

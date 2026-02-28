@@ -77,7 +77,7 @@ def _handle_cli_error(func):
 
 def _register_commands() -> None:
     """延迟导入并注册所有子命令，避免循环导入。"""
-    from backend.src.cli.commands.agent import ask
+    from backend.src.cli.commands.agent import ask, resume
     from backend.src.cli.commands.chat import chat
     from backend.src.cli.commands.config import config
     from backend.src.cli.commands.graph import graph
@@ -88,6 +88,7 @@ def _register_commands() -> None:
     from backend.src.cli.commands.task import task
 
     cli.add_command(ask)
+    cli.add_command(resume)
     cli.add_command(task)
     cli.add_command(memory)
     cli.add_command(skill)

@@ -35,6 +35,8 @@ class PlanCoordinator:
                     brief=str(step.brief),
                     allow=list(step.allow or []),
                     status=status,
+                    kind=str(getattr(step, "kind", "") or ""),
+                    prompt=dict(getattr(step, "prompt")) if isinstance(getattr(step, "prompt", None), dict) else None,
                 )
             )
 
@@ -53,6 +55,8 @@ class PlanCoordinator:
                     brief=brief,
                     allow=allow,
                     status="pending",
+                    kind=str(raw_item.get("kind") or "").strip(),
+                    prompt=dict(raw_item.get("prompt")) if isinstance(raw_item.get("prompt"), dict) else None,
                 )
             )
 

@@ -14,6 +14,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -69,7 +70,9 @@ def print_sse_delta(text: str) -> None:
 
 def print_sse_status(label: str, message: str, style: str = "cyan") -> None:
     """SSE 状态行输出。"""
-    console.print(f"[{style}][{label}][/{style}] {message}")
+    safe_label = rich_escape(str(label))
+    safe_message = rich_escape(str(message))
+    console.print(f"[{style}][{safe_label}][/{style}] {safe_message}")
 
 
 # ── 任务相关 ──
@@ -255,13 +258,23 @@ def print_graph_edges_table(edges: List[Dict[str, Any]]) -> None:
 
 def print_search_results(results: Dict[str, Any]) -> None:
     """分组展示统一搜索结果。"""
+    memory_items = results.get("memory", [])
+    skill_items = results.get("skills", [])
+    graph = results.get("graph", {})
+    graph_nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
+
     has_results = False
     for section_key, section_title in [
-        ("memories", "记忆"),
+        ("memory", "记忆"),
         ("skills", "技能"),
         ("graph_nodes", "图谱节点"),
     ]:
-        items = results.get(section_key, [])
+        if section_key == "memory":
+            items = memory_items
+        elif section_key == "skills":
+            items = skill_items
+        else:
+            items = graph_nodes
         if not items:
             continue
         has_results = True

@@ -36,7 +36,10 @@ from backend.src.agent.runner.react_step_executor import (
     yield_memory_write_event,
     yield_visible_result,
 )
-from backend.src.agent.runner.react_helpers import build_react_step_prompt
+from backend.src.agent.runner.react_helpers import (
+    build_react_step_prompt,
+    resolve_direct_user_prompt_payload,
+)
 from backend.src.agent.runner.capability_router import build_capability_hint, resolve_step_capability
 from backend.src.agent.runner.plan_events import sse_plan_delta
 from backend.src.agent.runner.react_state_manager import persist_loop_state
@@ -325,11 +328,15 @@ def _build_dependency_map(
         for j in range(0, out_idx):
             dep_sets[out_idx].add(j)
 
-    # 确认满意度（user_prompt）也必须最后（依赖 task_output + 全部前置）
-    if plan_titles and is_task_feedback_step_title(str(plan_titles[-1] or "")):
-        feedback_idx = len(plan_titles) - 1
-        for j in range(0, feedback_idx):
-            dep_sets[feedback_idx].add(j)
+    # 确认满意度（task_feedback）也必须最后（依赖 task_output + 全部前置）
+    feedback_idx = None
+    for idx, step in enumerate(plan_struct.steps):
+        step_kind = str(getattr(step, "kind", "") or "").strip().lower()
+        if step_kind == "task_feedback" or is_task_feedback_step_title(str(step.title or "")):
+            feedback_idx = idx
+    if feedback_idx is not None:
+        for j in range(0, int(feedback_idx)):
+            dep_sets[int(feedback_idx)].add(j)
 
     # 转 list（稳定排序）
     return [sorted(list(s)) for s in dep_sets]
@@ -868,6 +875,36 @@ def run_think_parallel_loop(
             if isinstance(resolved_params, dict):
                 step_overrides = dict(resolved_params)
                 step_params.update(step_overrides)
+
+        # 确定性步骤直通：allow 仅 user_prompt 且标题已携带问题时，不再调用 LLM 生成 action。
+        direct_user_prompt_payload = resolve_direct_user_prompt_payload(
+            step_title=title,
+            allowed_actions=allow,
+            step_prompt=getattr(step_obj, "prompt", None),
+        )
+        if isinstance(direct_user_prompt_payload, dict):
+            safe_write_debug(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                message="agent.user_prompt.short_circuit",
+                data={"step_order": int(step_order), "title": title, "parallel_role": role},
+                level="info",
+            )
+            for msg in handle_user_prompt_action(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                step_order=int(step_order),
+                title=title,
+                payload_obj=direct_user_prompt_payload,
+                plan_struct=plan_struct,
+                agent_state=agent_state,
+                safe_write_debug=safe_write_debug,
+                db_lock=db_lock,
+            ):
+                _emit(msg)
+            _wait_run(step_order)
+            _mark_step_finished(idx, "waiting")
+            return
 
         # 构造 prompt（观测取最后 3 条）
         with state_lock:
