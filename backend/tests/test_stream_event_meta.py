@@ -34,6 +34,8 @@ class TestStreamEventMeta(unittest.TestCase):
         self.assertEqual(obj.get("schema_version"), 2)
         self.assertEqual(obj.get("session_key"), "sess_abc")
         self.assertEqual(obj.get("causation_id"), "sess_abc")
+        self.assertEqual(int(obj.get("seq") or 0), 3)
+        self.assertTrue(str(obj.get("trace_id") or "").startswith("trace_"))
         self.assertTrue(str(obj.get("event_id") or "").startswith("sess_abc:2:3:run_created"))
         self.assertTrue(bool(str(obj.get("emitted_at") or "").strip()))
 
@@ -62,6 +64,7 @@ class TestStreamEventMeta(unittest.TestCase):
         obj = _parse_sse_data_json(out)
         self.assertIsNotNone(obj)
         self.assertEqual(obj.get("type"), "error")
+        self.assertEqual(int(obj.get("seq") or 0), 2)
         self.assertTrue(bool(str(obj.get("event_id") or "").strip()))
 
     def test_attach_meta_derives_type_from_done_event_name(self):
@@ -77,6 +80,7 @@ class TestStreamEventMeta(unittest.TestCase):
         obj = _parse_sse_data_json(out)
         self.assertIsNotNone(obj)
         self.assertEqual(obj.get("type"), "stream_end")
+        self.assertEqual(int(obj.get("seq") or 0), 4)
         self.assertTrue(bool(str(obj.get("event_id") or "").strip()))
 
     def test_parse_stream_event_chunk_rejects_unsupported_schema(self):

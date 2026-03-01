@@ -1,10 +1,16 @@
 import asyncio
 import json
-from typing import Generator, List, Optional
+from typing import Any, Generator, List, Optional
 
 from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
 
+from backend.src.agent.runner.execution_pipeline import create_sse_response
+from backend.src.agent.runner.stream_convergence import build_stream_error_payload
+from backend.src.agent.runner.stream_mode_lifecycle import (
+    StreamModeLifecycle,
+    iter_stream_done_tail,
+    iter_stream_exception_tail,
+)
 from backend.src.agent.runner.stream_pump import pump_sync_generator
 from backend.src.actions.executor import _execute_step_action
 from backend.src.api.schemas import TaskExecuteRequest
@@ -12,7 +18,7 @@ from backend.src.api.tasks.route_common import ensure_task_exists_or_error
 from backend.src.common.serializers import task_run_from_row, task_step_from_row
 from backend.src.api.utils import now_iso, require_write_permission
 from backend.src.common.errors import AppError
-from backend.src.common.utils import action_type_from_step_detail, truncate_text
+from backend.src.common.utils import action_type_from_step_detail, parse_positive_int, truncate_text
 from backend.src.constants import (
     ACTION_TYPE_LLM_CALL,
     ACTION_TYPE_SHELL_COMMAND,
@@ -114,6 +120,64 @@ def _build_run_event(
     if created_at is not None:
         payload["created_at"] = str(created_at or "").strip() or None
     return payload
+
+
+def _row_value(row: object, key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]  # type: ignore[index]
+    except Exception:
+        return default
+
+
+def _build_step_error_event(
+    *,
+    task_id: int,
+    run_id: int,
+    step_row: object,
+    action_type: Optional[str],
+    message: str,
+    recoverable: bool,
+) -> dict:
+    step_id = int(parse_positive_int(_row_value(step_row, "id"), default=0) or 0)
+    step_order = int(parse_positive_int(_row_value(step_row, "step_order"), default=0) or 0)
+    error_code = "task_step_failed"
+    error_message = str(message or "")
+    return {
+        "type": "step_error",
+        "task_id": int(task_id),
+        "run_id": int(run_id),
+        "step_id": step_id,
+        "step_order": step_order,
+        "action_type": str(action_type or ""),
+        "code": error_code,
+        "error_code": error_code,
+        "message": error_message,
+        "error_message": error_message,
+        "phase": "task_execute_step",
+        "recoverable": bool(recoverable),
+        "retryable": bool(recoverable),
+        "non_retriable_failure": not bool(recoverable),
+    }
+
+
+def _bind_task_stream_lifecycle(
+    lifecycle: StreamModeLifecycle,
+    *,
+    task_id: int,
+    run_id: int,
+    prime_status: Optional[str] = RUN_STATUS_RUNNING,
+) -> None:
+    lifecycle.task_id = int(task_id)
+    lifecycle.run_id = int(run_id)
+    lifecycle.session_key = f"task_exec:{int(task_id)}:{int(run_id)}"
+    lifecycle.stream_state.bind_run(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        session_key=lifecycle.session_key,
+        prime_status=prime_status,
+    )
 
 
 def _execute_task_with_messages(
@@ -235,6 +299,14 @@ def _execute_task_with_messages(
                                 updated_at=updated_at,
                             )
                             step_completed = True
+                            yield _build_step_error_event(
+                                task_id=int(task_id),
+                                run_id=int(run_id),
+                                step_row=step_row,
+                                action_type=action_type,
+                                message=str(error_message),
+                                recoverable=True,
+                            )
                             yield f"{STREAM_TAG_SKIP} {step_row['title']}（{error_message}）"
                         else:
                             mark_task_step_failed(
@@ -245,6 +317,14 @@ def _execute_task_with_messages(
                             )
                             run_status = RUN_STATUS_FAILED
                             step_completed = True
+                            yield _build_step_error_event(
+                                task_id=int(task_id),
+                                run_id=int(run_id),
+                                step_row=step_row,
+                                action_type=action_type,
+                                message=str(error_message),
+                                recoverable=False,
+                            )
                             yield f"{STREAM_TAG_FAIL} {step_row['title']}（{error_message}）"
                             failed_event = _emit_run_status(RUN_STATUS_FAILED)
                             if failed_event is not None:
@@ -297,7 +377,7 @@ def _execute_task_with_messages(
             except Exception:
                 latest_rows = []
             has_waiting_step = any(
-                str((row or {}).get("status") or "").strip().lower() == STEP_STATUS_WAITING
+                str(_row_value(row, "status", "") or "").strip().lower() == STEP_STATUS_WAITING
                 for row in (latest_rows or [])
             )
             if has_waiting_step:
@@ -322,6 +402,16 @@ def _execute_task_with_messages(
         raise
     except Exception as exc:
         run_status = RUN_STATUS_FAILED
+        yield build_stream_error_payload(
+            error_code="task_execute_unhandled_exception",
+            error_message=f"任务执行异常（{exc}）",
+            phase="task_execute",
+            task_id=task_id,
+            run_id=run_id,
+            recoverable=False,
+            retryable=False,
+            terminal_source="runtime",
+        )
         yield f"{STREAM_TAG_FAIL} 任务执行异常（{exc}）"
         failed_event = _emit_run_status(RUN_STATUS_FAILED)
         if failed_event is not None:
@@ -376,31 +466,15 @@ def _execute_task_with_messages(
     }
 
 
-@router.post("/tasks/{task_id}/execute")
-@require_write_permission
-async def execute_task(task_id: int, payload: Optional[TaskExecuteRequest] = None) -> dict:
-    task_exists_error = ensure_task_exists_or_error(task_id=task_id)
-    if task_exists_error:
-        return task_exists_error
-
-    def _run() -> dict:
-        inner = _execute_task_with_messages(task_id, payload)
-        try:
-            while True:
-                next(inner)
-        except StopIteration as exc:
-            return exc.value or {}
-
-    return await asyncio.to_thread(_run)
-
-
 @router.post("/tasks/{task_id}/execute/stream")
 @require_write_permission
 async def execute_task_stream(task_id: int, payload: Optional[TaskExecuteRequest] = None):
     """
-    执行任务（SSE 流式）：用于桌宠实时显示 step 进度。
+    执行任务（SSE 流式）：用于 workflow/桌宠实时显示 step 进度。
 
-    data: {"delta":"..."} 逐段输出；event: done 表示结束；event: error 表示失败。
+    事件语义与 agent 主链路对齐：
+    - run_created / run_status / step_error（结构化）
+    - stream_end（通过 event: done 回传）
     """
     task_exists_error = ensure_task_exists_or_error(task_id=task_id)
     if task_exists_error:
@@ -408,6 +482,8 @@ async def execute_task_stream(task_id: int, payload: Optional[TaskExecuteRequest
 
     async def gen():
         cancelled = False
+        lifecycle = StreamModeLifecycle()
+        run_status = RUN_STATUS_RUNNING
         try:
             inner = _execute_task_with_messages(task_id, payload)
             async for kind, payload_obj in pump_sync_generator(
@@ -420,51 +496,80 @@ async def execute_task_stream(task_id: int, payload: Optional[TaskExecuteRequest
                     msg = payload_obj
                     if isinstance(msg, dict):
                         msg_type = str(msg.get("type") or "").strip()
+                        msg_task_id = int(parse_positive_int(msg.get("task_id"), default=task_id) or int(task_id))
+                        msg_run_id = int(parse_positive_int(msg.get("run_id"), default=0) or 0)
+                        if lifecycle.run_id is None and msg_run_id > 0:
+                            prime_status = RUN_STATUS_RUNNING if msg_type == "run_created" else ""
+                            _bind_task_stream_lifecycle(
+                                lifecycle,
+                                task_id=msg_task_id,
+                                run_id=msg_run_id,
+                                prime_status=prime_status,
+                            )
+                        if msg_type == "run_status":
+                            status = str(msg.get("status") or "").strip().lower()
+                            if status:
+                                run_status = status
+                                if lifecycle.run_id is not None:
+                                    status_chunk = lifecycle.emit_run_status(status)
+                                    if status_chunk:
+                                        yield status_chunk
+                                    continue
+                        elif msg_type == "run_created":
+                            status = str(msg.get("status") or "").strip().lower()
+                            if status:
+                                run_status = status
                         if msg_type:
-                            yield sse_json(msg)
+                            chunk = sse_json(msg)
+                            if lifecycle.run_id is not None:
+                                yield lifecycle.emit(chunk)
+                            else:
+                                yield chunk
                             continue
                     if msg:
-                        yield sse_json({"delta": f"{msg}\n"})
+                        chunk = sse_json({"delta": f"{msg}\n"})
+                        if lifecycle.run_id is not None:
+                            yield lifecycle.emit(chunk)
+                        else:
+                            yield chunk
                     continue
                 if kind == "done":
                     # 兜底：即便中间 run_status 丢失，也尽量在 done 前补一个最终状态事件。
                     if isinstance(payload_obj, dict):
                         run_obj = payload_obj.get("run") if isinstance(payload_obj.get("run"), dict) else None
-                        run_id = int(run_obj.get("id") or 0) if isinstance(run_obj, dict) else 0
-                        status = str(run_obj.get("status") or "").strip().lower() if isinstance(run_obj, dict) else ""
-                        if run_id > 0 and status:
-                            yield sse_json(
-                                _build_run_event(
-                                    event_type="run_status",
-                                    task_id=int(task_id),
-                                    run_id=int(run_id),
-                                    status=status,
-                                )
+                        run_id = int(parse_positive_int((run_obj or {}).get("id"), default=0) or 0)
+                        status = str((run_obj or {}).get("status") or "").strip().lower() if isinstance(run_obj, dict) else ""
+                        if run_id > 0 and lifecycle.run_id is None:
+                            _bind_task_stream_lifecycle(
+                                lifecycle,
+                                task_id=int(task_id),
+                                run_id=int(run_id),
+                                prime_status="",
                             )
-                    return
+                        if status:
+                            run_status = status
+                    break
                 if kind == "err":
-                    yield sse_json({"message": f"任务执行失败:{payload_obj}"}, event="error")
-                    return
+                    raise RuntimeError(str(payload_obj or "task execute stream error"))
         except (asyncio.CancelledError, GeneratorExit):
             # SSE 客户端断开/主动取消时：不要再尝试 yield，否则会触发
             # “async generator ignored GeneratorExit/CancelledError” 类错误。
             cancelled = True
             raise
         except Exception as exc:
-            try:
-                yield sse_json({"message": f"任务执行失败:{exc}"}, event="error")
-            except BaseException:
-                return
+            async for chunk in iter_stream_exception_tail(
+                lifecycle=lifecycle,
+                exc=exc,
+                mode_prefix="task_execute",
+            ):
+                yield chunk
+            run_status = RUN_STATUS_FAILED
         finally:
-            # done 事件的数据前端目前不会消费，但保留结构方便后续升级
             if not cancelled:
-                try:
-                    yield sse_json({"type": "done"}, event="done")
-                except BaseException:
-                    return
+                async for chunk in iter_stream_done_tail(
+                    lifecycle=lifecycle,
+                    run_status=run_status,
+                ):
+                    yield chunk
 
-    headers = {
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-    }
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+    return create_sse_response(gen)

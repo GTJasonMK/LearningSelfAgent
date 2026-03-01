@@ -1,5 +1,8 @@
+import json
 import os
 import re
+import shlex
+import sys
 from typing import List, Optional, Set, Tuple
 
 from backend.src.common.python_code import (
@@ -9,6 +12,7 @@ from backend.src.common.python_code import (
 )
 from backend.src.common.path_utils import normalize_windows_abs_path_on_posix
 from backend.src.common.task_error_codes import format_task_error
+from backend.src.common.utils import is_test_env, parse_json_value
 from backend.src.actions.handlers.common_utils import (
     load_json_object,
     parse_command_tokens,
@@ -527,6 +531,781 @@ def _build_retry_payload_with_default_url(
 
 
 _WARNING_ONLY_LINE_RE = re.compile(r"(?:^warning:|deprecationwarning)", re.IGNORECASE)
+_SCRIPT_REQUIRED_OPTION_RE = re.compile(
+    r"add_argument\(\s*['\"](?P<flag>--[a-zA-Z0-9][a-zA-Z0-9_-]*)['\"](?P<body>.*?)\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _looks_like_nonempty_string_list(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, str) or not str(item).strip():
+            return False
+    return True
+
+
+def _merge_unique_args(base: List[str], extra: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in list(base or []) + list(extra or []):
+        current = str(item or "").strip()
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        out.append(current)
+    return out
+
+
+def _build_script_command_payload(payload: dict, context: Optional[dict]) -> Tuple[dict, Optional[str]]:
+    patched = dict(payload or {})
+    script = str(patched.get("script") or "").strip()
+    if not script:
+        return patched, None
+
+    args_raw = patched.get("args")
+    args: List[str] = []
+    if isinstance(args_raw, list):
+        args = [str(item) for item in args_raw if str(item).strip()]
+    elif isinstance(args_raw, str) and args_raw.strip():
+        args = parse_command_tokens(args_raw)
+
+    python_exec = str((context or {}).get("python_executable_override") or "").strip()
+    if not python_exec:
+        python_exec = str(sys.executable or "").strip() or "python"
+
+    patched["command"] = [python_exec, script] + args
+    return patched, None
+
+
+def _discover_required_script_optional_args(script_path: str) -> List[str]:
+    """
+    从脚本文本中提取 argparse.required=True 的可选参数（--flag）。
+    """
+    if not script_path:
+        return []
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="replace") as handle:
+            source = handle.read()
+    except Exception:
+        return []
+
+    found: List[str] = []
+    for match in _SCRIPT_REQUIRED_OPTION_RE.finditer(source):
+        flag = str(match.group("flag") or "").strip()
+        body = str(match.group("body") or "")
+        if not flag:
+            continue
+        if not re.search(r"required\s*=\s*True", body):
+            continue
+        found.append(flag)
+    return _merge_unique_args([], found)
+
+
+def _discover_script_optional_args(script_path: str) -> List[str]:
+    """
+    从脚本文本中提取 argparse 可选参数（--flag）。
+    """
+    if not script_path:
+        return []
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="replace") as handle:
+            source = handle.read()
+    except Exception:
+        return []
+
+    found: List[str] = []
+    for match in _SCRIPT_REQUIRED_OPTION_RE.finditer(source):
+        flag = str(match.group("flag") or "").strip()
+        if not flag:
+            continue
+        found.append(flag)
+    return _merge_unique_args([], found)
+
+
+def _extract_script_and_args_from_payload(payload: dict) -> Tuple[str, List[str]]:
+    script = str(payload.get("script") or "").strip()
+    command = payload.get("command")
+    args = parse_command_tokens(command)
+    if not script and len(args) >= 2 and _is_python_executable(str(args[0] or "").strip()):
+        candidate = str(args[1] or "").strip()
+        if candidate.lower().endswith(".py"):
+            script = candidate
+            return script, [str(item) for item in args[2:]]
+    if script and len(args) >= 2 and _is_python_executable(str(args[0] or "").strip()):
+        return script, [str(item) for item in args[2:]]
+    return script, []
+
+
+def _arg_is_provided(tokens: List[str], expected: str) -> bool:
+    normalized_expected = str(expected or "").strip()
+    if not normalized_expected:
+        return True
+    for token in tokens:
+        current = str(token or "").strip()
+        if current == normalized_expected:
+            return True
+        if normalized_expected.startswith("--") and current.startswith(normalized_expected + "="):
+            return True
+    return False
+
+
+def _is_output_like_flag(flag: str) -> bool:
+    raw = str(flag or "").strip().lower()
+    if not raw:
+        return False
+    return any(token in raw for token in ("--out", "--output", "result", "target"))
+
+
+def _extract_option_value_pairs(tokens: List[str]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    idx = 0
+    while idx < len(tokens):
+        token = str(tokens[idx] or "").strip()
+        if not token.startswith("--"):
+            idx += 1
+            continue
+        if "=" in token:
+            key, value = token.split("=", 1)
+            key_text = str(key or "").strip()
+            value_text = str(value or "").strip()
+            if key_text and value_text:
+                out.append((key_text, value_text))
+            idx += 1
+            continue
+        next_value = ""
+        if idx + 1 < len(tokens):
+            candidate = str(tokens[idx + 1] or "").strip()
+            if candidate and not candidate.startswith("--"):
+                next_value = candidate
+                idx += 2
+            else:
+                idx += 1
+        else:
+            idx += 1
+        if next_value:
+            out.append((token, next_value))
+    return out
+
+
+def _filter_script_args_by_known_options(tokens: List[str], known_options: Set[str]) -> List[str]:
+    if not known_options:
+        return list(tokens)
+    out: List[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = str(tokens[idx] or "").strip()
+        if not token.startswith("--"):
+            out.append(token)
+            idx += 1
+            continue
+        if "=" in token:
+            key, _value = token.split("=", 1)
+            if str(key or "").strip() in known_options:
+                out.append(token)
+            idx += 1
+            continue
+        if token in known_options:
+            out.append(token)
+            if idx + 1 < len(tokens):
+                candidate = str(tokens[idx + 1] or "").strip()
+                if candidate and not candidate.startswith("--"):
+                    out.append(candidate)
+                    idx += 2
+                    continue
+            idx += 1
+            continue
+        # unknown option: 丢弃该 flag 及其 value（如存在）
+        if idx + 1 < len(tokens):
+            candidate = str(tokens[idx + 1] or "").strip()
+            if candidate and not candidate.startswith("--"):
+                idx += 2
+                continue
+        idx += 1
+    return out
+
+
+def _is_truthy(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _llm_script_arg_binding_enabled(context: Optional[dict]) -> bool:
+    if isinstance(context, dict) and "enable_llm_script_arg_binding" in context:
+        return _is_truthy(context.get("enable_llm_script_arg_binding"), default=False)
+
+    env_value = os.getenv("ENABLE_LLM_SCRIPT_ARG_BINDING")
+    if str(env_value or "").strip():
+        return _is_truthy(env_value, default=False)
+
+    # 测试环境默认关闭，避免单测依赖外部模型。
+    if is_test_env():
+        return False
+    return True
+
+
+def _collect_arg_binding_artifacts(workdir: str, *, max_items: int = 40, max_depth: int = 3) -> List[dict]:
+    roots: List[str] = []
+    for candidate in (
+        "backend/.agent/workspace",
+        ".agent/workspace",
+        "data",
+        "backend/data",
+    ):
+        resolved = resolve_path_with_workdir(candidate, workdir)
+        if not resolved:
+            continue
+        absolute = os.path.abspath(resolved)
+        if os.path.isdir(absolute):
+            roots.append(absolute)
+
+    dedup_roots: List[str] = []
+    seen_root: Set[str] = set()
+    for root in roots:
+        key = os.path.normcase(root)
+        if key in seen_root:
+            continue
+        seen_root.add(key)
+        dedup_roots.append(root)
+
+    artifacts: List[dict] = []
+    seen_file: Set[str] = set()
+    workdir_abs = os.path.abspath(workdir or os.getcwd())
+
+    for root in dedup_roots:
+        base_depth = root.rstrip(os.sep).count(os.sep)
+        for current_dir, dirs, files in os.walk(root):
+            depth = current_dir.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= int(max_depth):
+                dirs[:] = []
+
+            for filename in sorted(files):
+                absolute = os.path.abspath(os.path.join(current_dir, filename))
+                key = os.path.normcase(absolute)
+                if key in seen_file:
+                    continue
+                seen_file.add(key)
+                try:
+                    stat = os.stat(absolute)
+                    rel = os.path.relpath(absolute, workdir_abs)
+                    rel = rel.replace("\\", "/")
+                    artifacts.append(
+                        {
+                            "path": rel,
+                            "ext": str(os.path.splitext(filename)[1] or "").lower(),
+                            "size": int(stat.st_size),
+                            "mtime": int(stat.st_mtime),
+                        }
+                    )
+                except Exception:
+                    continue
+                if len(artifacts) >= int(max_items):
+                    return artifacts
+    return artifacts
+
+
+def _extract_first_json_object(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    start = raw.find("{")
+    if start < 0:
+        return ""
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(raw)):
+        ch = raw[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == "\"":
+                in_string = False
+            continue
+        if ch == "\"":
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start : idx + 1]
+    return ""
+
+
+def _build_llm_script_arg_prompt(
+    *,
+    script: str,
+    required_args: List[str],
+    known_options: List[str],
+    provided_args: List[str],
+    missing_args: List[str],
+    expected_outputs: List[str],
+    artifacts: List[dict],
+) -> str:
+    payload = {
+        "script": script,
+        "required_args": list(required_args),
+        "known_options": list(known_options),
+        "provided_args": list(provided_args),
+        "missing_args": list(missing_args),
+        "expected_outputs": list(expected_outputs),
+        "artifacts": list(artifacts),
+    }
+    payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+    return (
+        "你是脚本参数绑定器。请把已有信息映射成可执行的脚本参数 args。\n"
+        "输出要求：仅输出一个 JSON 对象，不要输出任何额外文本。\n"
+        '固定格式：{"args":["--k","v"],"reason":"...","confidence":0.0}\n'
+        "约束：\n"
+        "1) args 只包含脚本参数，不要包含 python 可执行程序和脚本路径。\n"
+        "2) 必须覆盖 missing_args；优先复用 provided_args 里的值。\n"
+        "3) 仅使用 known_options 或 required_args 中存在的选项名，禁止杜撰新选项。\n"
+        "4) 若无法确定，请返回 args=[] 且给出 reason，confidence 设为 0。\n\n"
+        "输入：\n"
+        f"{payload_json}"
+    )
+
+
+def _try_llm_bind_script_missing_args(
+    *,
+    payload: dict,
+    workdir: str,
+    script: str,
+    required_args: List[str],
+    known_options: List[str],
+    missing_args: List[str],
+    provided_args: List[str],
+    task_id: Optional[int],
+    run_id: Optional[int],
+    context: Optional[dict],
+) -> Tuple[Optional[dict], Optional[dict]]:
+    if not missing_args:
+        return None, None
+    if not _llm_script_arg_binding_enabled(context):
+        return None, {"status": "disabled", "reason": "llm_script_arg_binding_disabled"}
+    if task_id is None or run_id is None:
+        return None, {"status": "skipped", "reason": "missing_task_or_run_id"}
+
+    expected_outputs: List[str] = []
+    raw_outputs = payload.get("expected_outputs")
+    if isinstance(raw_outputs, list):
+        for item in raw_outputs:
+            text = str(item or "").strip()
+            if text:
+                expected_outputs.append(text)
+
+    artifacts = _collect_arg_binding_artifacts(workdir)
+    prompt = _build_llm_script_arg_prompt(
+        script=script,
+        required_args=required_args,
+        known_options=known_options,
+        provided_args=provided_args,
+        missing_args=missing_args,
+        expected_outputs=expected_outputs,
+        artifacts=artifacts,
+    )
+
+    try:
+        from backend.src.services.llm.llm_calls import create_llm_call
+
+        llm_result = create_llm_call(
+            {
+                "task_id": int(task_id),
+                "run_id": int(run_id),
+                "prompt": prompt,
+                "parameters": {
+                    "temperature": 0,
+                    "timeout_seconds": 20,
+                },
+            }
+        )
+    except Exception as exc:
+        return None, {"status": "error", "reason": f"llm_call_exception:{exc}"}
+
+    record = llm_result.get("record") if isinstance(llm_result, dict) else None
+    record_id = None
+    status = ""
+    response_text = ""
+    if isinstance(record, dict):
+        try:
+            if record.get("id") is not None:
+                record_id = int(record.get("id"))
+        except Exception:
+            record_id = None
+        status = str(record.get("status") or "").strip().lower()
+        response_text = str(record.get("response") or "")
+
+    if status == "error":
+        return None, {
+            "status": "error",
+            "reason": str((record or {}).get("error") or "llm_record_error"),
+            "record_id": record_id,
+        }
+
+    parsed = parse_json_value(response_text)
+    if not isinstance(parsed, dict):
+        embedded = _extract_first_json_object(response_text)
+        parsed = parse_json_value(embedded) if embedded else None
+    if not isinstance(parsed, dict):
+        return None, {
+            "status": "invalid_response",
+            "reason": "llm_response_not_json_object",
+            "record_id": record_id,
+        }
+
+    candidate_args = parsed.get("args")
+    if isinstance(candidate_args, str):
+        candidate_tokens = parse_command_tokens(candidate_args)
+    elif isinstance(candidate_args, list):
+        candidate_tokens = [str(item).strip() for item in candidate_args if str(item).strip()]
+    else:
+        candidate_tokens = []
+
+    if not candidate_tokens:
+        return None, {
+            "status": "empty_args",
+            "reason": str(parsed.get("reason") or "llm_returned_empty_args"),
+            "record_id": record_id,
+        }
+
+    allowed_options = set(
+        [item for item in required_args if str(item).strip().startswith("--")]
+        + [item for item in known_options if str(item).strip().startswith("--")]
+    )
+    normalized_tokens = _filter_script_args_by_known_options(candidate_tokens, allowed_options)
+
+    missing_after: List[str] = []
+    for item in required_args:
+        if not _arg_is_provided(normalized_tokens, item):
+            missing_after.append(item)
+    if missing_after:
+        return None, {
+            "status": "contract_not_satisfied",
+            "reason": f"missing_after_llm_bind:{','.join(missing_after)}",
+            "record_id": record_id,
+        }
+
+    patched = dict(payload or {})
+    patched["args"] = list(normalized_tokens)
+    python_exec = str(sys.executable or "").strip() or "python"
+    command_tokens = parse_command_tokens(payload.get("command"))
+    if command_tokens and _is_python_executable(str(command_tokens[0] or "").strip()):
+        python_exec = str(command_tokens[0] or "").strip() or python_exec
+    patched["command"] = [python_exec, script] + list(normalized_tokens)
+
+    confidence = 0.0
+    try:
+        confidence = float(parsed.get("confidence"))
+    except Exception:
+        confidence = 0.0
+    if confidence < 0:
+        confidence = 0.0
+    if confidence > 1:
+        confidence = 1.0
+
+    return (
+        {
+            "patched_payload": patched,
+            "args": list(normalized_tokens),
+            "record_id": record_id,
+            "reason": str(parsed.get("reason") or "").strip(),
+            "confidence": confidence,
+            "status": "applied",
+        },
+        None,
+    )
+
+
+def _try_autofill_script_missing_args(
+    *,
+    payload: dict,
+    workdir: str,
+    script: str,
+    required_args: List[str],
+    missing_args: List[str],
+    provided_args: List[str],
+    known_options: Optional[Set[str]] = None,
+) -> Optional[dict]:
+    if not missing_args:
+        return None
+
+    option_pairs = _extract_option_value_pairs(provided_args)
+    if not option_pairs:
+        return None
+
+    options = set(known_options or [])
+    if not options:
+        script_abs = resolve_path_with_workdir(script, workdir)
+        options = set(_discover_script_optional_args(script_abs))
+
+    input_candidates: List[Tuple[str, str]] = []
+    output_candidates: List[Tuple[str, str]] = []
+    for key, value in option_pairs:
+        if _is_output_like_flag(key):
+            output_candidates.append((key, value))
+        else:
+            input_candidates.append((key, value))
+
+    expected_outputs = payload.get("expected_outputs")
+    if isinstance(expected_outputs, list):
+        for item in expected_outputs:
+            path = str(item or "").strip()
+            if path:
+                output_candidates.append(("expected_outputs", path))
+
+    if not input_candidates and not output_candidates:
+        return None
+
+    # 先按脚本真实契约裁剪未知参数，避免 argparse 因旧 flag 报 unrecognized。
+    normalized_args = _filter_script_args_by_known_options(provided_args, options)
+
+    used_input = 0
+    used_output = 0
+    applied: List[dict] = []
+
+    for required in required_args:
+        if not required or _arg_is_provided(normalized_args, required):
+            continue
+        selected_key = ""
+        selected_value = ""
+        if _is_output_like_flag(required):
+            if used_output < len(output_candidates):
+                selected_key, selected_value = output_candidates[used_output]
+                used_output += 1
+        else:
+            if used_input < len(input_candidates):
+                selected_key, selected_value = input_candidates[used_input]
+                used_input += 1
+        if not selected_value:
+            continue
+        normalized_args.extend([required, selected_value])
+        applied.append(
+            {
+                "required": required,
+                "source_option": selected_key,
+                "value": selected_value,
+            }
+        )
+
+    if not applied:
+        return None
+
+    patched = dict(payload or {})
+    patched["args"] = list(normalized_args)
+    python_exec = str(sys.executable or "").strip() or "python"
+    command_tokens = parse_command_tokens(payload.get("command"))
+    if command_tokens and _is_python_executable(str(command_tokens[0] or "").strip()):
+        python_exec = str(command_tokens[0] or "").strip() or python_exec
+    patched["command"] = [python_exec, script] + list(normalized_args)
+
+    return {
+        "patched_payload": patched,
+        "applied": applied,
+        "known_options": sorted(options),
+        "original_args": list(provided_args),
+        "normalized_args": list(normalized_args),
+    }
+
+
+def _preflight_script_arg_contract(
+    payload: dict,
+    workdir: str,
+    *,
+    task_id: Optional[int] = None,
+    run_id: Optional[int] = None,
+    context: Optional[dict] = None,
+) -> Tuple[dict, Optional[str]]:
+    script, script_args = _extract_script_and_args_from_payload(payload)
+    if not script:
+        return {}, None
+
+    required_from_payload = []
+    raw_required = payload.get("required_args")
+    if _looks_like_nonempty_string_list(raw_required):
+        required_from_payload = [str(item).strip() for item in raw_required if str(item).strip()]
+
+    discover_required = payload.get("discover_required_args")
+    if discover_required is None:
+        discover_required = True
+    required_auto: List[str] = []
+    script_abs = resolve_path_with_workdir(script, workdir)
+    if bool(discover_required):
+        required_auto = _discover_required_script_optional_args(script_abs)
+    known_options = _discover_script_optional_args(script_abs)
+
+    required = _merge_unique_args(required_from_payload, required_auto)
+    if not required:
+        return {
+            "mode": "script_run",
+            "script": script,
+            "required_args": [],
+            "provided_args": list(script_args),
+            "missing_args": [],
+        }, None
+
+    def _collect_missing(args_tokens: List[str]) -> List[str]:
+        out: List[str] = []
+        for item in required:
+            if not _arg_is_provided(args_tokens, item):
+                out.append(item)
+        return out
+
+    missing = _collect_missing(script_args)
+    autofill_meta = None
+    llm_bind_meta = None
+    llm_bind_failure = None
+    if missing:
+        autofill_meta = _try_autofill_script_missing_args(
+            payload=payload,
+            workdir=workdir,
+            script=script,
+            required_args=required,
+            missing_args=missing,
+            provided_args=script_args,
+            known_options=set(known_options),
+        )
+        if isinstance(autofill_meta, dict):
+            patched_payload = autofill_meta.get("patched_payload")
+            if isinstance(patched_payload, dict):
+                payload.clear()
+                payload.update(patched_payload)
+                _script, script_args = _extract_script_and_args_from_payload(payload)
+                # 仅在脚本路径一致时使用更新后的 args 重新校验，避免意外漂移。
+                if _script == script:
+                    missing = _collect_missing(script_args)
+        if missing:
+            llm_bind_meta, llm_bind_failure = _try_llm_bind_script_missing_args(
+                payload=payload,
+                workdir=workdir,
+                script=script,
+                required_args=required,
+                known_options=list(known_options),
+                missing_args=missing,
+                provided_args=script_args,
+                task_id=task_id,
+                run_id=run_id,
+                context=context,
+            )
+            if isinstance(llm_bind_meta, dict):
+                patched_payload = llm_bind_meta.get("patched_payload")
+                if isinstance(patched_payload, dict):
+                    payload.clear()
+                    payload.update(patched_payload)
+                    _script, script_args = _extract_script_and_args_from_payload(payload)
+                    if _script == script:
+                        missing = _collect_missing(script_args)
+
+    contract = {
+        "mode": "script_run",
+        "script": script,
+        "required_args": required,
+        "known_options": list(known_options),
+        "provided_args": list(script_args),
+        "missing_args": missing,
+    }
+    if isinstance(autofill_meta, dict):
+        contract["autofill"] = {
+            "applied": list(autofill_meta.get("applied") or []),
+            "known_options": list(autofill_meta.get("known_options") or []),
+        }
+    if isinstance(llm_bind_meta, dict):
+        contract["llm_autofill"] = {
+            "status": "applied",
+            "record_id": llm_bind_meta.get("record_id"),
+            "args": list(llm_bind_meta.get("args") or []),
+            "reason": str(llm_bind_meta.get("reason") or ""),
+            "confidence": llm_bind_meta.get("confidence"),
+        }
+    elif isinstance(llm_bind_failure, dict):
+        contract["llm_autofill"] = {
+            "status": str(llm_bind_failure.get("status") or "failed"),
+            "record_id": llm_bind_failure.get("record_id"),
+            "reason": str(llm_bind_failure.get("reason") or ""),
+        }
+    if missing:
+        autofill_tail = ""
+        if isinstance(autofill_meta, dict):
+            applied = autofill_meta.get("applied") or []
+            if isinstance(applied, list) and applied:
+                autofill_tail = f"；已尝试自动补齐: {applied}"
+        llm_tail = ""
+        if isinstance(llm_bind_failure, dict):
+            reason = str(llm_bind_failure.get("reason") or "").strip()
+            if reason:
+                llm_tail = f"；LLM补齐未生效: {reason}"
+        return contract, format_task_error(
+            code="script_args_missing",
+            message=(
+                f"{ERROR_MESSAGE_COMMAND_FAILED}: 脚本参数缺失（{', '.join(missing)}）；"
+                f"脚本={script}{autofill_tail}{llm_tail}"
+            ),
+        )
+    return contract, None
+
+
+def _maybe_apply_stdin_from_context(payload: dict, context: Optional[dict]) -> Tuple[dict, int]:
+    patched = dict(payload or {})
+    if not bool(patched.get("stdin_from_context")):
+        return patched, 0
+
+    current_stdin = patched.get("stdin")
+    if isinstance(current_stdin, str) and current_stdin.strip():
+        return patched, 0
+
+    parse_text = str((context or {}).get("latest_parse_input_text") or "").strip()
+    if not parse_text:
+        return patched, 0
+
+    patched["stdin"] = parse_text
+    return patched, len(parse_text)
+
+
+def _collect_expected_output_artifacts(payload: dict, workdir: str) -> Tuple[List[dict], List[str]]:
+    outputs = payload.get("expected_outputs")
+    if not isinstance(outputs, list):
+        return [], []
+
+    artifacts: List[dict] = []
+    missing: List[str] = []
+    for raw_item in outputs:
+        rel_path = str(raw_item or "").strip()
+        if not rel_path:
+            continue
+        absolute_path = resolve_path_with_workdir(rel_path, workdir)
+        exists = bool(absolute_path) and os.path.exists(absolute_path)
+        item = {
+            "path": rel_path,
+            "absolute_path": absolute_path,
+            "exists": exists,
+            "size": None,
+        }
+        if exists:
+            try:
+                item["size"] = int(os.path.getsize(absolute_path))
+            except Exception:
+                item["size"] = None
+        else:
+            missing.append(rel_path)
+        artifacts.append(item)
+    return artifacts, missing
 
 
 def _build_shell_failure_detail(*, stdout: str, stderr: str, returncode: object) -> str:
@@ -589,6 +1368,9 @@ def execute_shell_command(
 ) -> Tuple[Optional[dict], Optional[str]]:
     ctx: dict = context if isinstance(context, dict) else {}
     payload = dict(payload or {})
+    payload, script_payload_error = _build_script_command_payload(payload, ctx)
+    if script_payload_error:
+        raise ValueError(script_payload_error)
 
     command = payload.get("command")
     if isinstance(command, str):
@@ -619,6 +1401,16 @@ def execute_shell_command(
     if not has_exec_permission(workdir):
         raise ValueError(ERROR_MESSAGE_PERMISSION_DENIED)
 
+    script_arg_contract, script_contract_error = _preflight_script_arg_contract(
+        payload,
+        workdir,
+        task_id=task_id,
+        run_id=run_id,
+        context=ctx,
+    )
+    if script_contract_error:
+        raise ValueError(script_contract_error)
+
     payload, _rewritten_script_path, rewrite_error = _maybe_rewrite_complex_python_c_payload(
         task_id=int(task_id),
         run_id=int(run_id),
@@ -643,17 +1435,21 @@ def execute_shell_command(
     if dependency_error:
         raise ValueError(dependency_error)
 
+    payload, explicit_stdin_len = _maybe_apply_stdin_from_context(payload=payload, context=ctx)
     payload, auto_attached_stdin_len = _maybe_attach_context_stdin_before_run(payload=payload, context=ctx)
     result, error_message = run_shell_command(payload)
     if error_message:
         raise ValueError(error_message)
     if not isinstance(result, dict):
         raise ValueError(ERROR_MESSAGE_COMMAND_FAILED)
-    if auto_attached_stdin_len > 0 and isinstance(result, dict):
+    if (auto_attached_stdin_len > 0 or explicit_stdin_len > 0) and isinstance(result, dict):
         try:
             result = dict(result)
-            result["auto_stdin_attached"] = True
+            result["auto_stdin_attached"] = bool(auto_attached_stdin_len > 0)
             result["auto_stdin_chars"] = int(auto_attached_stdin_len)
+            if explicit_stdin_len > 0:
+                result["stdin_from_context"] = True
+                result["stdin_from_context_chars"] = int(explicit_stdin_len)
         except Exception:
             pass
 
@@ -766,4 +1562,42 @@ def execute_shell_command(
             )
 
         raise ValueError(f"{ERROR_MESSAGE_COMMAND_FAILED}:{detail}" if detail else ERROR_MESSAGE_COMMAND_FAILED)
+
+    if script_arg_contract:
+        try:
+            result = dict(result)
+            result["script_contract"] = dict(script_arg_contract)
+        except Exception:
+            pass
+
+    parse_json_output = bool(payload.get("parse_json_output"))
+    if parse_json_output:
+        stdout_text = str(result.get("stdout") or "").strip()
+        parsed_obj = parse_json_value(stdout_text)
+        if parsed_obj is None:
+            raise ValueError(
+                format_task_error(
+                    code="script_output_not_json",
+                    message=f"{ERROR_MESSAGE_COMMAND_FAILED}: 脚本输出不是合法 JSON",
+                )
+            )
+        result["parsed_output"] = parsed_obj
+        emit_as = str(payload.get("emit_as") or "").strip()
+        if emit_as and isinstance(ctx, dict):
+            ctx[emit_as] = parsed_obj
+            result["emitted_context_key"] = emit_as
+
+    artifacts, missing_outputs = _collect_expected_output_artifacts(payload, workdir)
+    if artifacts:
+        result["artifacts"] = artifacts
+    if missing_outputs:
+        raise ValueError(
+            format_task_error(
+                code="missing_expected_artifact",
+                message=(
+                    f"{ERROR_MESSAGE_COMMAND_FAILED}: 缺少预期产物（{', '.join(missing_outputs)}）"
+                ),
+            )
+        )
+
     return result, None

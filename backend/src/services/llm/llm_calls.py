@@ -1,5 +1,7 @@
 import json
+import os
 import time
+import threading
 from typing import Any, Callable, TypeVar
 
 from backend.src.common.app_error_utils import invalid_request_error, not_found_error
@@ -22,8 +24,24 @@ from backend.src.storage import get_connection
 
 T = TypeVar("T")
 
-LLM_CALL_MAX_ATTEMPTS = 3
+
+def _read_int_env(name: str, default: int, *, min_value: int = 0) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(float(raw))
+    except Exception:
+        return int(default)
+    if value < int(min_value):
+        return int(min_value)
+    return int(value)
+
+
+LLM_CALL_MAX_ATTEMPTS = _read_int_env("LLM_CALL_MAX_ATTEMPTS", 3, min_value=1)
 LLM_CALL_RETRY_BASE_SECONDS = 0.6
+# create_llm_call 级硬超时（秒）：防止供应商 SDK 在少数情况下长期阻塞导致 run 永久 running。
+LLM_CALL_HARD_TIMEOUT_SECONDS = _read_int_env("LLM_CALL_HARD_TIMEOUT_SECONDS", 30, min_value=5)
 
 
 def _fetch_llm_record_by_id(conn, record_id: int):
@@ -39,6 +57,41 @@ def _with_sqlite_locked_retry(op: Callable[[], T]) -> T:
     - 若仍抛出 locked，再做最多 3 次轻量重试，避免并行 Agent 把瞬时争用误判为“步骤失败”。
     """
     return run_with_sqlite_locked_retry(op, attempts=3, base_delay_seconds=0.05)
+
+
+def _call_llm_with_hard_timeout(
+    *,
+    prompt_text: str,
+    model: str,
+    parameters: Any,
+    provider: str,
+    timeout_seconds: int,
+):
+    """
+    对 call_llm 增加线程级硬超时，避免单次 SDK 卡死拖垮整个 run。
+
+    说明：
+    - 超时时仅中断主流程，后台线程会作为 daemon 继续/退出，不阻塞当前请求返回；
+    - 异常语义保持为普通 Exception，由上层重试/记录。
+    """
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["result"] = call_llm(prompt_text, model, parameters, provider=provider)
+        except Exception as exc:  # pragma: no cover - 由调用方行为断言
+            box["error"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=float(timeout_seconds))
+    if worker.is_alive():
+        raise TimeoutError(f"LLM call timeout after {int(timeout_seconds)}s")
+
+    err = box.get("error")
+    if err is not None:
+        raise err
+    return box.get("result")
 
 
 def create_llm_call(payload: Any) -> dict:
@@ -145,7 +198,17 @@ def create_llm_call(payload: Any) -> dict:
     error_message = None
     for attempt in range(1, int(LLM_CALL_MAX_ATTEMPTS) + 1):
         try:
-            response_text, tokens = call_llm(prompt_text, model, parameters, provider=provider)
+            call_result = _call_llm_with_hard_timeout(
+                prompt_text=prompt_text,
+                model=model,
+                parameters=parameters,
+                provider=provider,
+                timeout_seconds=int(LLM_CALL_HARD_TIMEOUT_SECONDS),
+            )
+            if isinstance(call_result, tuple) and len(call_result) >= 2:
+                response_text, tokens = call_result[0], call_result[1]
+            else:
+                raise RuntimeError(ERROR_MESSAGE_LLM_CALL_FAILED)
             error_message = None
             break
         except AppError as exc:

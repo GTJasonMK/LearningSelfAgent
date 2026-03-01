@@ -84,6 +84,30 @@ class TestTasksExecuteStreamUsesPump(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hello", text)
         self.assertIn("event: done", text)
 
+    async def test_execute_task_non_stream_endpoint_removed(self):
+        from backend.src.main import create_app
+        from backend.src.storage import get_connection
+        from backend.src.api.utils import now_iso
+
+        created_at = now_iso()
+        with get_connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO tasks (title, status, created_at, expectation_id, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("t_removed", "queued", created_at, None, None, None),
+            )
+            task_id = int(cursor.lastrowid)
+
+        app = create_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/tasks/{task_id}/execute",
+                json={},
+                timeout=10,
+            )
+
+        self.assertEqual(resp.status_code, 404)
+
     async def test_execute_task_stream_emits_structured_events_as_json(self):
         from backend.src.main import create_app
         from backend.src.storage import get_connection
@@ -118,6 +142,7 @@ class TestTasksExecuteStreamUsesPump(unittest.IsolatedAsyncioTestCase):
         self.assertIn("\"status\": \"done\"", text)
         self.assertNotIn("{'type': 'run_status'", text)
         self.assertIn("event: done", text)
+        self.assertIn("\"type\": \"stream_end\"", text)
 
 
 if __name__ == "__main__":

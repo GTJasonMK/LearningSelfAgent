@@ -35,6 +35,19 @@ class TestPostActionVerifier(unittest.TestCase):
         self.assertEqual(str(contract.get("action_type") or ""), "task_output")
         self.assertEqual(str(contract.get("status") or ""), "warn")
 
+    def test_shell_command_parse_json_contract_requires_parsed_output(self):
+        from backend.src.actions.post_action_verifier import verify_and_normalize_action_result
+
+        result, error = verify_and_normalize_action_result(
+            action_type="shell_command",
+            payload={"script": "backend/.agent/workspace/fetch.py", "parse_json_output": True},
+            result={"ok": True, "stdout": '{"ok":true}'},
+            error=None,
+            context={},
+        )
+        self.assertIsNone(result)
+        self.assertIn("[code=missing_script_parsed_output]", str(error or ""))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -182,6 +182,63 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         self.assertEqual(obj["payload"]["workdir"], workdir)
         self.assertIn("timeout_ms", obj["payload"])
 
+    def test_shell_command_python_script_command_is_normalized_to_structured_script_run(self):
+        detail, workdir = self._run_react_loop_once(
+            plan_title="shell_command:运行脚本",
+            allow=["shell_command"],
+            llm_actions=[
+                {
+                    "action": {
+                        "type": "shell_command",
+                        "payload": {
+                            "command": [
+                                "python",
+                                "backend/.agent/workspace/parse_gold_price.py",
+                                "--input",
+                                "raw.json",
+                                "--output",
+                                "data/out.csv",
+                            ]
+                        },
+                    }
+                }
+            ],
+        )
+        obj = json.loads(detail)
+        self.assertEqual(obj["type"], "shell_command")
+        self.assertEqual(obj["payload"]["script"], "backend/.agent/workspace/parse_gold_price.py")
+        self.assertEqual(
+            obj["payload"]["args"],
+            ["--input", "raw.json", "--output", "data/out.csv"],
+        )
+        self.assertTrue(bool(obj["payload"]["discover_required_args"]))
+        self.assertEqual(obj["payload"]["workdir"], workdir)
+        self.assertIn("timeout_ms", obj["payload"])
+        self.assertNotIn("command", obj["payload"])
+
+    def test_script_run_alias_can_infer_script_from_title_prefix(self):
+        detail, workdir = self._run_react_loop_once(
+            plan_title="script_run:backend/.agent/workspace/validate_gold_csv.py",
+            allow=["shell_command"],
+            llm_actions=[
+                {
+                    "action": {
+                        "type": "script_run",
+                        "payload": {
+                            "args": ["--csv", "data/gold.csv"],
+                            "expected_outputs": ["data/gold.csv"],
+                        },
+                    }
+                }
+            ],
+        )
+        obj = json.loads(detail)
+        self.assertEqual(obj["type"], "shell_command")
+        self.assertEqual(obj["payload"]["script"], "backend/.agent/workspace/validate_gold_csv.py")
+        self.assertEqual(obj["payload"]["args"], ["--csv", "data/gold.csv"])
+        self.assertEqual(obj["payload"]["expected_outputs"], ["data/gold.csv"])
+        self.assertEqual(obj["payload"]["workdir"], workdir)
+
     def test_file_write_missing_path_is_coerced_from_title_before_validation(self):
         detail, _ = self._run_react_loop_once(
             plan_title="file_write:test/out.txt 写入文件",

@@ -32,6 +32,7 @@ from backend.src.agent.runner.stream_mode_lifecycle import (
     iter_stream_done_tail,
     iter_stream_exception_tail,
 )
+from backend.src.agent.runner.stream_convergence import build_stream_error_payload
 from backend.src.agent.runner.stream_request import (
     ParsedStreamCommandRequest,
     parse_stream_command_request,
@@ -388,7 +389,21 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 status_event = lifecycle.emit_run_status(RUN_STATUS_FAILED)
                 if status_event:
                     yield status_event
-                yield lifecycle.emit(sse_json({"message": "Think 模式规划失败：未生成有效计划"}, event="error"))
+                yield lifecycle.emit(
+                    sse_json(
+                        build_stream_error_payload(
+                            error_code="think_planning_empty",
+                            error_message="Think 模式规划失败：未生成有效计划",
+                            phase="think_planning",
+                            task_id=task_id,
+                            run_id=run_id,
+                            recoverable=False,
+                            retryable=False,
+                            terminal_source="runtime",
+                        ),
+                        event="error",
+                    )
+                )
                 logger.warning(
                     "[agent.think] planning_failed_empty task_id=%s run_id=%s",
                     task_id,

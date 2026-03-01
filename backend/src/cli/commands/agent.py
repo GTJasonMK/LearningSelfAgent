@@ -17,7 +17,7 @@ from backend.src.cli.output import (
     console,
     print_error,
 )
-from backend.src.cli.commands.stream_render import render_stream_event
+from backend.src.cli.commands.stream_session import run_stream_session
 
 
 def _parse_json_option(raw: str | None, option_name: str) -> dict | None:
@@ -80,20 +80,20 @@ def ask(
         payload["think_config"] = think_config
 
     try:
-        seen_done = False
-        seen_error = False
-        for event in client.stream_post("/agent/command/stream", json_data=payload):
-            outcome = render_stream_event(event, output_json, done_message="执行完毕")
-            if outcome == "done":
-                seen_done = True
-            elif outcome == "error":
-                seen_error = True
+        result = run_stream_session(
+            client=client,
+            path="/agent/command/stream",
+            payload=payload,
+            output_json=output_json,
+            done_message="执行完毕",
+            enable_agent_replay=True,
+        )
         # 流结束后换行
         console.print()
-        if seen_error:
+        if result.seen_error:
             sys.exit(1)
-        if not seen_done:
-            print_error("流式请求已结束，但未收到 done 事件（执行状态不可信）")
+        if not result.seen_done:
+            print_error("流式请求已结束，但未收到 done/stream_end 事件（执行状态不可信）")
             sys.exit(1)
     except CliError as exc:
         print_error(str(exc))
@@ -127,19 +127,19 @@ def resume(
         payload["session_key"] = str(session_key).strip()
 
     try:
-        seen_done = False
-        seen_error = False
-        for event in client.stream_post("/agent/command/resume/stream", json_data=payload):
-            outcome = render_stream_event(event, output_json, done_message="恢复执行完毕")
-            if outcome == "done":
-                seen_done = True
-            elif outcome == "error":
-                seen_error = True
+        result = run_stream_session(
+            client=client,
+            path="/agent/command/resume/stream",
+            payload=payload,
+            output_json=output_json,
+            done_message="恢复执行完毕",
+            enable_agent_replay=True,
+        )
         console.print()
-        if seen_error:
+        if result.seen_error:
             sys.exit(1)
-        if not seen_done:
-            print_error("恢复流已结束，但未收到 done 事件（执行状态不可信）")
+        if not result.seen_done:
+            print_error("恢复流已结束，但未收到 done/stream_end 事件（执行状态不可信）")
             sys.exit(1)
     except CliError as exc:
         print_error(str(exc))

@@ -1,0 +1,86 @@
+{
+  "cases": [
+    {
+      "id": "done_without_business_state_then_replay",
+      "replay_run_id": 11,
+      "stream_events": [
+        {
+          "event": "done",
+          "payload": {
+            "type": "stream_end",
+            "task_id": 8,
+            "run_id": 11
+          }
+        }
+      ],
+      "replay_response": {
+        "items": [
+          {
+            "event_id": "sess_x:11:2:run_status",
+            "payload": {
+              "type": "run_status",
+              "task_id": 8,
+              "run_id": 11,
+              "status": "done",
+              "event_id": "sess_x:11:2:run_status"
+            }
+          },
+          {
+            "event_id": "sess_x:11:3:stream_end",
+            "payload": {
+              "type": "stream_end",
+              "task_id": 8,
+              "run_id": 11,
+              "run_status": "done",
+              "event_id": "sess_x:11:3:stream_end"
+            }
+          }
+        ]
+      },
+      "expected_cli": {
+        "seen_done": true,
+        "seen_error": false,
+        "saw_business_state_event": true,
+        "last_run_status": "done",
+        "replay_applied": 1,
+        "replay_calls": 1
+      },
+      "expected_frontend": {
+        "had_error": false,
+        "replay_applied": 1,
+        "replay_calls": 1
+      }
+    },
+    {
+      "id": "done_with_run_status_no_replay",
+      "replay_run_id": 11,
+      "stream_events": [
+        {
+          "event": "done",
+          "payload": {
+            "type": "stream_end",
+            "task_id": 8,
+            "run_id": 11,
+            "run_status": "done"
+          }
+        }
+      ],
+      "replay_response": {
+        "items": []
+      },
+      "expected_cli": {
+        "seen_done": true,
+        "seen_error": false,
+        "saw_business_state_event": true,
+        "last_run_status": "",
+        "replay_applied": 0,
+        "replay_calls": 0
+      },
+      "expected_frontend": {
+        "had_error": false,
+        "replay_applied": 0,
+        "replay_calls": 0
+      }
+    }
+  ]
+}

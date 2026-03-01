@@ -28,15 +28,31 @@ def _status_style(status: str) -> str:
     return "cyan"
 
 
-RenderOutcome = Literal["done", "error", "other"]
+RenderOutcome = Literal["done", "error", "other", "skip"]
 
 
 def render_stream_event(event: Any, output_json: bool, *, done_message: str) -> RenderOutcome:
     """统一渲染 SSE 事件并返回事件结果类型。"""
+    def _format_structured_error(data: dict) -> str:
+        code = str(data.get("error_code") or data.get("code") or "").strip()
+        phase = str(data.get("phase") or "").strip()
+        msg = str(data.get("error_message") or data.get("message") or "").strip()
+        prefix_parts = []
+        if code:
+            prefix_parts.append(code)
+        if phase:
+            prefix_parts.append(phase)
+        prefix = f"[{'|'.join(prefix_parts)}] " if prefix_parts else ""
+        return f"{prefix}{msg}".strip() or str(data)
+
     if output_json and getattr(event, "json_data", None):
         print_json(event.json_data)
         data = getattr(event, "json_data", None)
-        if isinstance(data, dict) and data.get("type") == "done":
+        event_name = str(getattr(event, "event", "") or "").strip().lower()
+        event_type = str(data.get("type") or "").strip().lower() if isinstance(data, dict) else ""
+        if event_name == "error" or event_type == "error":
+            return "error"
+        if event_name == "done" or event_type in {"done", "stream_end"}:
             return "done"
         return "other"
 
@@ -44,12 +60,14 @@ def render_stream_event(event: Any, output_json: bool, *, done_message: str) -> 
         msg = ""
         data = getattr(event, "json_data", None)
         if isinstance(data, dict):
-            msg = str(data.get("message") or "")
+            msg = _format_structured_error(data)
         print_error(msg or str(getattr(event, "data", "") or ""))
         return "error"
 
     data = getattr(event, "json_data", None)
-    if getattr(event, "event", "") == "done" or (isinstance(data, dict) and data.get("type") == "done"):
+    if getattr(event, "event", "") == "done" or (
+        isinstance(data, dict) and str(data.get("type") or "").strip() in {"done", "stream_end"}
+    ):
         print_sse_status("完成", done_message, "green")
         return "done"
 
@@ -60,6 +78,10 @@ def render_stream_event(event: Any, output_json: bool, *, done_message: str) -> 
         return "other"
 
     event_type = str(data.get("type") or "")
+
+    if event_type == "error":
+        print_error(_format_structured_error(data))
+        return "error"
 
     if "delta" in data:
         print_sse_delta(str(data.get("delta") or ""))
@@ -123,6 +145,15 @@ def render_stream_event(event: Any, output_json: bool, *, done_message: str) -> 
     if event_type == "review":
         verdict = str(data.get("verdict") or "")
         print_sse_status("审查", f"审查结论: {verdict}", "blue")
+        return "other"
+
+    if event_type == "step_error":
+        code = str(data.get("code") or "").strip()
+        message = str(data.get("message") or "").strip()
+        non_retriable = bool(data.get("non_retriable_failure"))
+        style = "red" if non_retriable else "yellow"
+        summary = f"[{code}] {message}" if code else message
+        print_sse_status("步骤失败", summary or "步骤执行失败", style)
         return "other"
 
     if event_type == "memory_item":

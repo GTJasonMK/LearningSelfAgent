@@ -277,7 +277,14 @@ class TestStreamCommands(unittest.TestCase):
         ]
         result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
         self.assertEqual(result.exit_code, 1)
-        self.assertIn("未收到 done 事件", result.output)
+        self.assertIn("未收到 done/stream_end 事件", result.output)
+
+    def test_ask_stream_json_stream_end_is_done(self):
+        events = [
+            SseEvent(event="done", data='{"type":"stream_end"}', json_data={"type": "stream_end"}),
+        ]
+        result = _invoke(["--json", "ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 0)
 
     def test_resume_stream_command_exists(self):
         events = [
@@ -322,11 +329,127 @@ class TestStreamCommands(unittest.TestCase):
             {"run_summary": "ok", "max_retries": 2, "on_failure": "continue"},
         )
 
+    def test_ask_stream_replay_events_can_recover_done(self):
+        stream_events = [
+            SseEvent(
+                event="message",
+                data='{"type":"run_created","task_id":1,"run_id":7}',
+                json_data={"type": "run_created", "task_id": 1, "run_id": 7},
+            ),
+        ]
+        replay_payload = {
+            "items": [
+                {
+                    "event_id": "sess_x:7:2:run_status",
+                    "payload": {
+                        "type": "run_status",
+                        "task_id": 1,
+                        "run_id": 7,
+                        "status": "done",
+                        "event_id": "sess_x:7:2:run_status",
+                    },
+                },
+                {
+                    "event_id": "sess_x:7:3:stream_end",
+                    "payload": {
+                        "type": "stream_end",
+                        "task_id": 1,
+                        "run_id": 7,
+                        "run_status": "done",
+                        "event_id": "sess_x:7:3:stream_end",
+                    },
+                },
+            ]
+        }
+        result = _invoke(
+            ["ask", "测试"],
+            responses={
+                "/agent/command/stream": stream_events,
+                "/agent/runs/7/events": replay_payload,
+            },
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("补齐 2 条事件", result.output)
+
+    def test_ask_stream_done_without_business_state_triggers_replay(self):
+        stream_events = [
+            SseEvent(
+                event="done",
+                data='{"type":"stream_end","task_id":1,"run_id":7}',
+                json_data={"type": "stream_end", "task_id": 1, "run_id": 7},
+            ),
+        ]
+        replay_payload = {
+            "items": [
+                {
+                    "event_id": "sess_x:7:2:run_status",
+                    "payload": {
+                        "type": "run_status",
+                        "task_id": 1,
+                        "run_id": 7,
+                        "status": "done",
+                        "event_id": "sess_x:7:2:run_status",
+                    },
+                },
+            ]
+        }
+        result = _invoke(
+            ["ask", "测试"],
+            responses={
+                "/agent/command/stream": stream_events,
+                "/agent/runs/7/events": replay_payload,
+            },
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("补齐 1 条事件", result.output)
+
+    def test_task_execute_stream_replay_events_can_recover_done(self):
+        stream_events = [
+            SseEvent(
+                event="message",
+                data='{"type":"run_created","task_id":9,"run_id":7}',
+                json_data={"type": "run_created", "task_id": 9, "run_id": 7},
+            ),
+        ]
+        replay_payload = {
+            "items": [
+                {
+                    "event_id": "task_exec:9:7:2:run_status",
+                    "payload": {
+                        "type": "run_status",
+                        "task_id": 9,
+                        "run_id": 7,
+                        "status": "done",
+                        "event_id": "task_exec:9:7:2:run_status",
+                    },
+                },
+                {
+                    "event_id": "task_exec:9:7:3:stream_end",
+                    "payload": {
+                        "type": "stream_end",
+                        "task_id": 9,
+                        "run_id": 7,
+                        "run_status": "done",
+                        "event_id": "task_exec:9:7:3:stream_end",
+                    },
+                },
+            ]
+        }
+        result = _invoke(
+            ["task", "execute", "9"],
+            responses={
+                "/tasks/9/execute/stream": stream_events,
+                "/agent/runs/7/events": replay_payload,
+            },
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("补齐 2 条事件", result.output)
+
     def test_task_execute_stream_without_done_fails(self):
         events = [SseEvent(event="message", data='{"delta":"running"}', json_data={"delta": "running"})]
         result = _invoke(["task", "execute", "9"], responses={"/tasks/9/execute/stream": events})
         self.assertEqual(result.exit_code, 1)
-        self.assertIn("未收到 done 事件", result.output)
+        self.assertIn("未收到 done/stream_end 事件", result.output)
 
 
 class TestConfigCommands(unittest.TestCase):

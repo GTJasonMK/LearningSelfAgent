@@ -69,6 +69,8 @@ def _fallback_brief_from_title(title: str, max_len: int = AGENT_PLAN_BRIEF_MAX_C
         "task_output：",
         "shell_command:",
         "shell_command：",
+        "script_run:",
+        "script_run：",
     ):
         if value.startswith(prefix):
             value = value[len(prefix) :].strip()

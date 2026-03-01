@@ -5,6 +5,41 @@ from unittest.mock import patch
 
 
 class TestLlmBaseUrlFallback(unittest.TestCase):
+    def test_call_llm_applies_timeout_and_strips_control_keys(self):
+        import backend.src.services.llm.llm_client as llm_client
+
+        seen = {"timeout": None, "parameters": None}
+
+        class FakeClient:
+            def __init__(self, provider=None, api_key=None, base_url=None, default_model=None, strict_mode=False):
+                _ = provider, api_key, base_url, default_model, strict_mode
+                self._provider_name = "openai"
+                self._default_model = "m1"
+
+            def complete_prompt_sync(self, prompt, model=None, parameters=None, timeout=120):
+                _ = prompt, model
+                seen["timeout"] = timeout
+                seen["parameters"] = dict(parameters or {})
+                return "ok", {"total": 1}
+
+        @contextlib.contextmanager
+        def _fake_guard(_key):
+            yield
+
+        with patch.object(llm_client, "LLMClient", FakeClient), patch.object(
+            llm_client, "_llm_concurrency_guard", side_effect=_fake_guard
+        ), patch.object(llm_client, "LLM_CALL_TIMEOUT_SECONDS", 41):
+            out, _tokens = llm_client.call_llm(
+                "hello",
+                "m1",
+                {"temperature": 0.1, "timeout_seconds": 19, "timeout": 23},
+                provider="openai",
+            )
+
+        self.assertEqual(out, "ok")
+        self.assertEqual(seen["timeout"], 23)
+        self.assertEqual(seen["parameters"], {"temperature": 0.1})
+
     def test_call_llm_tries_fallback_base_urls_on_transient_errors(self):
         import backend.src.services.llm.llm_client as llm_client
 

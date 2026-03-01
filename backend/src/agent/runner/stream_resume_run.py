@@ -43,6 +43,10 @@ from backend.src.agent.runner.execution_pipeline import (
     retrieve_all_knowledge,
 )
 from backend.src.agent.runner.stream_status_event import normalize_stream_run_status
+from backend.src.agent.runner.stream_convergence import (
+    build_stream_error_payload,
+    resolve_terminal_meta,
+)
 from backend.src.agent.support import (
     _assess_knowledge_sufficiency,
     _collect_tools_from_solutions,
@@ -279,7 +283,21 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
         try:
             run = await asyncio.to_thread(get_task_run, run_id=run_id)
             if not run:
-                yield _emit(sse_json({"message": "run 不存在"}, event="error"))
+                yield _emit(
+                    sse_json(
+                        build_stream_error_payload(
+                            error_code="resume_run_not_found",
+                            error_message="run 不存在",
+                            phase="resume_preflight",
+                            task_id=None,
+                            run_id=run_id,
+                            recoverable=False,
+                            retryable=False,
+                            terminal_source="runtime",
+                        ),
+                        event="error",
+                    )
+                )
                 await _cleanup_resume_resources_once(RUN_STATUS_FAILED)
                 return
             task_id = int(run["task_id"])
@@ -330,7 +348,21 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                     task_id,
                     run_id,
                 )
-                yield _emit(sse_json({"message": "agent_plan 缺失，无法 resume"}, event="error"))
+                yield _emit(
+                    sse_json(
+                        build_stream_error_payload(
+                            error_code="resume_missing_agent_plan",
+                            error_message="agent_plan 缺失，无法 resume",
+                            phase="resume_preflight",
+                            task_id=task_id,
+                            run_id=run_id,
+                            recoverable=False,
+                            retryable=False,
+                            terminal_source="runtime",
+                        ),
+                        event="error",
+                    )
+                )
                 await _cleanup_resume_resources_once(RUN_STATUS_FAILED)
                 return
 
@@ -507,7 +539,17 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                 missing_visible_result = stream_state.build_missing_visible_result_if_needed(normalized_status)
                 if missing_visible_result:
                     yield missing_visible_result
-                yield _emit(done_sse_event(run_status=str(normalized_status or "")))
+                terminal_meta = resolve_terminal_meta(
+                    normalized_status,
+                    status_source="runtime",
+                )
+                yield _emit(
+                    done_sse_event(
+                        run_status=str(terminal_meta.run_status or ""),
+                        completion_reason=str(terminal_meta.completion_reason or ""),
+                        terminal_source=str(terminal_meta.terminal_source or ""),
+                    )
+                )
                 await _cleanup_resume_resources_once(normalized_status or run_status)
                 return
 
@@ -613,15 +655,19 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                             yield status_event
                         yield _emit(
                             sse_json(
-                                {
-                                    "message": format_task_error(
+                                build_stream_error_payload(
+                                    error_code="pending_planning_resume_failed",
+                                    error_message=format_task_error(
                                         code="pending_planning_resume_failed",
                                         message="pending planning 恢复失败，执行已收敛为 failed",
                                     ),
-                                    "code": "pending_planning_resume_failed",
-                                    "task_id": task_id,
-                                    "run_id": run_id,
-                                },
+                                    phase="resume_pending_planning",
+                                    task_id=task_id,
+                                    run_id=run_id,
+                                    recoverable=False,
+                                    retryable=False,
+                                    terminal_source="runtime",
+                                ),
                                 event="error",
                             )
                         )
@@ -799,12 +845,16 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
             try:
                 yield _emit(
                     sse_json(
-                        {
-                            "message": user_message,
-                            "code": error_code,
-                            "task_id": task_id,
-                            "run_id": run_id,
-                        },
+                        build_stream_error_payload(
+                            error_code=error_code,
+                            error_message=user_message,
+                            phase="resume_exception",
+                            task_id=task_id,
+                            run_id=run_id,
+                            recoverable=False,
+                            retryable=False,
+                            terminal_source="runtime",
+                        ),
                         event="error",
                     )
                 )
@@ -818,9 +868,11 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
 
         # 正常结束/异常结束均尽量发送 done；若客户端已断开则直接结束 generator。
         normalized_status = ""
+        status_source = "runtime"
         try:
             normalized_status = normalize_stream_run_status(run_status)
             if not normalized_status:
+                status_source = "fallback"
                 db_run = await asyncio.to_thread(get_task_run, run_id=int(run_id))
                 db_status = ""
                 if db_run is not None:
@@ -828,7 +880,11 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                         db_status = normalize_stream_run_status(db_run["status"])
                     except Exception:
                         db_status = ""
-                normalized_status = db_status or RUN_STATUS_FAILED
+                if db_status:
+                    normalized_status = db_status
+                    status_source = "db"
+                else:
+                    normalized_status = RUN_STATUS_FAILED
                 anomaly_message = format_task_error(
                     code="stream_missing_terminal_status",
                     message=(
@@ -837,31 +893,50 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                 )
                 yield _emit(
                     sse_json(
-                        {
-                            "message": anomaly_message,
-                            "code": "stream_missing_terminal_status",
-                            "task_id": task_id,
-                            "run_id": run_id,
-                            "resolved_status": normalized_status,
-                        },
+                        build_stream_error_payload(
+                            error_code="stream_missing_terminal_status",
+                            error_message=anomaly_message,
+                            phase="resume_finalize",
+                            task_id=task_id,
+                            run_id=run_id,
+                            recoverable=False,
+                            retryable=False,
+                            terminal_source=status_source,
+                            details={
+                                "resolved_status": normalized_status,
+                                "status_source": status_source,
+                            },
+                        ),
                         event="error",
                     )
                 )
-            missing_visible_result = stream_state.build_missing_visible_result_if_needed(normalized_status)
+            terminal_meta = resolve_terminal_meta(
+                normalized_status,
+                status_source=status_source,
+            )
+            missing_visible_result = stream_state.build_missing_visible_result_if_needed(
+                terminal_meta.run_status
+            )
             if missing_visible_result:
                 yield missing_visible_result
-            status_event = _emit_run_status(normalized_status)
+            status_event = _emit_run_status(terminal_meta.run_status)
             if status_event:
                 yield status_event
-            yield _emit(done_sse_event(run_status=str(normalized_status or "")))
+            yield _emit(
+                done_sse_event(
+                    run_status=str(terminal_meta.run_status or ""),
+                    completion_reason=str(terminal_meta.completion_reason or ""),
+                    terminal_source=str(terminal_meta.terminal_source or ""),
+                )
+            )
             logger.info(
                 "[agent.resume] finalized task_id=%s run_id=%s status=%s last_step=%s",
                 task_id,
                 run_id,
-                normalized_status,
+                terminal_meta.run_status,
                 last_step_order,
             )
-            _finalize_token_once(normalized_status or "done")
+            _finalize_token_once(terminal_meta.run_status or "done")
         except BaseException:
             return
         finally:

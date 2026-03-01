@@ -18,6 +18,7 @@ from typing import Any, AsyncGenerator, Callable, List, Optional
 
 from backend.src.constants import RUN_STATUS_FAILED, TASK_OUTPUT_TYPE_DEBUG, TASK_OUTPUT_TYPE_TEXT
 from backend.src.common.task_error_codes import format_task_error
+from backend.src.agent.runner.stream_convergence import build_stream_error_payload
 from backend.src.agent.runner.failed_output_helpers import (
     build_failed_task_output_content as build_failed_task_output_content_shared,
     extract_step_error_text as extract_step_error_text_shared,
@@ -311,12 +312,16 @@ async def handle_execution_exception(
     try:
         yield_func(
             sse_json(
-                {
-                    "message": user_message,
-                    "code": error_code,
-                    "task_id": task_id,
-                    "run_id": run_id,
-                },
+                build_stream_error_payload(
+                    error_code=error_code,
+                    error_message=user_message,
+                    phase=f"{mode_prefix}_exception",
+                    task_id=task_id,
+                    run_id=run_id,
+                    recoverable=False,
+                    retryable=False,
+                    terminal_source="runtime",
+                ),
                 event="error",
             )
         )

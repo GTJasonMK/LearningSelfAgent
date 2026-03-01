@@ -15,6 +15,7 @@ from backend.src.agent.runner.stream_status_event import (
     is_legal_stream_run_status_transition,
     normalize_stream_run_status,
 )
+from backend.src.agent.runner.stream_convergence import resolve_terminal_meta
 from backend.src.agent.runner.stream_task_events import iter_stream_task_events
 from backend.src.constants import RUN_STATUS_DONE, RUN_STATUS_FAILED, RUN_STATUS_STOPPED, STREAM_TAG_RESULT
 from backend.src.common.utils import parse_optional_int
@@ -117,11 +118,22 @@ async def iter_execution_exception_events(
             yield str(event_payload)
 
 
-def done_sse_event(*, run_status: Optional[str] = None) -> str:
+def done_sse_event(
+    *,
+    run_status: Optional[str] = None,
+    completion_reason: Optional[str] = None,
+    terminal_source: Optional[str] = None,
+) -> str:
     payload = {"type": "stream_end", "kind": "stream_end"}
-    status_text = str(run_status or "").strip().lower()
+    terminal = resolve_terminal_meta(
+        run_status,
+        status_source=str(terminal_source or "").strip() or "runtime",
+    )
+    status_text = str(terminal.run_status or "").strip().lower()
     if status_text:
         payload["run_status"] = status_text
+    payload["completion_reason"] = str(completion_reason or terminal.completion_reason or "").strip() or "unknown"
+    payload["terminal_source"] = str(terminal_source or terminal.terminal_source or "").strip() or "runtime"
     return sse_json(payload, event="done")
 
 

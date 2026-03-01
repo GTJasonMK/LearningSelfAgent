@@ -25,6 +25,7 @@ _REACT_ERROR_POLICY_ENV = "AGENT_REACT_ERROR_POLICY_MATRIX"
 class ReactErrorPolicyMatrix:
     structural_replan_codes: FrozenSet[str]
     env_replan_codes: FrozenSet[str]
+    non_retriable_codes: FrozenSet[str]
     legacy_keywords: Tuple[str, ...]
 
 
@@ -37,9 +38,20 @@ _DEFAULT_MATRIX = ReactErrorPolicyMatrix(
             "plan_patch_not_action",
             "policy_blocked_python_c",
             "script_arg_contract_mismatch",
+            "script_args_missing",
+            "missing_expected_artifact",
+            "script_output_not_json",
         }
     ),
     env_replan_codes=frozenset({"dependency_missing"}),
+    non_retriable_codes=frozenset(
+        {
+            "invalid_action_payload",
+            "invalid_tool_payload",
+            "missing_tool_exec_spec",
+            "tool_exec_contract_error",
+        }
+    ),
     legacy_keywords=(
         "tool_call.input 不能为空",
         "action 输出不是有效 JSON",
@@ -99,10 +111,12 @@ def _resolve_react_error_policy_matrix_cached(raw: str) -> ReactErrorPolicyMatri
 
     structural = _normalize_code_set(obj.get("structural_replan_codes"))
     env_codes = _normalize_code_set(obj.get("env_replan_codes"))
+    non_retriable_codes = _normalize_code_set(obj.get("non_retriable_codes"))
     keywords = _normalize_keyword_tuple(obj.get("legacy_keywords"))
     return ReactErrorPolicyMatrix(
         structural_replan_codes=structural or _DEFAULT_MATRIX.structural_replan_codes,
         env_replan_codes=env_codes or _DEFAULT_MATRIX.env_replan_codes,
+        non_retriable_codes=non_retriable_codes or _DEFAULT_MATRIX.non_retriable_codes,
         legacy_keywords=keywords or _DEFAULT_MATRIX.legacy_keywords,
     )
 
@@ -137,5 +151,23 @@ def should_force_replan_on_action_error(error_text: str) -> bool:
         if is_source_failure_error_code(code):
             return True
         return any(keyword in str(error_text or "") for keyword in matrix.legacy_keywords)
+    except Exception:
+        return False
+
+
+def should_fail_fast_on_step_error(error_text: str) -> bool:
+    """
+    判断步骤执行错误是否应“立即终止”而非继续 replan/重试。
+
+    原则：
+    - 仅针对确定性契约错误（参数/协议错误）；
+    - 外部源失败（rate_limited/dns/tls 等）仍允许 replan 换源。
+    """
+    try:
+        matrix = resolve_react_error_policy_matrix()
+        code = extract_task_error_code(str(error_text or ""))
+        if not code:
+            return False
+        return code in matrix.non_retriable_codes
     except Exception:
         return False

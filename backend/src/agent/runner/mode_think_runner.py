@@ -11,6 +11,7 @@ from backend.src.agent.runner.feedback import is_task_feedback_step_title
 from backend.src.agent.runner import react_loop as react_loop_facade
 from backend.src.agent.runner.react_loop import run_react_loop
 from backend.src.agent.runner.stream_pump import pump_sync_generator
+from backend.src.agent.runner.stream_status_event import normalize_stream_run_status
 from backend.src.agent.runner.think_parallel_loop import run_think_parallel_loop
 from backend.src.agent.think import infer_executor_assignments, merge_fix_steps_into_plan, run_reflection
 from backend.src.agent.think.think_execution import _infer_executor_from_allow
@@ -20,12 +21,13 @@ from backend.src.constants import (
     AGENT_STREAM_PUMP_POLL_INTERVAL_SECONDS,
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
+    RUN_STATUS_RUNNING,
     STEP_STATUS_FAILED,
     STREAM_TAG_FAIL,
     STREAM_TAG_REFLECTION,
 )
 from backend.src.services.llm.llm_client import sse_json
-from backend.src.services.tasks.task_queries import list_task_steps_for_run, mark_task_step_skipped
+from backend.src.services.tasks.task_queries import get_task_run, list_task_steps_for_run, mark_task_step_skipped
 
 
 @dataclass
@@ -242,6 +244,21 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
 
     async def _pump_inner(inner, *, label: str):
         result = None
+
+        def _read_external_terminal_status() -> Optional[str]:
+            try:
+                row = get_task_run(run_id=int(run_id))
+            except Exception:
+                return None
+            if not row:
+                return ""
+            status = normalize_stream_run_status(row["status"])
+            if not status:
+                return ""
+            if status == RUN_STATUS_RUNNING:
+                return ""
+            return status
+
         async for kind, payload in pump_sync_generator(
             inner=inner,
             label=str(label or "think"),
@@ -259,11 +276,14 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
             ),
             heartbeat_min_interval_seconds=float(heartbeat_min_interval_seconds),
             heartbeat_trigger_debounce_seconds=float(heartbeat_trigger_debounce_seconds),
+            stop_status_provider=_read_external_terminal_status,
         ):
             if kind == "msg":
                 if payload:
                     yield_func(str(payload))
                 continue
+            if kind == "stop":
+                return {"_stream_stop_status": str(payload or "").strip().lower()}
             if kind == "done":
                 result = payload
                 break
@@ -326,6 +346,16 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
 
         exec_started_at = time.monotonic()
         parallel_result = await _pump_inner(inner_parallel, label=str(parallel_pump_label or "think_parallel"))
+        if isinstance(parallel_result, dict) and str(parallel_result.get("_stream_stop_status") or "").strip():
+            run_status = str(parallel_result.get("_stream_stop_status") or "").strip()
+            return ThinkExecutionResult(
+                run_status=str(run_status),
+                last_step_order=int(last_step_order),
+                reflection_count=int(reflection_count),
+                plan_briefs=list(plan_briefs),
+                agent_state=dict(agent_state),
+                plan_struct=plan_struct,
+            )
         run_status = str(parallel_result.run_status or "")
         last_step_order = int(getattr(parallel_result, "last_step_order", 0) or 0)
 
@@ -353,6 +383,16 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
                 step_llm_config_resolver=step_llm_config_resolver,
             )
             tail_result = await _pump_inner(inner_tail, label=str(tail_pump_label or "think_react_tail"))
+            if isinstance(tail_result, dict) and str(tail_result.get("_stream_stop_status") or "").strip():
+                run_status = str(tail_result.get("_stream_stop_status") or "").strip()
+                return ThinkExecutionResult(
+                    run_status=str(run_status),
+                    last_step_order=int(last_step_order),
+                    reflection_count=int(reflection_count),
+                    plan_briefs=list(plan_briefs),
+                    agent_state=dict(agent_state),
+                    plan_struct=plan_struct,
+                )
             run_status = str(getattr(tail_result, "run_status", "") or "")
             last_step_order = int(getattr(tail_result, "last_step_order", 0) or 0)
 

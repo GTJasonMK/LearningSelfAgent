@@ -44,7 +44,8 @@ class TestStreamModeLifecycleDoneTail(unittest.IsolatedAsyncioTestCase):
 
         anomaly = next((p for p in payloads if str(p.get("code") or "") == "stream_missing_terminal_status"), None)
         self.assertIsNotNone(anomaly)
-        self.assertEqual(str(anomaly.get("resolved_status") or ""), "failed")
+        details = anomaly.get("details") if isinstance(anomaly.get("details"), dict) else {}
+        self.assertEqual(str(details.get("resolved_status") or ""), "failed")
 
         run_status = next((p for p in payloads if str(p.get("type") or "") == "run_status"), None)
         self.assertIsNotNone(run_status)
@@ -53,6 +54,8 @@ class TestStreamModeLifecycleDoneTail(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(done)
         self.assertEqual(str(done.get("kind") or ""), "stream_end")
         self.assertEqual(str(done.get("run_status") or ""), "failed")
+        self.assertEqual(str(done.get("completion_reason") or ""), "failed_from_db")
+        self.assertEqual(str(done.get("terminal_source") or ""), "db")
         self.assertTrue(bool(str(done.get("event_id") or "").strip()))
 
     async def test_done_tail_does_not_emit_observability_error_when_status_present(self):
@@ -76,6 +79,8 @@ class TestStreamModeLifecycleDoneTail(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(done)
         self.assertEqual(str(done.get("kind") or ""), "stream_end")
         self.assertEqual(str(done.get("run_status") or ""), "done")
+        self.assertEqual(str(done.get("completion_reason") or ""), "completed")
+        self.assertEqual(str(done.get("terminal_source") or ""), "runtime")
 
 
 if __name__ == "__main__":

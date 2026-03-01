@@ -1352,6 +1352,8 @@ def _draft_solution_from_skills(
             return ["tool_call"]
         if t.startswith("shell_command:") or t.startswith("[shell_command]"):
             return ["shell_command"]
+        if t.startswith("script_run:") or t.startswith("[script_run]"):
+            return ["shell_command"]
         if t.startswith("http_request:") or t.startswith("[http_request]"):
             return ["http_request"]
         if t.startswith("json_parse:") or t.startswith("[json_parse]"):

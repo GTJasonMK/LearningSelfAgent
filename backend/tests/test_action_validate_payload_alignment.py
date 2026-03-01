@@ -62,6 +62,47 @@ class TestActionValidatePayloadAlignment(unittest.TestCase):
         )
         self.assertEqual(err, "tool_call.input 不能为空")
 
+    def test_tool_call_allows_empty_optional_id_fields(self):
+        from backend.src.actions.registry import validate_action_object
+
+        err = validate_action_object(
+            {
+                "action": {
+                    "type": "tool_call",
+                    "payload": {
+                        "tool_name": "web_fetch",
+                        "input": "https://example.com",
+                        "output": "",
+                        "tool_id": "",
+                        "task_id": "",
+                        "run_id": "",
+                        "skill_id": "",
+                    },
+                }
+            }
+        )
+        self.assertIsNone(err)
+
+    def test_tool_call_rejects_invalid_optional_id_fields(self):
+        from backend.src.actions.registry import validate_action_object
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        err = validate_action_object(
+            {
+                "action": {
+                    "type": "tool_call",
+                    "payload": {
+                        "tool_name": "web_fetch",
+                        "input": "https://example.com",
+                        "output": "",
+                        "tool_id": "abc",
+                    },
+                }
+            }
+        )
+        self.assertIsNotNone(err)
+        self.assertEqual(extract_task_error_code(str(err)), "invalid_action_payload")
+
     def test_file_list_rejects_non_string_path(self):
         from backend.src.actions.registry import validate_action_object
 
@@ -96,6 +137,28 @@ class TestActionValidatePayloadAlignment(unittest.TestCase):
                 "action": {
                     "type": "shell_command",
                     "payload": {"command": ["echo", "hi"], "workdir": self._tmpdir.name},
+                }
+            }
+        )
+        self.assertIsNone(err)
+
+    def test_script_run_alias_accepts_structured_payload(self):
+        from backend.src.actions.registry import validate_action_object
+
+        err = validate_action_object(
+            {
+                "action": {
+                    "type": "script_run",
+                    "payload": {
+                        "script": "backend/.agent/workspace/demo.py",
+                        "args": ["--input", "a.json", "--output", "b.csv"],
+                        "required_args": ["--input", "--output"],
+                        "expected_outputs": ["data/out.csv"],
+                        "parse_json_output": False,
+                        "discover_required_args": True,
+                        "stdin_from_context": False,
+                        "workdir": self._tmpdir.name,
+                    },
                 }
             }
         )
@@ -140,4 +203,3 @@ class TestActionValidatePayloadAlignment(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

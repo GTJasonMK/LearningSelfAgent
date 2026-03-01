@@ -10,6 +10,10 @@ from backend.src.agent.runner.stream_entry_common import (
     done_sse_event,
     iter_execution_exception_events,
 )
+from backend.src.agent.runner.stream_convergence import (
+    build_stream_error_payload,
+    resolve_terminal_meta,
+)
 from backend.src.agent.runner.stream_status_event import normalize_stream_run_status
 from backend.src.common.task_error_codes import format_task_error
 from backend.src.constants import RUN_STATUS_FAILED, RUN_STATUS_RUNNING
@@ -130,25 +134,41 @@ async def iter_stream_done_tail(
             )
             yield lifecycle.emit(
                 sse_json(
-                    {
-                        "message": anomaly_message,
-                        "code": "stream_missing_terminal_status",
-                        "task_id": lifecycle.task_id,
-                        "run_id": lifecycle.run_id,
-                        "resolved_status": normalized_status,
-                        "status_source": status_source,
-                    },
+                    build_stream_error_payload(
+                        error_code="stream_missing_terminal_status",
+                        error_message=anomaly_message,
+                        phase="stream_finalize",
+                        task_id=lifecycle.task_id,
+                        run_id=lifecycle.run_id,
+                        recoverable=False,
+                        retryable=False,
+                        terminal_source=status_source,
+                        details={
+                            "resolved_status": normalized_status,
+                            "status_source": status_source,
+                        },
+                    ),
                     event="error",
                 )
             )
+        terminal_meta = resolve_terminal_meta(
+            normalized_status,
+            status_source=status_source,
+        )
         missing_visible_result = lifecycle.stream_state.build_missing_visible_result_if_needed(
-            normalized_status
+            terminal_meta.run_status
         )
         if missing_visible_result:
             yield missing_visible_result
-        status_event = lifecycle.emit_run_status(normalized_status)
+        status_event = lifecycle.emit_run_status(terminal_meta.run_status)
         if status_event:
             yield status_event
-        yield lifecycle.emit(done_sse_event(run_status=str(normalized_status or "")))
+        yield lifecycle.emit(
+            done_sse_event(
+                run_status=str(terminal_meta.run_status or ""),
+                completion_reason=str(terminal_meta.completion_reason or ""),
+                terminal_source=str(terminal_meta.terminal_source or ""),
+            )
+        )
     except BaseException:
         return

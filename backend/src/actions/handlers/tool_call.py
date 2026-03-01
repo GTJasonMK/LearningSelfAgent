@@ -3,7 +3,8 @@ import re
 import shlex
 import time
 from functools import lru_cache
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from backend.src.actions.handlers.common_utils import (
     load_json_object,
@@ -13,7 +14,7 @@ from backend.src.actions.handlers.common_utils import (
 )
 from backend.src.common.path_utils import normalize_windows_abs_path_on_posix
 from backend.src.common.task_error_codes import format_task_error
-from backend.src.common.utils import parse_json_dict, parse_json_value
+from backend.src.common.utils import parse_json_dict, parse_json_value, parse_positive_int
 from backend.src.constants import (
     ACTION_TYPE_TOOL_CALL,
     AGENT_EXPERIMENT_DIR_REL,
@@ -26,6 +27,9 @@ from backend.src.constants import (
     WEB_FETCH_BLOCK_MARKERS_DEFAULT,
     AGENT_WEB_FETCH_BLOCK_MARKERS_ENV,
     AGENT_WEB_FETCH_BLOCK_MARKERS_MAX,
+    AGENT_WEB_FETCH_FALLBACK_URL_TEMPLATES_ENV,
+    AGENT_WEB_FETCH_FALLBACK_MAX_CANDIDATES,
+    WEB_FETCH_FALLBACK_URL_TEMPLATES_DEFAULT,
     TOOL_METADATA_SOURCE_AUTO,
     SHELL_COMMAND_REQUIRE_FILE_WRITE_BINDING_DEFAULT,
 )
@@ -198,6 +202,341 @@ def _detect_web_fetch_semantic_error(output_text: str) -> Optional[str]:
     return "semantic_error"
 
 
+def _iter_env_web_fetch_fallback_templates(raw_env: str) -> List[str]:
+    text = str(raw_env or "").strip()
+    if not text:
+        return []
+    payload = parse_json_value(text)
+    if not isinstance(payload, list):
+        return []
+    parsed: List[str] = []
+    for item in payload:
+        current = str(item or "").strip()
+        if current:
+            parsed.append(current)
+    return parsed
+
+
+def _normalize_web_fetch_url_candidate(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return text
+
+
+def _extract_web_fetch_host(value: object) -> str:
+    text = _normalize_web_fetch_url_candidate(value)
+    if not text:
+        return ""
+    try:
+        return str(urlparse(text).netloc or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _build_exchangerate_fallback_urls(input_url: str) -> List[str]:
+    """
+    exchangerate.host 常见问题是返回 missing_access_key，这里提供免 key 备用源。
+    """
+    normalized = _normalize_web_fetch_url_candidate(input_url)
+    if not normalized:
+        return []
+    parsed = urlparse(normalized)
+    host = str(parsed.netloc or "").strip().lower()
+    if "exchangerate.host" not in host:
+        return []
+
+    query = parse_qs(parsed.query or "", keep_blank_values=False)
+    base = str((query.get("base") or [""])[0] or "").strip().upper()
+    symbols_raw = str((query.get("symbols") or [""])[0] or "").strip().upper()
+    start_date = str((query.get("start_date") or [""])[0] or "").strip()
+    end_date = str((query.get("end_date") or [""])[0] or "").strip()
+    symbols = ",".join([token for token in (part.strip() for part in symbols_raw.split(",")) if token])
+
+    candidates: List[str] = []
+    if base and symbols and start_date and end_date:
+        candidates.append(
+            f"https://api.frankfurter.app/{start_date}..{end_date}?from={base}&to={symbols}"
+        )
+    elif base and symbols:
+        candidates.append(
+            f"https://api.frankfurter.app/latest?from={base}&to={symbols}"
+        )
+    elif base:
+        candidates.append(f"https://api.frankfurter.app/latest?from={base}")
+
+    if base:
+        candidates.append(f"https://open.er-api.com/v6/latest/{base}")
+    return candidates
+
+
+def _render_web_fetch_fallback_template(template: str, source_url: str) -> str:
+    normalized = _normalize_web_fetch_url_candidate(source_url)
+    if not normalized:
+        return ""
+    parsed = urlparse(normalized)
+    rendered = str(template or "")
+    substitutions = {
+        "{url}": normalized,
+        "{scheme}": str(parsed.scheme or ""),
+        "{host}": str(parsed.netloc or ""),
+        "{path}": str(parsed.path or ""),
+        "{query}": str(parsed.query or ""),
+    }
+    for token, value in substitutions.items():
+        rendered = rendered.replace(token, value)
+    return _normalize_web_fetch_url_candidate(rendered)
+
+
+def _build_web_fetch_fallback_urls(source_url: str) -> List[str]:
+    normalized = _normalize_web_fetch_url_candidate(source_url)
+    if not normalized:
+        return []
+
+    merged_templates: List[str] = []
+    for item in WEB_FETCH_FALLBACK_URL_TEMPLATES_DEFAULT or ():
+        current = str(item or "").strip()
+        if current:
+            merged_templates.append(current)
+    for item in _iter_env_web_fetch_fallback_templates(
+        os.getenv(AGENT_WEB_FETCH_FALLBACK_URL_TEMPLATES_ENV, "")
+    ):
+        merged_templates.append(item)
+
+    rendered_urls: List[str] = []
+    for template in merged_templates:
+        candidate = _render_web_fetch_fallback_template(template, normalized)
+        if candidate:
+            rendered_urls.append(candidate)
+
+    fallback_urls = _build_exchangerate_fallback_urls(normalized) + rendered_urls
+
+    deduped: List[str] = []
+    seen = {normalized}
+    for item in fallback_urls:
+        current = _normalize_web_fetch_url_candidate(item)
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        deduped.append(current)
+
+    try:
+        limit = max(1, int(AGENT_WEB_FETCH_FALLBACK_MAX_CANDIDATES or 4))
+    except Exception:
+        limit = 4
+    return deduped[:limit]
+
+
+def _classify_web_fetch_exec_error(error_text: str) -> Tuple[str, str]:
+    lowered = str(error_text or "").strip().lower()
+    if not lowered:
+        return "web_fetch_blocked", "exec_error"
+    if "429" in lowered or "too many requests" in lowered or "rate limit" in lowered or "daily hits limit" in lowered:
+        return "rate_limited", "too_many_requests"
+    if "403" in lowered or "access denied" in lowered or "forbidden" in lowered:
+        return "web_fetch_blocked", "access_denied"
+    if "503" in lowered or "service unavailable" in lowered:
+        return "service_unavailable", "service_unavailable"
+    if "missing_access_key" in lowered or "access key" in lowered or "api key" in lowered:
+        return "missing_api_key", "missing_access_key"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout", "timeout"
+    return "web_fetch_blocked", "exec_error"
+
+
+def _classify_web_fetch_result(output_text: str, exec_error: Optional[str]) -> Dict[str, str]:
+    if exec_error:
+        code, reason = _classify_web_fetch_exec_error(exec_error)
+        return {
+            "ok": "0",
+            "error_code": code,
+            "reason": reason,
+            "detail": truncate_inline_text(exec_error, 240),
+        }
+
+    block_reason = _detect_web_fetch_block_reason(output_text)
+    if block_reason:
+        code = "rate_limited" if block_reason == "too_many_requests" else "web_fetch_blocked"
+        return {
+            "ok": "0",
+            "error_code": code,
+            "reason": block_reason,
+            "detail": truncate_inline_text(output_text, 240),
+        }
+
+    semantic_error = _detect_web_fetch_semantic_error(output_text)
+    if semantic_error:
+        semantic_lower = str(semantic_error).lower()
+        code = "missing_api_key" if ("missing_access_key" in semantic_lower or "access key" in semantic_lower) else "web_fetch_blocked"
+        reason = "missing_access_key" if code == "missing_api_key" else "semantic_error"
+        return {
+            "ok": "0",
+            "error_code": code,
+            "reason": reason,
+            "detail": truncate_inline_text(semantic_error, 240),
+        }
+
+    return {"ok": "1", "error_code": "", "reason": "", "detail": ""}
+
+
+def _should_block_host_after_web_fetch_error(error_code: str, reason: str) -> bool:
+    normalized_code = str(error_code or "").strip().lower()
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_code in {"missing_api_key", "rate_limited", "timeout", "service_unavailable"}:
+        return True
+    if normalized_code != "web_fetch_blocked":
+        return False
+    host_block_reasons = {
+        "access_denied",
+        "request_blocked",
+        "cloudflare",
+        "captcha",
+        "verify_human",
+        "enable_javascript",
+        "missing_access_key",
+        "exec_error",
+    }
+    return normalized_reason in host_block_reasons
+
+
+def _build_web_fetch_attempt_summary(attempts: List[dict]) -> str:
+    chunks: List[str] = []
+    for item in attempts[-6:]:
+        status = str(item.get("status") or "").strip()
+        host = str(item.get("host") or "").strip() or "unknown-host"
+        code = str(item.get("error_code") or "").strip()
+        if code:
+            chunks.append(f"{host}:{status}:{code}")
+        else:
+            chunks.append(f"{host}:{status}")
+    return " | ".join(chunks)
+
+
+def _execute_web_fetch_with_fallback(exec_spec: dict, tool_input: str) -> dict:
+    """
+    web_fetch 自动换源执行：
+    - 原始 URL 失败后尝试有限候选源；
+    - 对同 host 的硬失败（403/missing key/限流）进行去重，避免无意义重试。
+    """
+    primary = _normalize_web_fetch_url_candidate(tool_input)
+    if not primary:
+        output_text, exec_error = _execute_tool_with_exec_spec(exec_spec, str(tool_input))
+        classified = _classify_web_fetch_result(str(output_text or ""), exec_error)
+        if str(classified.get("ok")) == "1":
+            return {
+                "ok": True,
+                "output_text": str(output_text or ""),
+                "warnings": [],
+                "attempts": [],
+                "error_code": "",
+                "error_message": "",
+            }
+        return {
+            "ok": False,
+            "output_text": str(output_text or ""),
+            "warnings": [],
+            "attempts": [],
+            "error_code": str(classified.get("error_code") or "web_fetch_blocked"),
+            "error_message": str(classified.get("detail") or "web_fetch 执行失败"),
+        }
+
+    candidates = [primary] + _build_web_fetch_fallback_urls(primary)
+    attempts: List[dict] = []
+    warnings: List[str] = []
+    blocked_hosts: Set[str] = set()
+    last_output = ""
+    final_error_code = "web_fetch_blocked"
+    final_reason = "unknown"
+    final_detail = ""
+
+    for index, candidate_url in enumerate(candidates):
+        host = _extract_web_fetch_host(candidate_url)
+        if index > 0 and host and host in blocked_hosts:
+            attempts.append(
+                {
+                    "url": candidate_url,
+                    "host": host,
+                    "status": "skipped",
+                    "error_code": "same_host_blocked",
+                    "reason": "same_host_blocked",
+                    "detail": "同 host 已判定不可用，跳过重复重试",
+                }
+            )
+            continue
+
+        output_text, exec_error = _execute_tool_with_exec_spec(exec_spec, candidate_url)
+        current_output = str(output_text or "")
+        if current_output.strip():
+            last_output = current_output
+        classified = _classify_web_fetch_result(current_output, exec_error)
+
+        if str(classified.get("ok")) == "1":
+            attempts.append(
+                {
+                    "url": candidate_url,
+                    "host": host,
+                    "status": "ok",
+                    "error_code": "",
+                    "reason": "",
+                    "detail": "",
+                }
+            )
+            if index > 0:
+                warnings.append(
+                    "web_fetch 已自动切换到备用源："
+                    f"{truncate_inline_text(primary, 120)} -> "
+                    f"{truncate_inline_text(candidate_url, 120)}"
+                )
+            return {
+                "ok": True,
+                "output_text": current_output,
+                "warnings": warnings,
+                "attempts": attempts,
+                "error_code": "",
+                "error_message": "",
+            }
+
+        current_code = str(classified.get("error_code") or "web_fetch_blocked")
+        current_reason = str(classified.get("reason") or "")
+        current_detail = str(classified.get("detail") or "")
+        attempts.append(
+            {
+                "url": candidate_url,
+                "host": host,
+                "status": "failed",
+                "error_code": current_code,
+                "reason": current_reason,
+                "detail": current_detail,
+            }
+        )
+        final_error_code = current_code
+        final_reason = current_reason or final_reason
+        final_detail = current_detail or final_detail
+        if host and _should_block_host_after_web_fetch_error(current_code, current_reason):
+            blocked_hosts.add(host)
+
+    summary = _build_web_fetch_attempt_summary(attempts)
+    final_message = (
+        f"web_fetch 全部候选源失败（{final_reason}）：{truncate_inline_text(primary, 180)}"
+    )
+    if summary:
+        final_message += f"；尝试摘要：{summary}"
+    if final_detail:
+        final_message += f"；最后错误：{truncate_inline_text(final_detail, 220)}"
+
+    return {
+        "ok": False,
+        "output_text": last_output,
+        "warnings": warnings,
+        "attempts": attempts,
+        "error_code": final_error_code or "web_fetch_blocked",
+        "error_message": final_message,
+    }
+
+
 def _detect_structured_tool_error(
     *,
     tool_name: str,
@@ -305,15 +644,69 @@ def _normalize_exec_spec(exec_spec: dict) -> dict:
     return spec
 
 
-def _load_tool_metadata_from_db(tool_id: Optional[int], tool_name: Optional[str]) -> Optional[dict]:
+def _load_tool_metadata_from_db(tool_id: object, tool_name: Optional[str]) -> Optional[dict]:
     """
     读取 tools_items.metadata（JSON）并解析为 dict。
     """
-    if tool_id is None and not tool_name:
+    tool_id_value = parse_positive_int(tool_id, default=None)
+    if tool_id_value is None and not tool_name:
         return None
-    if tool_id is not None:
-        return get_tool_metadata_by_id(tool_id=int(tool_id))
+    if tool_id_value is not None:
+        return get_tool_metadata_by_id(tool_id=int(tool_id_value))
     return get_tool_metadata_by_name(name=str(tool_name or ""))
+
+
+def _coerce_optional_tool_int_fields(payload: dict) -> None:
+    """
+    归一化 tool_call 可选整数字段：
+    - 空字符串 -> None
+    - 可解析整数 -> int
+    - 非法值 -> 抛出结构化错误（供上层策略识别为不可重试契约问题）
+    """
+    if not isinstance(payload, dict):
+        return
+    for key in ("tool_id", "task_id", "run_id", "skill_id"):
+        if key not in payload:
+            continue
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str) and not raw.strip():
+            payload[key] = None
+            continue
+        parsed = parse_positive_int(raw, default=None)
+        if parsed is None:
+            raise ValueError(
+                format_task_error(
+                    code="invalid_action_payload",
+                    message=f"tool_call.{key} 必须为正整数或空",
+                )
+            )
+        payload[key] = int(parsed)
+
+
+def _coerce_optional_tool_text_fields(payload: dict) -> None:
+    """
+    归一化 tool_call 可选文本字段：
+    - 空字符串 -> None，避免下游把空值判定为非法状态。
+    - reuse_status 统一小写。
+    """
+    if not isinstance(payload, dict):
+        return
+    for key in ("tool_version", "tool_description", "reuse_status", "reuse_notes"):
+        if key not in payload:
+            continue
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            payload[key] = None
+            continue
+        if key == "reuse_status":
+            payload[key] = text.lower()
+        else:
+            payload[key] = text
 
 
 def _has_nonempty_exec_spec(spec: dict) -> bool:
@@ -843,6 +1236,8 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
     """
     tool_input = payload.get("input")
     tool_output = payload.get("output")
+    _coerce_optional_tool_int_fields(payload)
+    _coerce_optional_tool_text_fields(payload)
     if tool_output is None:
         payload["output"] = ""
         tool_output = ""
@@ -866,7 +1261,7 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
 
     # 检查工具是否被禁用
     tool_name_value = str(payload.get("tool_name") or "").strip()
-    tool_id_value = payload.get("tool_id")
+    tool_id_value = parse_positive_int(payload.get("tool_id"), default=None)
     if not tool_name_value and tool_id_value is not None:
         try:
             row = get_tool(tool_id=int(tool_id_value))
@@ -894,9 +1289,14 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
     exec_spec = _resolve_tool_exec_spec(payload)
     if exec_spec is None:
         raise ValueError(
-            "tool_call 缺少可执行定义：请在 tool_metadata.exec 中提供 "
-            "type=shell，且包含 command(str) 或 args(list)，可选 timeout_ms，建议 workdir；"
-            "并把 output 留空让系统真实执行"
+            format_task_error(
+                code="missing_tool_exec_spec",
+                message=(
+                    "tool_call 缺少可执行定义：请在 tool_metadata.exec 中提供 "
+                    "type=shell，且包含 command(str) 或 args(list)，可选 timeout_ms，建议 workdir；"
+                    "并把 output 留空让系统真实执行"
+                ),
+            )
         )
 
     allow_empty_output = False
@@ -914,18 +1314,30 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
         tool_input=str(tool_input),
     )
     if dependency_error:
-        raise ValueError(dependency_error)
+        raise ValueError(format_task_error(code="tool_exec_contract_error", message=dependency_error))
 
-    output_text, exec_error = _execute_tool_with_exec_spec(exec_spec, str(tool_input))
-    if exec_error:
-        # 检测 TLS/SSL 握手失败
-        lowered_err = str(exec_error).lower()
-        if "handshake" in lowered_err and ("ssl" in lowered_err or "tls" in lowered_err):
-            raise ValueError(format_task_error(code="tls_handshake_failed", message=exec_error))
-        raise ValueError(exec_error)
+    web_fetch_error_code = ""
+    web_fetch_error_message = ""
+    web_fetch_attempts: List[dict] = []
+    if tool_name_value == TOOL_NAME_WEB_FETCH:
+        web_fetch_result = _execute_web_fetch_with_fallback(exec_spec, str(tool_input))
+        output_text = str(web_fetch_result.get("output_text") or "")
+        web_fetch_error_code = str(web_fetch_result.get("error_code") or "").strip().lower()
+        web_fetch_error_message = str(web_fetch_result.get("error_message") or "").strip()
+        if isinstance(web_fetch_result.get("attempts"), list):
+            web_fetch_attempts = [dict(item) for item in web_fetch_result.get("attempts") if isinstance(item, dict)]
+        warnings = [str(item) for item in (web_fetch_result.get("warnings") or []) if str(item or "").strip()]
+    else:
+        output_text, exec_error = _execute_tool_with_exec_spec(exec_spec, str(tool_input))
+        if exec_error:
+            # 检测 TLS/SSL 握手失败
+            lowered_err = str(exec_error).lower()
+            if "handshake" in lowered_err and ("ssl" in lowered_err or "tls" in lowered_err):
+                raise ValueError(format_task_error(code="tls_handshake_failed", message=exec_error))
+            raise ValueError(exec_error)
+        output_text = str(output_text or "")
+        warnings = []
 
-    output_text = str(output_text or "")
-    warnings: List[str] = []
     if tool_was_missing and not output_text.strip():
         warnings.append("新创建工具执行输出为空：建议让工具打印关键结果/关键日志，或使用文件落盘并在后续步骤验证产物。")
     if not output_text.strip() and not allow_empty_output:
@@ -937,51 +1349,26 @@ def execute_tool_call(task_id: int, run_id: int, step_row, payload: dict) -> Tup
         payload["tool_metadata"]["input_sample"] = str(tool_input)
         payload["tool_metadata"]["output_sample"] = output_text
 
-    payload.setdefault("task_id", task_id)
-    payload.setdefault("run_id", run_id)
+    if payload.get("task_id") is None:
+        payload["task_id"] = int(task_id)
+    if payload.get("run_id") is None:
+        payload["run_id"] = int(run_id)
     result = _create_tool_record(payload)
     record = result.get("record") if isinstance(result, dict) else None
     if not isinstance(record, dict):
         raise ValueError(ERROR_MESSAGE_PROMPT_RENDER_FAILED)
     if warnings:
         record["warnings"] = warnings
+    if web_fetch_attempts:
+        record["attempts"] = web_fetch_attempts
 
-    # web_fetch：避免把“限流/反爬拦截页正文”当成成功证据继续执行。
-    # 说明：
-    # - 该工具常用于冷启动抓取；若继续在拦截页上做解析/产物落盘，很容易诱发“编数据”或输出无效结果；
-    # - 这里选择“记录证据 + 标记本步失败”，让上层 replan 换源/退避/提示用户提供 API Key。
+    # web_fetch：在记录调用后返回结构化失败，避免“完成态掩盖失败”。
     if tool_name_value == TOOL_NAME_WEB_FETCH:
-        block_reason = _detect_web_fetch_block_reason(output_text)
-        if block_reason:
-            warn_text = f"web_fetch 可能被限流/反爬拦截：{block_reason}"
-            if isinstance(record.get("warnings"), list):
-                record["warnings"].append(warn_text)
-            else:
-                record["warnings"] = [warn_text]
-
-            url_text = truncate_inline_text(str(tool_input), 180)
-            preview = truncate_inline_text(output_text, 260)
-            tail = f" {preview}" if preview else ""
-            error_code = "rate_limited" if block_reason == "too_many_requests" else "web_fetch_blocked"
+        if web_fetch_error_message:
+            error_code = web_fetch_error_code or "web_fetch_blocked"
             return record, format_task_error(
                 code=error_code,
-                message=f"web_fetch 可能被限流/反爬（{block_reason}）：{url_text}{tail}",
-            )
-
-        semantic_error = _detect_web_fetch_semantic_error(output_text)
-        if semantic_error:
-            warn_text = f"web_fetch 语义失败：{semantic_error}"
-            if isinstance(record.get("warnings"), list):
-                record["warnings"].append(warn_text)
-            else:
-                record["warnings"] = [warn_text]
-
-            url_text = truncate_inline_text(str(tool_input), 180)
-            semantic_lower = str(semantic_error).lower()
-            error_code = "missing_api_key" if ("missing_access_key" in semantic_lower or "access key" in semantic_lower) else "web_fetch_blocked"
-            return record, format_task_error(
-                code=error_code,
-                message=f"web_fetch 返回错误响应（{semantic_error}）：{url_text}",
+                message=web_fetch_error_message,
             )
 
     structured_error = _detect_structured_tool_error(

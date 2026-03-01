@@ -115,6 +115,7 @@ def normalize_plan_data_for_execution(
             "file_write": ACTION_TYPE_FILE_WRITE,
             "tool_call": ACTION_TYPE_TOOL_CALL,
             "shell_command": ACTION_TYPE_SHELL_COMMAND,
+            "script_run": ACTION_TYPE_SHELL_COMMAND,
             "llm_call": ACTION_TYPE_LLM_CALL,
             "memory_write": ACTION_TYPE_MEMORY_WRITE,
             "file_read": ACTION_TYPE_FILE_READ,

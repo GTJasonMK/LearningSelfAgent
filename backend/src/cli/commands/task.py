@@ -12,7 +12,7 @@ import sys
 import click
 
 from backend.src.cli.client import CliError
-from backend.src.cli.commands.stream_render import render_stream_event
+from backend.src.cli.commands.stream_session import run_stream_session
 from backend.src.cli.output import (
     console,
     print_error,
@@ -158,20 +158,20 @@ def execute(
     if on_failure is not None:
         payload["on_failure"] = on_failure
     try:
-        seen_done = False
-        seen_error = False
-        for event in client.stream_post(f"/tasks/{task_id}/execute/stream", json_data=payload):
-            outcome = _render_stream_event(event, ctx.obj["output_json"])
-            if outcome == "done":
-                seen_done = True
-            elif outcome == "error":
-                seen_error = True
+        result = run_stream_session(
+            client=client,
+            path=f"/tasks/{task_id}/execute/stream",
+            payload=payload,
+            output_json=ctx.obj["output_json"],
+            done_message="任务执行完毕",
+            enable_agent_replay=True,
+        )
         # 流结束后换行
         console.print()
-        if seen_error:
+        if result.seen_error:
             sys.exit(1)
-        if not seen_done:
-            print_error("任务流已结束，但未收到 done 事件（执行状态不可信）")
+        if not result.seen_done:
+            print_error("任务流已结束，但未收到 done/stream_end 事件（执行状态不可信）")
             sys.exit(1)
     except CliError as exc:
         print_error(str(exc))
@@ -195,8 +195,3 @@ def summary(ctx: click.Context) -> None:
     except CliError as exc:
         print_error(str(exc))
         sys.exit(exc.exit_code)
-
-
-def _render_stream_event(event, output_json: bool):
-    """渲染 SSE 流式事件。"""
-    return render_stream_event(event, output_json, done_message="任务执行完毕")

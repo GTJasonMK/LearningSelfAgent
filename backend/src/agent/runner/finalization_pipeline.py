@@ -16,6 +16,8 @@ from backend.src.agent.runner.failed_output_helpers import (
 from backend.src.agent.runner.failed_output_injector import ensure_failed_task_output_shared
 from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.agent.runner.stream_status_event import build_run_status_sse
+from backend.src.agent.runner.stream_convergence import build_stream_error_payload, resolve_terminal_meta
+from backend.src.common.task_error_codes import format_task_error
 from backend.src.constants import (
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
@@ -360,8 +362,27 @@ async def handle_execution_exception(
         )
 
     suffix = f"（task_id={task_id} run_id={run_id}）" if task_id else ""
+    error_code = "agent_unhandled_exception"
+    error_message = format_task_error(
+        code=error_code,
+        message=f"{mode_prefix} 执行失败:{exc}{suffix}",
+    )
     try:
-        yield_func(sse_json({"message": f"{mode_prefix} 执行失败:{exc}{suffix}"}, event="error"))
+        yield_func(
+            sse_json(
+                build_stream_error_payload(
+                    error_code=error_code,
+                    error_message=error_message,
+                    phase=f"{mode_prefix}_exception",
+                    task_id=task_id,
+                    run_id=run_id,
+                    recoverable=False,
+                    retryable=False,
+                    terminal_source="runtime",
+                ),
+                event="error",
+            )
+        )
     except BaseException:
         pass
 
@@ -370,10 +391,14 @@ def yield_done_event(yield_func: Callable, *, run_status: str = "") -> None:
     """
     发送 done 事件，若客户端已断开则忽略。
     """
-    payload = {"type": "stream_end", "kind": "stream_end"}
-    status_text = str(run_status or "").strip().lower()
-    if status_text:
-        payload["run_status"] = status_text
+    terminal_meta = resolve_terminal_meta(run_status, status_source="runtime")
+    payload = {
+        "type": "stream_end",
+        "kind": "stream_end",
+        "run_status": str(terminal_meta.run_status or "").strip().lower(),
+        "completion_reason": str(terminal_meta.completion_reason or "").strip() or "unknown",
+        "terminal_source": str(terminal_meta.terminal_source or "").strip() or "runtime",
+    }
     try:
         yield_func(sse_json(payload, event="done"))
     except BaseException:

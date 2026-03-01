@@ -97,6 +97,7 @@ async def pump_sync_generator(
     heartbeat_builder: Optional[Callable[[], Optional[str]]] = None,
     heartbeat_min_interval_seconds: float = 0.0,
     heartbeat_trigger_debounce_seconds: float = 0.0,
+    stop_status_provider: Optional[Callable[[], Optional[str]]] = None,
 ) -> AsyncGenerator[tuple[str, object], None]:
     """
     将“同步 generator”的产出桥接为“异步事件流”。
@@ -105,6 +106,7 @@ async def pump_sync_generator(
     - ("msg", <str>)  : 需要继续向 SSE 输出的内容
     - ("done", <T>)   : 同步 generator 正常结束，payload 为 return 值
     - ("err", <exc>)  : 同步 generator 内部异常（payload 为异常对象）
+    - ("stop", <str>) : 检测到外部终态（如 stopped/failed）后主动停泵
 
     重要：这里使用 tick_task + asyncio.wait 定期唤醒 event loop。
     在 httpx.ASGITransport 的测试场景中，单纯 await queue.get() 可能出现“回调已投递但 loop
@@ -323,6 +325,25 @@ async def pump_sync_generator(
 
             # tick：检查线程/回传异常，并让 loop 周期性 wake up
             tick_task = asyncio.create_task(asyncio.sleep(poll_interval_seconds))
+
+            if callable(stop_status_provider):
+                external_status = ""
+                try:
+                    external_status = str(stop_status_provider() or "").strip().lower()
+                except Exception:
+                    external_status = ""
+                if external_status:
+                    # 停泵前尽量把节流缓存刷出，避免丢最后一批 plan 可视状态。
+                    if plan_min_interval > 0:
+                        delta_msg = _flush_plan_delta()
+                        if delta_msg:
+                            yield "msg", str(delta_msg)
+                    if pending_plan_msg:
+                        yield "msg", str(pending_plan_msg)
+                        pending_plan_msg = None
+                    stop_event.set()
+                    yield "stop", external_status
+                    return
 
             # 双层 heartbeat：
             # 1) trigger layer：收到业务消息后进入 active；

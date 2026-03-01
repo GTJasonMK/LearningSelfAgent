@@ -74,6 +74,23 @@ def _validate_optional_string_field(payload: dict, key: str, error_message: str)
     return None
 
 
+def _validate_optional_positive_int_field(payload: dict, key: str, *, action_name: str) -> Optional[str]:
+    if key not in payload:
+        return None
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except Exception:
+        return format_task_error(code="invalid_action_payload", message=f"{action_name}.{key} 必须为正整数或空")
+    if parsed <= 0:
+        return format_task_error(code="invalid_action_payload", message=f"{action_name}.{key} 必须为正整数或空")
+    return None
+
+
 def _validate_required_path_field(payload: dict, action_name: str) -> Optional[str]:
     return _require_nonempty_string(payload.get("path"), f"{action_name}.path 不能为空")
 
@@ -97,24 +114,70 @@ def _validate_tool_call(payload: dict) -> Optional[str]:
     input_error = _require_nonempty_string(payload.get("input"), "tool_call.input 不能为空")
     if input_error:
         return input_error
+    for key in ("tool_id", "task_id", "run_id", "skill_id"):
+        field_error = _validate_optional_positive_int_field(payload, key, action_name="tool_call")
+        if field_error:
+            return field_error
     # output 允许为空：执行器会在运行时尝试执行工具并填充 output
     return _validate_optional_string_field(payload, "output", "tool_call.output 必须是字符串")
 
 
 def _validate_shell_command(payload: dict) -> Optional[str]:
     command = payload.get("command")
+    script = payload.get("script")
+
+    script_text = str(script or "").strip() if isinstance(script, str) else ""
+    has_script = bool(script_text)
+
+    has_command = False
+    command_present = command is not None
     if isinstance(command, str):
-        if not command.strip():
-            return "shell_command.command 不能为空"
+        if command.strip():
+            has_command = True
     elif isinstance(command, list):
-        if not command:
-            return "shell_command.command 不能为空"
-        # command[0] 通常为可执行文件/主命令；必须是非空字符串，避免 [""] 这类输入在执行阶段才失败。
-        head = command[0]
-        if not isinstance(head, str) or not head.strip():
-            return "shell_command.command 不能为空"
-    else:
+        if command:
+            head = command[0]
+            if isinstance(head, str) and head.strip():
+                has_command = True
+
+    if command_present and not has_command and not has_script:
         return "shell_command.command 不能为空"
+    if not has_command and not has_script:
+        return "shell_command.command/script 不能为空"
+
+    args = payload.get("args")
+    if args is not None:
+        if not isinstance(args, list):
+            return "shell_command.args 必须是字符串数组"
+        for idx, item in enumerate(args):
+            if not isinstance(item, str):
+                return f"shell_command.args[{idx}] 必须是字符串"
+
+    required_args = payload.get("required_args")
+    if required_args is not None:
+        if not isinstance(required_args, list):
+            return "shell_command.required_args 必须是字符串数组"
+        for idx, item in enumerate(required_args):
+            if not isinstance(item, str) or not str(item).strip():
+                return f"shell_command.required_args[{idx}] 不能为空"
+
+    expected_outputs = payload.get("expected_outputs")
+    if expected_outputs is not None:
+        if not isinstance(expected_outputs, list):
+            return "shell_command.expected_outputs 必须是字符串数组"
+        for idx, item in enumerate(expected_outputs):
+            if not isinstance(item, str) or not str(item).strip():
+                return f"shell_command.expected_outputs[{idx}] 不能为空"
+
+    for key in ("parse_json_output", "discover_required_args", "stdin_from_context"):
+        value = payload.get(key)
+        if value is not None and not isinstance(value, bool):
+            return f"shell_command.{key} 必须是布尔值"
+
+    emit_as = payload.get("emit_as")
+    if emit_as is not None and (not isinstance(emit_as, str) or not emit_as.strip()):
+        return "shell_command.emit_as 必须是非空字符串"
+
     workdir = payload.get("workdir")
     if not isinstance(workdir, str) or not workdir.strip():
         return "shell_command.workdir 不能为空"
@@ -366,7 +429,7 @@ _PAYLOAD_REQUIRED_ONE_OF_KEYS: Dict[str, List[List[str]]] = {
     ACTION_TYPE_LLM_CALL: [["prompt", "template_id"]],
     ACTION_TYPE_TASK_OUTPUT: [["content", "run_id"]],
     ACTION_TYPE_TOOL_CALL: [["tool_id", "tool_name"], ["input"]],
-    ACTION_TYPE_SHELL_COMMAND: [["command"], ["workdir"]],
+    ACTION_TYPE_SHELL_COMMAND: [["command", "script"], ["workdir"]],
     ACTION_TYPE_HTTP_REQUEST: [["url"]],
     ACTION_TYPE_FILE_WRITE: [["path"]],
     ACTION_TYPE_FILE_APPEND: [["path"]],
@@ -615,8 +678,21 @@ def _register_builtin_specs() -> None:
     register_action_type(
         ActionTypeSpec(
             action_type=ACTION_TYPE_SHELL_COMMAND,
-            allowed_payload_keys={"command", "workdir", "timeout_ms", "stdin"},
-            aliases={"shell", "cmd", "command"},
+            allowed_payload_keys={
+                "command",
+                "script",
+                "args",
+                "required_args",
+                "discover_required_args",
+                "expected_outputs",
+                "parse_json_output",
+                "emit_as",
+                "workdir",
+                "timeout_ms",
+                "stdin",
+                "stdin_from_context",
+            },
+            aliases={"shell", "cmd", "command", "script_run"},
             executor=_exec_shell_command,
             validate_payload=_validate_shell_command,
         )

@@ -1783,7 +1783,7 @@ const SLASH_COMMAND_HANDLERS = {
     petSession.setState({ lastRun: null }, { reason: "run_reset_last_run" });
     const streamResult = await streamAndShow(
       (signal) => api.streamExecuteTask(id, {}, signal),
-      { displayMode: "status" }
+      { displayMode: "status", enableAgentReplay: true }
     );
     const finalText = String(streamResult?.transcript || "");
     let runId = resolveRunIdForPostRun(streamResult);

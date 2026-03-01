@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import locale
 import os
 import re
 import shlex
@@ -90,6 +91,45 @@ def _normalize_windows_builtin_command_line(raw_command: str, args: list[str]) -
         return subprocess.list2cmdline(normalized_tokens)
     except Exception:
         return raw_command
+
+
+def _decode_subprocess_stream(value: object) -> str:
+    """
+    将 subprocess 输出统一解码为字符串，避免编码不一致导致 UnicodeDecodeError。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+    else:
+        raw = str(value).encode("utf-8", errors="replace")
+
+    preferred = str(locale.getpreferredencoding(False) or "").strip()
+    encodings: list[str] = ["utf-8"]
+    if preferred:
+        encodings.append(preferred)
+    if os.name == "nt":
+        encodings.extend(["gb18030", "gbk"])
+
+    seen = set()
+    for enc in encodings:
+        normalized = str(enc or "").strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return raw.decode(normalized, errors="strict")
+        except Exception:
+            continue
+
+    fallback = preferred or "utf-8"
+    try:
+        return raw.decode(fallback, errors="replace")
+    except Exception:
+        return raw.decode("utf-8", errors="replace")
 
 
 
@@ -229,13 +269,15 @@ def run_shell_command(payload: dict) -> Tuple[Optional[dict], Optional[str]]:
         except Exception:
             stdin_text = ""
 
+    stdin_bytes = str(stdin_text).encode("utf-8", errors="replace")
+
     try:
         result = subprocess.run(
             args,
             cwd=workdir,
             capture_output=True,
-            text=True,
-            input=stdin_text,
+            text=False,
+            input=stdin_bytes,
             timeout=timeout,
             check=False,
         )
@@ -254,8 +296,8 @@ def run_shell_command(payload: dict) -> Tuple[Optional[dict], Optional[str]]:
         return None, f"{ERROR_MESSAGE_COMMAND_FAILED}:{exc}"
 
     return {
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "stdout": _decode_subprocess_stream(result.stdout),
+        "stderr": _decode_subprocess_stream(result.stderr),
         "returncode": result.returncode,
         "ok": result.returncode == 0,
     }, None

@@ -12,7 +12,10 @@ from typing import Callable, Dict, Generator, List, Optional, Tuple
 
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.support import _truncate_observation
-from backend.src.agent.runner.react_error_policy import should_force_replan_on_action_error
+from backend.src.agent.runner.react_error_policy import (
+    should_fail_fast_on_step_error,
+    should_force_replan_on_action_error,
+)
 from backend.src.agent.runner.react_state_manager import (
     ReplanContext,
     prepare_replan_context,
@@ -427,12 +430,17 @@ def handle_step_failure(
     repeat_failure_limit = coerce_int(AGENT_REACT_REPEAT_FAILURE_MAX, default=0)
     if repeat_failure_limit < 0:
         repeat_failure_limit = 0
+    non_retriable_failure = should_fail_fast_on_step_error(str(step_error or ""))
     repeat_failure_exceeded = repeat_failure_limit > 0 and coerce_int(
         failure_hit_count, default=0
     ) >= repeat_failure_limit
+    if non_retriable_failure:
+        repeat_failure_exceeded = True
     if repeat_failure_exceeded:
         agent_state["critical_failure"] = True
-        agent_state["critical_failure_reason"] = "repeat_failure_budget_exceeded"
+        agent_state["critical_failure_reason"] = (
+            "non_retriable_step_error" if non_retriable_failure else "repeat_failure_budget_exceeded"
+        )
 
     safe_write_debug(
         task_id=int(task_id),
@@ -449,6 +457,7 @@ def handle_step_failure(
             "failure_hit_count": coerce_int(failure_hit_count, default=0),
             "failure_budget": coerce_int(repeat_failure_limit, default=0),
             "failure_budget_exceeded": bool(repeat_failure_exceeded),
+            "non_retriable_failure": bool(non_retriable_failure),
         },
         level="warning",
     )
@@ -469,6 +478,43 @@ def handle_step_failure(
     if isinstance(context, dict):
         context.pop("latest_parse_input_text", None)
 
+    error_code = extract_task_error_code(str(step_error or "")) or "step_failed"
+    logger.warning(
+        "[agent.react.step_failed] task_id=%s run_id=%s step_id=%s step_order=%s action_type=%s code=%s non_retriable=%s budget_exceeded=%s error=%s",
+        int(task_id),
+        int(run_id),
+        int(step_id),
+        int(step_order),
+        str(action_type or ""),
+        str(error_code or ""),
+        bool(non_retriable_failure),
+        bool(repeat_failure_exceeded),
+        str(step_error or ""),
+    )
+    # 关键语义：步骤级失败是“可观测事件”，不应伪装为 SSE transport error。
+    # 否则前端会提前终止流，造成状态不同步（例如仍在 replan 却已提示任务结束）。
+    yield sse_json(
+        {
+            "type": "step_error",
+            "level": "warning",
+            "code": error_code,
+            "error_code": error_code,
+            "task_id": int(task_id),
+            "run_id": int(run_id),
+            "step_id": int(step_id),
+            "step_order": int(step_order),
+            "action_type": str(action_type or ""),
+            "message": str(step_error or ""),
+            "error_message": str(step_error or ""),
+            "phase": "react_step_execution",
+            "recoverable": not bool(repeat_failure_exceeded),
+            "retryable": not bool(repeat_failure_exceeded),
+            "non_retriable_failure": bool(non_retriable_failure),
+            "failure_signature": str(failure_signature or ""),
+            "failure_hit_count": int(coerce_int(failure_hit_count, default=0)),
+        }
+    )
+
     # 持久化失败状态
     persist_loop_state(
         run_id=run_id,
@@ -488,24 +534,29 @@ def handle_step_failure(
         safe_write_debug(
             task_id=int(task_id),
             run_id=int(run_id),
-            message="agent.failure_budget.exceeded",
+            message="agent.failure.non_retriable" if non_retriable_failure else "agent.failure_budget.exceeded",
             data={
                 "signature": failure_signature,
                 "count": int(failure_hit_count),
                 "budget": int(repeat_failure_limit),
                 "step_order": int(step_order),
                 "action_type": str(action_type or ""),
+                "error_code": str(error_code or ""),
+                "non_retriable_failure": bool(non_retriable_failure),
             },
             level="warning",
         )
-        yield sse_json(
-            {
-                "delta": (
-                    f"{STREAM_TAG_FAIL} 同类失败已连续出现 {int(failure_hit_count)} 次，"
-                    "停止自动重试并终止本轮执行。\n"
-                )
-            }
-        )
+        if non_retriable_failure:
+            yield sse_json({"delta": f"{STREAM_TAG_FAIL} 检测到不可重试的契约错误，终止本轮执行。\n"})
+        else:
+            yield sse_json(
+                {
+                    "delta": (
+                        f"{STREAM_TAG_FAIL} 同类失败已连续出现 {int(failure_hit_count)} 次，"
+                        "停止自动重试并终止本轮执行。\n"
+                    )
+                }
+            )
         return RUN_STATUS_FAILED, None
 
     # 失败后优先尝试 replan

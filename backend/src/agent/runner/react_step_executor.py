@@ -201,6 +201,29 @@ def build_observation_line(
         if parse_input:
             context["latest_parse_input_text"] = parse_input
 
+        parsed_output = result.get("parsed_output")
+        if parsed_output is not None:
+            try:
+                parsed_text = json.dumps(parsed_output, ensure_ascii=False)
+                context["latest_parse_input_text"] = parsed_text
+                context["latest_script_json_output"] = parsed_output
+                obs_line = (
+                    f"{title}: script_run parsed_output="
+                    f"{_truncate_observation(parsed_text)}{retry_tail}"
+                ).strip()
+            except Exception:
+                pass
+
+        artifacts = result.get("artifacts")
+        if isinstance(artifacts, list):
+            context["latest_script_artifacts"] = artifacts
+            exists_count = 0
+            for item in artifacts:
+                if isinstance(item, dict) and bool(item.get("exists")):
+                    exists_count += 1
+            if exists_count > 0:
+                obs_line += f" artifacts={exists_count}/{len(artifacts)}"
+
     elif action_type == ACTION_TYPE_LLM_CALL and isinstance(result, dict):
         resp = str(result.get("response") or "")
         context["last_llm_response"] = resp

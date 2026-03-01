@@ -77,6 +77,18 @@ def build_stream_event_id(
     return f"{sk}:{rid}:{seq}:{et}"
 
 
+def generate_trace_id(
+    *,
+    session_key: str,
+    run_id: Optional[int],
+) -> str:
+    sk = coerce_session_key(session_key) or "sess_unknown"
+    rid = parse_optional_int(run_id, default=0) or 0
+    raw = f"{sk}|{int(rid)}"
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+    return f"trace_{digest[:24]}"
+
+
 def _parse_sse_event_and_json(chunk: str) -> Tuple[str, Optional[dict]]:
     text = str(chunk or "")
     if not text:
@@ -185,6 +197,13 @@ def attach_stream_event_meta(
         obj["emitted_at"] = now_iso()
     if not str(obj.get("causation_id") or "").strip():
         obj["causation_id"] = normalized_session_key or f"run:{int(normalized_run_id)}"
+    if obj.get("seq") is None:
+        obj["seq"] = int(event_seq)
+    if not str(obj.get("trace_id") or "").strip():
+        obj["trace_id"] = generate_trace_id(
+            session_key=normalized_session_key or "sess_unknown",
+            run_id=parse_optional_int(run_id, default=0),
+        )
     if not str(obj.get("event_id") or "").strip():
         obj["event_id"] = build_stream_event_id(
             session_key=normalized_session_key or "sess_unknown",

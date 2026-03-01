@@ -168,10 +168,6 @@ export async function streamExecuteTask(taskId, payload, signal) {
   return response;
 }
 
-export async function executeTask(taskId, payload) {
-  return jsonRequest("POST", `/tasks/${taskId}/execute`, payload || {});
-}
-
 export async function fetchHealth() {
   return request("/health");
 }

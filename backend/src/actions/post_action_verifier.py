@@ -6,6 +6,7 @@ from backend.src.actions.registry import normalize_action_type
 from backend.src.common.task_error_codes import format_task_error
 from backend.src.constants import (
     ACTION_TYPE_HTTP_REQUEST,
+    ACTION_TYPE_SHELL_COMMAND,
     ACTION_TYPE_TASK_OUTPUT,
     ACTION_TYPE_TOOL_CALL,
     ACTION_TYPE_USER_PROMPT,
@@ -130,6 +131,19 @@ def verify_and_normalize_action_result(
     if normalized_action_type == ACTION_TYPE_TOOL_CALL:
         if not str(result_obj.get("output") or "").strip():
             result_obj = _merge_warning(result_obj, "tool_call.output is empty")
+
+    # shell_command(script_run)：启用结构化输出契约，避免“脚本执行成功但中间产物缺失”。
+    if normalized_action_type == ACTION_TYPE_SHELL_COMMAND:
+        if bool(payload_obj.get("parse_json_output")) and ("parsed_output" not in result_obj):
+            return None, format_task_error(
+                code="missing_script_parsed_output",
+                message="script_run.parse_json_output=true 但结果缺少 parsed_output",
+            )
+        expected_outputs = payload_obj.get("expected_outputs")
+        if isinstance(expected_outputs, list) and expected_outputs:
+            artifacts = result_obj.get("artifacts")
+            if not isinstance(artifacts, list):
+                result_obj = _merge_warning(result_obj, "script_run.expected_outputs provided but artifacts missing")
 
     # user_prompt：至少要有 question 字段（用于暂停渲染）。
     if normalized_action_type == ACTION_TYPE_USER_PROMPT:

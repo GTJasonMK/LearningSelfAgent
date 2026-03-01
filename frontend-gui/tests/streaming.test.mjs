@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import { streamSse } from "../src/renderer/streaming.js";
 
@@ -17,6 +18,21 @@ function buildSseResponse(chunks) {
     status: 200,
     headers: { "content-type": "text/event-stream; charset=utf-8" },
   });
+}
+
+async function loadCrossSurfaceCases() {
+  const fixtureUrl = new URL("../../test-fixtures/stream_cross_surface_cases.json", import.meta.url);
+  const raw = await readFile(fixtureUrl, "utf8");
+  const parsed = JSON.parse(String(raw || "{}"));
+  const cases = Array.isArray(parsed?.cases) ? parsed.cases : [];
+  return cases;
+}
+
+function encodeSseChunk(eventName, payload) {
+  const name = String(eventName || "message").trim().toLowerCase() || "message";
+  const data = JSON.stringify(payload || {}, undefined, 0);
+  if (name === "message") return `data: ${data}\n\n`;
+  return `event: ${name}\ndata: ${data}\n\n`;
 }
 
 test("streamSse supports CRLF event separators", async () => {
@@ -199,6 +215,122 @@ test("streamSse keeps need_input when prompt token changes", async () => {
       globalThis.requestAnimationFrame = previousRaf;
     } else {
       delete globalThis.requestAnimationFrame;
+    }
+  }
+});
+
+test("streamSse replays when done has no business state", async () => {
+  const response = buildSseResponse([
+    "event: done\ndata: {\"type\":\"stream_end\",\"task_id\":8,\"run_id\":11}\n\n",
+  ]);
+  let replayCalls = 0;
+  const previousRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0);
+  try {
+    const result = await streamSse(
+      async () => response,
+      {
+        displayMode: "status",
+        replayFetch: async () => {
+          replayCalls += 1;
+          return {
+            items: [
+              {
+                event_id: "sess_x:11:2:run_status",
+                payload: {
+                  type: "run_status",
+                  task_id: 8,
+                  run_id: 11,
+                  status: "done",
+                  event_id: "sess_x:11:2:run_status",
+                },
+              },
+            ],
+          };
+        },
+        getReplayRunId: () => 11,
+      }
+    );
+    assert.equal(result.hadError, false);
+    assert.equal(result.replayApplied, 1);
+    assert.equal(replayCalls, 1);
+  } finally {
+    if (typeof previousRaf === "function") {
+      globalThis.requestAnimationFrame = previousRaf;
+    } else {
+      delete globalThis.requestAnimationFrame;
+    }
+  }
+});
+
+test("streamSse does not replay when done includes run_status", async () => {
+  const response = buildSseResponse([
+    "event: done\ndata: {\"type\":\"stream_end\",\"task_id\":8,\"run_id\":11,\"run_status\":\"done\"}\n\n",
+  ]);
+  let replayCalls = 0;
+  const previousRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0);
+  try {
+    const result = await streamSse(
+      async () => response,
+      {
+        displayMode: "status",
+        replayFetch: async () => {
+          replayCalls += 1;
+          return { items: [] };
+        },
+        getReplayRunId: () => 11,
+      }
+    );
+    assert.equal(result.hadError, false);
+    assert.equal(result.replayApplied, 0);
+    assert.equal(replayCalls, 0);
+  } finally {
+    if (typeof previousRaf === "function") {
+      globalThis.requestAnimationFrame = previousRaf;
+    } else {
+      delete globalThis.requestAnimationFrame;
+    }
+  }
+});
+
+test("streamSse matches shared cross-surface fixture contract", async () => {
+  const cases = await loadCrossSurfaceCases();
+  assert.ok(cases.length > 0);
+
+  for (const item of cases) {
+    const caseId = String(item?.id || "unknown");
+    const events = Array.isArray(item?.stream_events) ? item.stream_events : [];
+    const expected = item?.expected_frontend || {};
+    const replayPayload = item?.replay_response || { items: [] };
+    const replayRunId = Number(item?.replay_run_id);
+    let replayCalls = 0;
+
+    const chunks = events.map((evt) => encodeSseChunk(evt?.event, evt?.payload));
+    const response = buildSseResponse(chunks);
+    const previousRaf = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0);
+    try {
+      const result = await streamSse(
+        async () => response,
+        {
+          displayMode: "status",
+          replayFetch: async () => {
+            replayCalls += 1;
+            return replayPayload;
+          },
+          getReplayRunId: () => (Number.isFinite(replayRunId) && replayRunId > 0 ? replayRunId : null),
+        }
+      );
+      assert.equal(Boolean(result.hadError), Boolean(expected?.had_error), caseId);
+      assert.equal(Number(result.replayApplied || 0), Number(expected?.replay_applied || 0), caseId);
+      assert.equal(replayCalls, Number(expected?.replay_calls || 0), caseId);
+    } finally {
+      if (typeof previousRaf === "function") {
+        globalThis.requestAnimationFrame = previousRaf;
+      } else {
+        delete globalThis.requestAnimationFrame;
+      }
     }
   }
 });

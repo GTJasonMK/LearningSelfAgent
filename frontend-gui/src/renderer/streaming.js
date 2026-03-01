@@ -431,6 +431,16 @@ export async function streamSse(makeRequest, options = {}) {
 
         const { eventName, dataStr } = parseSseEventBlock(rawEvent);
         if (eventName === "done") {
+          let doneObj = null;
+          try {
+            doneObj = JSON.parse(dataStr);
+          } catch (e) {
+            doneObj = null;
+          }
+          if (doneObj && typeof doneObj === "object") {
+            const doneResult = await processStructuredObject(doneObj);
+            if (doneResult?.delta) await applyDelta(doneResult.delta);
+          }
           streamDone = true;
           streamCompletedByDoneEvent = true;
           break;

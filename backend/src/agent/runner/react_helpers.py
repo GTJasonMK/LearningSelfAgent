@@ -7,6 +7,7 @@ from backend.src.actions.registry import (
     action_types_line,
     normalize_action_type,
 )
+from backend.src.actions.handlers.common_utils import parse_command_tokens
 from backend.src.agent.support import (
     _extract_json_object,
     coerce_file_write_payload_path_from_title,
@@ -124,6 +125,34 @@ def _looks_like_url(value: str) -> bool:
     if not raw:
         return False
     return bool(re.match(r"^https?://", raw, re.IGNORECASE))
+
+
+def _looks_like_python_script_token(value: str) -> bool:
+    token = str(value or "").strip().lower()
+    return bool(token) and token.endswith(".py")
+
+
+def _extract_script_run_from_command(command: object) -> Tuple[str, List[str]]:
+    """
+    从 shell_command.command 中提取 script_run 结构：
+    - 支持 ["python", "x.py", ...] / "python x.py ..."
+    - 支持直接执行脚本 ["x.py", ...]（默认由执行器补 python）
+    """
+    tokens = parse_command_tokens(command)
+    if not tokens:
+        return "", []
+
+    head = str(tokens[0] or "").strip()
+    head_lower = head.lower()
+    if head_lower in {"python", "python3", "py"} and len(tokens) >= 2:
+        script = str(tokens[1] or "").strip()
+        if _looks_like_python_script_token(script):
+            return script, [str(item) for item in tokens[2:]]
+        return "", []
+
+    if _looks_like_python_script_token(head):
+        return head, [str(item) for item in tokens[1:]]
+    return "", []
 
 
 def _normalize_llm_parameters(raw_params: object) -> Optional[dict]:
@@ -362,6 +391,36 @@ def normalize_action_obj_for_execution(
         # workdir 在 Windows/WSL 下很容易被模型漏填；缺失会导致 _validate_action 直接失败
         payload_obj.setdefault("workdir", workdir)
         payload_obj.setdefault("timeout_ms", AGENT_SHELL_COMMAND_DEFAULT_TIMEOUT_MS)
+
+        # 结构化 script_run 归一化：
+        # - 若模型直接给 script/args，保留并清洗；
+        # - 若模型给的是 python xxx.py ... 的 command，自动拆成 script + args；
+        # - 目的：让执行器可做参数契约预检，避免“运行后才报 argparse 缺参”。
+        script_value = str(payload_obj.get("script") or "").strip()
+        if not script_value:
+            script_value = _extract_prefixed_value(step_title, "script_run")
+        command_value = payload_obj.get("command")
+        extracted_script, extracted_args = _extract_script_run_from_command(command_value)
+        if not script_value and extracted_script:
+            script_value = extracted_script
+        if script_value:
+            payload_obj["script"] = script_value
+            args_value = payload_obj.get("args")
+            if isinstance(args_value, str) and args_value.strip():
+                payload_obj["args"] = parse_command_tokens(args_value)
+            elif not isinstance(args_value, list):
+                payload_obj["args"] = []
+            if extracted_args and isinstance(payload_obj.get("args"), list) and not payload_obj.get("args"):
+                payload_obj["args"] = list(extracted_args)
+
+            required_args = payload_obj.get("required_args")
+            if isinstance(required_args, str) and required_args.strip():
+                payload_obj["required_args"] = [required_args.strip()]
+            elif not isinstance(required_args, list):
+                payload_obj.pop("required_args", None)
+
+            payload_obj.setdefault("discover_required_args", True)
+            payload_obj.pop("command", None)
 
     if action_type == ACTION_TYPE_TASK_OUTPUT:
         payload_obj.setdefault("output_type", TASK_OUTPUT_TYPE_TEXT)

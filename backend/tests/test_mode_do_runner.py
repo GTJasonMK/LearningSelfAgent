@@ -15,6 +15,10 @@ async def _iter_error(*args, **kwargs):
     yield ("err", "bad")
 
 
+async def _iter_stop(*args, **kwargs):
+    yield ("stop", "stopped")
+
+
 class TestModeDoRunner(unittest.IsolatedAsyncioTestCase):
     async def test_run_do_mode_execution_success(self):
         chunks = []
@@ -98,6 +102,44 @@ class TestModeDoRunner(unittest.IsolatedAsyncioTestCase):
                         yield_func=lambda _msg: None,
                     )
                 )
+
+    async def test_run_do_mode_execution_external_stop_returns_terminal_status(self):
+        plan_struct = PlanStructure.from_legacy(
+            plan_titles=["a"],
+            plan_items=[{"id": 1}],
+            plan_allows=[["tool_call"]],
+            plan_artifacts=[],
+        )
+        with patch(
+            "backend.src.agent.runner.mode_do_runner.run_react_loop",
+            return_value=object(),
+        ), patch(
+            "backend.src.agent.runner.mode_do_runner.pump_sync_generator",
+            side_effect=_iter_stop,
+        ):
+            result = await run_do_mode_execution_from_config(
+                DoExecutionConfig(
+                    task_id=1,
+                    run_id=2,
+                    message="m",
+                    workdir="/tmp",
+                    model="gpt",
+                    parameters={},
+                    plan_struct=plan_struct,
+                    tools_hint="(无)",
+                    skills_hint="(无)",
+                    memories_hint="(无)",
+                    graph_hint="(无)",
+                    agent_state={},
+                    context={},
+                    observations=[],
+                    start_step_order=1,
+                    variables_source="agent_react",
+                    yield_func=lambda _msg: None,
+                )
+            )
+
+        self.assertEqual(result.run_status, "stopped")
 
 
 if __name__ == "__main__":

@@ -42,6 +42,24 @@ _LLM_CONCURRENCY_STATE: Dict[str, Any] = {
 }
 
 
+def _read_int_env(name: str, default: int, *, min_value: int = 1) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(float(raw))
+    except Exception:
+        return int(default)
+    if value < int(min_value):
+        return int(min_value)
+    return int(value)
+
+
+# 同步 LLM 调用超时（秒）。
+# 目的：避免单次供应商调用无限等待导致 run 一直处于 running 且无可观测失败信号。
+LLM_CALL_TIMEOUT_SECONDS = _read_int_env("LLM_CALL_TIMEOUT_SECONDS", 45, min_value=5)
+
+
 def _normalize_concurrency_limit(value: object) -> int:
     try:
         v = int(value)  # type: ignore[arg-type]
@@ -685,6 +703,19 @@ def call_llm(
     errors: List[str] = []
     content = ""
     tokens = None
+    timeout_seconds = int(LLM_CALL_TIMEOUT_SECONDS)
+    effective_parameters = dict(parameters or {})
+    timeout_override = effective_parameters.pop("timeout", None)
+    timeout_seconds_override = effective_parameters.pop("timeout_seconds", None)
+    if timeout_override is None:
+        timeout_override = timeout_seconds_override
+    if timeout_override is not None:
+        try:
+            parsed_timeout = int(float(timeout_override))
+            if parsed_timeout >= 5:
+                timeout_seconds = parsed_timeout
+        except Exception:
+            pass
 
     for idx, base_url_candidate in enumerate(client_urls):
         try:
@@ -699,7 +730,10 @@ def call_llm(
             key = f"{str(client._provider_name or '').strip() or LLM_PROVIDER_OPENAI}:{actual_model}"
             with _llm_concurrency_guard(key):
                 content, tokens = client.complete_prompt_sync(
-                    prompt=prompt, model=actual_model, parameters=parameters
+                    prompt=prompt,
+                    model=actual_model,
+                    parameters=effective_parameters,
+                    timeout=timeout_seconds,
                 )
             if str(content or "").strip():
                 break

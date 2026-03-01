@@ -207,6 +207,59 @@ export function bind(section, onStatusChange) {
     };
   }
 
+  async function streamTaskExecute(taskId) {
+    const targetTaskId = Number(taskId);
+    if (!Number.isFinite(targetTaskId) || targetTaskId <= 0) {
+      return {
+        hadError: true,
+        runStatus: "",
+        pendingNeedInput: null,
+        errorMessage: "invalid_task_id",
+      };
+    }
+    let runStatus = "";
+    let pendingNeedInput = null;
+    let errorMessage = "";
+    let runId = null;
+    const streamResult = await streamSse(
+      (signal) => api.streamExecuteTask(targetTaskId, {}, signal),
+      {
+        displayMode: "status",
+        onRunCreated: (obj) => {
+          const rid = Number(obj?.run_id);
+          if (Number.isFinite(rid) && rid > 0) runId = rid;
+          const status = normalizeRunStatusValue(obj?.status);
+          if (status) runStatus = status;
+        },
+        onRunStatus: (obj) => {
+          const rid = Number(obj?.run_id);
+          if (Number.isFinite(rid) && rid > 0) runId = rid;
+          const status = normalizeRunStatusValue(obj?.status);
+          if (status) runStatus = status;
+        },
+        onNeedInput: (obj) => {
+          runStatus = TASK_STATUS.WAITING;
+          pendingNeedInput = buildNeedInputPendingFromNeedInputEvent(obj, runId);
+        },
+        onError: (msg) => {
+          errorMessage = String(msg || "").trim();
+        },
+        replayFetch: (rid, afterEventId, signal) => api.fetchAgentRunEvents(
+          rid,
+          { after_event_id: afterEventId || undefined, limit: 200 },
+          signal
+        ),
+        getReplayRunId: () => runId,
+      }
+    );
+    return {
+      hadError: !!streamResult?.hadError,
+      runStatus: normalizeRunStatusValue(runStatus),
+      pendingNeedInput,
+      errorMessage,
+    };
+  }
+
   async function handleNeedInputSubmit(rawValue = null) {
     const pending = currentNeedInput;
     if (!pending?.runId || !currentTaskId) return;
@@ -521,10 +574,20 @@ export function bind(section, onStatusChange) {
     executingTask = true;
     refreshActionResumeState();
     try {
-      // 直接复用后端 /tasks/{id}/execute：会跳过已完成步骤，继续执行 planned/running 的步骤。
+      // 统一走流式执行链路：确保状态事件语义与 agent 主链路一致。
       drawerStatus.textContent = TASK_STATUS.RUNNING;
       drawerStatus.className = `panel-tag panel-tag--${getStatusColor(TASK_STATUS.RUNNING)}`;
-      await api.executeTask(taskIdAtStart, {});
+      const streamResult = await streamTaskExecute(taskIdAtStart);
+      if (streamResult.hadError) {
+        throw new Error(streamResult.errorMessage || "task_execute_stream_failed");
+      }
+      if (
+        streamResult.pendingNeedInput
+        && streamResult.runStatus === TASK_STATUS.WAITING
+        && isDrawerShowingTask(taskIdAtStart)
+      ) {
+        renderNeedInputSection(streamResult.pendingNeedInput);
+      }
       if (isDrawerShowingTask(taskIdAtStart)) {
         await loadTaskDetail(taskIdAtStart);
       }

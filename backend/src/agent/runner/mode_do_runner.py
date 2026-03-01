@@ -7,7 +7,10 @@ from typing import Callable, List, Optional
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_loop import run_react_loop
 from backend.src.agent.runner.stream_pump import pump_sync_generator
+from backend.src.agent.runner.stream_status_event import normalize_stream_run_status
+from backend.src.constants import RUN_STATUS_RUNNING
 from backend.src.services.llm.llm_client import sse_json
+from backend.src.services.tasks.task_queries import get_task_run
 
 
 @dataclass
@@ -75,6 +78,22 @@ async def _run_do_mode_execution_impl(config: DoExecutionConfig) -> DoExecutionR
 
     react_started_at = time.monotonic()
     react_result = None
+    external_stop_status = ""
+
+    def _read_external_terminal_status() -> Optional[str]:
+        try:
+            row = get_task_run(run_id=int(run_id))
+        except Exception:
+            return None
+        if not row:
+            return ""
+        status = normalize_stream_run_status(row["status"])
+        if not status:
+            return ""
+        if status == RUN_STATUS_RUNNING:
+            return ""
+        return status
+
     async for kind, payload in pump_sync_generator(
         inner=inner_react,
         label=str(pump_label or "react"),
@@ -92,11 +111,15 @@ async def _run_do_mode_execution_impl(config: DoExecutionConfig) -> DoExecutionR
         ),
         heartbeat_min_interval_seconds=float(config.heartbeat_min_interval_seconds or 0),
         heartbeat_trigger_debounce_seconds=float(config.heartbeat_trigger_debounce_seconds or 0),
+        stop_status_provider=_read_external_terminal_status,
     ):
         if kind == "msg":
             if payload:
                 config.yield_func(str(payload))
             continue
+        if kind == "stop":
+            external_stop_status = str(payload or "").strip().lower()
+            break
         if kind == "done":
             react_result = payload
             break
@@ -104,6 +127,24 @@ async def _run_do_mode_execution_impl(config: DoExecutionConfig) -> DoExecutionR
             if isinstance(payload, BaseException):
                 raise payload  # noqa: TRY301
             raise RuntimeError(f"{pump_label} 异常:{payload}")  # noqa: TRY301
+
+    if external_stop_status:
+        if callable(config.safe_write_debug):
+            config.safe_write_debug(
+                task_id,
+                run_id,
+                message=f"{str(config.debug_done_message or 'agent.react.done')}.external_stop",
+                data={
+                    "duration_ms": int((time.monotonic() - react_started_at) * 1000),
+                    "run_status": external_stop_status,
+                },
+                level="warning",
+            )
+        return DoExecutionResult(
+            run_status=str(external_stop_status),
+            last_step_order=0,
+            plan_struct=plan_struct,
+        )
 
     if react_result is None:
         raise RuntimeError(f"{pump_label} 返回为空")  # noqa: TRY301

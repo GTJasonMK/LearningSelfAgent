@@ -13,6 +13,7 @@ from backend.src.agent.runner.pending_planning_state import (
     build_waiting_followup_state,
 )
 from backend.src.agent.runner.planning_runner import run_do_planning_phase_with_stream
+from backend.src.agent.runner.stream_convergence import build_stream_error_payload
 from backend.src.constants import (
     AGENT_KNOWLEDGE_SUFFICIENCY_KIND,
     AGENT_KNOWLEDGE_SUFFICIENCY_PROCEED_VALUE,
@@ -322,7 +323,21 @@ async def resume_pending_planning_after_user_input(
 
     user_input_text = str(user_input or "").strip()
     if not user_input_text:
-        yield_func(sse_json({"message": "缺少用户补充信息，无法继续规划"}, event="error"))
+        yield_func(
+            sse_json(
+                build_stream_error_payload(
+                    error_code="pending_planning_missing_user_input",
+                    error_message="缺少用户补充信息，无法继续规划",
+                    phase="pending_planning_preflight",
+                    task_id=task_id,
+                    run_id=run_id,
+                    recoverable=False,
+                    retryable=True,
+                    terminal_source="runtime",
+                ),
+                event="error",
+            )
+        )
         return {
             "outcome": "failed",
             "message": str(message or "").strip(),
@@ -639,7 +654,21 @@ async def resume_pending_planning_after_user_input(
                 reason=f"think_pending_planning_failed:{exc}",
             )
             enqueue_postprocess_thread(task_id=int(task_id), run_id=int(run_id), run_status=RUN_STATUS_FAILED)
-            yield_func(sse_json({"message": "Think 模式规划失败：未生成有效计划"}, event="error"))
+            yield_func(
+                sse_json(
+                    build_stream_error_payload(
+                        error_code="think_pending_planning_failed",
+                        error_message="Think 模式规划失败：未生成有效计划",
+                        phase="pending_planning_think",
+                        task_id=task_id,
+                        run_id=run_id,
+                        recoverable=False,
+                        retryable=False,
+                        terminal_source="runtime",
+                    ),
+                    event="error",
+                )
+            )
             return {
                 "outcome": "failed",
                 "message": str(message_for_planning or "").strip(),
@@ -663,7 +692,21 @@ async def resume_pending_planning_after_user_input(
                 reason="think_pending_planning_failed:think_planning_empty",
             )
             enqueue_postprocess_thread(task_id=int(task_id), run_id=int(run_id), run_status=RUN_STATUS_FAILED)
-            yield_func(sse_json({"message": "Think 模式规划失败：未生成有效计划"}, event="error"))
+            yield_func(
+                sse_json(
+                    build_stream_error_payload(
+                        error_code="think_pending_planning_empty",
+                        error_message="Think 模式规划失败：未生成有效计划",
+                        phase="pending_planning_think",
+                        task_id=task_id,
+                        run_id=run_id,
+                        recoverable=False,
+                        retryable=False,
+                        terminal_source="runtime",
+                    ),
+                    event="error",
+                )
+            )
             return {
                 "outcome": "failed",
                 "message": str(message_for_planning or "").strip(),
@@ -860,7 +903,22 @@ async def resume_pending_planning_after_user_input(
             reason=str(exc.reason),
         )
         enqueue_postprocess_thread(task_id=int(task_id), run_id=int(run_id), run_status=RUN_STATUS_FAILED)
-        yield_func(sse_json({"message": exc.public_message}, event="error"))
+        yield_func(
+            sse_json(
+                build_stream_error_payload(
+                    error_code="pending_planning_plan_phase_failed",
+                    error_message=str(exc.public_message or "规划失败"),
+                    phase="pending_planning_planning",
+                    task_id=task_id,
+                    run_id=run_id,
+                    recoverable=False,
+                    retryable=False,
+                    terminal_source="runtime",
+                    details={"reason": str(exc.reason or "").strip()},
+                ),
+                event="error",
+            )
+        )
         return {
             "outcome": "failed",
             "message": str(message_for_planning or "").strip(),
