@@ -331,6 +331,20 @@ export async function streamSse(makeRequest, options = {}) {
         return { consumed: true, delta: "" };
       }
     }
+    if (
+      obj.type === "strategy_update"
+      || obj.type === "progress_update"
+      || obj.type === "unreachable_proof"
+      || obj.type === "step_error"
+      || obj.type === "step_progress"
+      || obj.type === "step_warning"
+      || obj.type === "search_progress"
+      || obj.type === "search_candidates"
+      || obj.type === "search_rejected"
+      || obj.type === "search_selected"
+    ) {
+      return { consumed: true, delta: "" };
+    }
     if (typeof obj.delta === "string") {
       return { consumed: false, delta: obj.delta };
     }

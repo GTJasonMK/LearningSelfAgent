@@ -23,7 +23,7 @@ from backend.src.constants import (
     RUN_STATUS_FAILED,
     RUN_STATUS_STOPPED,
     RUN_STATUS_WAITING,
-    STREAM_TAG_EXEC,
+    STREAM_TAG_FAIL,
     SSE_TYPE_MEMORY_ITEM,
     TASK_OUTPUT_TYPE_DEBUG,
     TASK_OUTPUT_TYPE_TEXT,
@@ -55,23 +55,107 @@ async def check_and_report_missing_artifacts(
     """
     检查 artifacts 是否缺失，返回更新后的状态。
 
-    仅在任务"成功结束"时检查，避免出现"嘴上完成但没有落盘"。
+    约束（开发期强约束）：
+    - run_status=done 且声明了 artifacts 时，任一缺失即降级为 failed。
     """
     if run_status != RUN_STATUS_DONE or not plan_artifacts:
         return run_status
 
     missing = check_missing_artifacts(artifacts=plan_artifacts, workdir=workdir)
-    if missing:
-        safe_write_debug(
-            task_id, run_id,
-            message="agent.artifacts.missing",
-            data={"missing": missing},
-            level="warning",
-        )
-        yield_func(sse_json({"delta": f"{STREAM_TAG_EXEC} 警告：未生成文件：{', '.join(missing)}（结果可能需要补救）\n"}))
+    if not missing:
         return run_status
 
-    return run_status
+    safe_write_debug(
+        task_id,
+        run_id,
+        message="agent.artifacts.missing",
+        data={"missing": missing},
+        level="error",
+    )
+    yield_func(sse_json({"delta": f"{STREAM_TAG_FAIL} 未生成文件：{', '.join(missing)}\n"}))
+    yield_func(
+        sse_json(
+            build_stream_error_payload(
+                error_code="missing_artifacts",
+                error_message=format_task_error(
+                    code="missing_artifacts",
+                    message=f"任务声明了产物但未生成：{', '.join(missing)}",
+                ),
+                phase="finalization",
+                task_id=task_id,
+                run_id=run_id,
+                recoverable=False,
+                retryable=False,
+                terminal_source="runtime",
+                details={"missing_artifacts": list(missing)},
+            ),
+            event="error",
+        )
+    )
+    return RUN_STATUS_FAILED
+
+
+async def enforce_done_visible_output_contract(
+    *,
+    run_status: str,
+    task_id: int,
+    run_id: int,
+    yield_func: Callable,
+) -> str:
+    """
+    done 终态必须有可展示结果（text task_output）。
+    """
+    if str(run_status or "").strip() != str(RUN_STATUS_DONE):
+        return str(run_status or "")
+
+    has_text_output = False
+    check_error = ""
+    try:
+        has_text_output = await asyncio.to_thread(
+            _has_text_task_output,
+            int(task_id),
+            int(run_id),
+        )
+    except Exception as exc:
+        check_error = str(exc)
+
+    if has_text_output:
+        return RUN_STATUS_DONE
+
+    reason = "missing_text_task_output"
+    details = {"reason": reason}
+    if check_error:
+        reason = f"task_output_visibility_check_failed:{check_error}"
+        details["check_error"] = check_error
+
+    safe_write_debug(
+        task_id,
+        run_id,
+        message="agent.done_contract.failed",
+        data=details,
+        level="error",
+    )
+    yield_func(sse_json({"delta": f"{STREAM_TAG_FAIL} 终态校验失败：缺少可展示的文本结果\n"}))
+    yield_func(
+        sse_json(
+            build_stream_error_payload(
+                error_code="missing_visible_task_output",
+                error_message=format_task_error(
+                    code="missing_visible_task_output",
+                    message="任务结束时缺少可展示的文本结果，已自动收敛为 failed",
+                ),
+                phase="finalization",
+                task_id=int(task_id),
+                run_id=int(run_id),
+                recoverable=False,
+                retryable=False,
+                terminal_source="runtime",
+                details=details,
+            ),
+            event="error",
+        )
+    )
+    return RUN_STATUS_FAILED
 
 
 def _truncate_inline_text(value: object, max_chars: int = 180) -> str:
@@ -157,6 +241,29 @@ async def ensure_failed_task_output(
         sse_json_func=sse_json,
         handled_errors=(Exception,),
     )
+
+
+def emit_unreachable_proof_if_failed(
+    *,
+    run_status: str,
+    agent_state: dict,
+    task_id: int,
+    run_id: int,
+    yield_func: Callable,
+) -> None:
+    """
+    failed 终态时，输出不可达证明（若存在）。
+    """
+    if str(run_status or "").strip() != str(RUN_STATUS_FAILED):
+        return
+    proof = agent_state.get("unreachable_proof") if isinstance(agent_state, dict) else None
+    if not isinstance(proof, dict) or not proof:
+        return
+    payload = dict(proof)
+    payload["type"] = "unreachable_proof"
+    payload["task_id"] = int(task_id)
+    payload["run_id"] = int(run_id)
+    yield_func(sse_json(payload))
 
 
 def finalize_plan_items_status(
@@ -292,10 +399,23 @@ async def run_finalization_sequence(
     run_status = await check_and_report_missing_artifacts(
         run_status, plan_artifacts, workdir, yield_func, task_id, run_id
     )
+    run_status = await enforce_done_visible_output_contract(
+        run_status=str(run_status),
+        task_id=int(task_id),
+        run_id=int(run_id),
+        yield_func=yield_func,
+    )
 
     finalize_plan_items_status(plan_items, run_status, yield_func, task_id, run_id)
 
     await ensure_failed_task_output(task_id, run_id, run_status, yield_func)
+    emit_unreachable_proof_if_failed(
+        run_status=run_status,
+        agent_state=agent_state,
+        task_id=int(task_id),
+        run_id=int(run_id),
+        yield_func=yield_func,
+    )
 
     await finalize_run_status(task_id, run_id, run_status)
     yield_func(

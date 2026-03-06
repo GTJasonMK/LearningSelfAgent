@@ -26,6 +26,7 @@ from backend.src.constants import (
     STREAM_TAG_FAIL,
     STREAM_TAG_REFLECTION,
 )
+from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.services.tasks.task_queries import get_task_run, list_task_steps_for_run, mark_task_step_skipped
 
@@ -603,16 +604,7 @@ async def _run_think_mode_execution_impl(config: ThinkExecutionConfig) -> ThinkE
                     level="warning",
                 )
 
-        yield_func(
-            sse_json(
-                {
-                    "type": "plan",
-                    "task_id": int(task_id),
-                    "run_id": int(run_id),
-                    "items": list(plan_items or []),
-                }
-            )
-        )
+        yield_func(sse_plan(task_id=int(task_id), run_id=int(run_id), plan_items=list(plan_items or [])))
         yield_func(sse_json({"delta": f"{STREAM_TAG_REFLECTION} 反思完成，继续从步骤 {last_step_order + 1} 执行…\n"}))
 
         start_step = last_step_order + 1

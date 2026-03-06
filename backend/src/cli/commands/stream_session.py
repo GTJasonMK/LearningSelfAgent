@@ -62,8 +62,10 @@ class StreamSessionResult:
         if str(payload.get("type") or "").strip() == "need_input":
             self.saw_business_state_event = True
         if str(payload.get("type") or "").strip() in {"done", "stream_end"}:
-            if str(payload.get("run_status") or "").strip():
+            terminal_status = _normalize_run_status(payload.get("run_status") or payload.get("status"))
+            if terminal_status:
                 self.saw_business_state_event = True
+                self.last_run_status = terminal_status
             self.seen_done = True
 
     @staticmethod
@@ -149,7 +151,12 @@ def _apply_event(
     if isinstance(event.json_data, dict):
         if not result.should_process_payload(event.json_data):
             return "skip"
-    outcome = render_stream_event(event, output_json, done_message=done_message)
+    outcome = render_stream_event(
+        event,
+        output_json,
+        done_message=done_message,
+        last_run_status=result.last_run_status,
+    )
     if outcome == "done":
         result.seen_done = True
     elif outcome == "error":
@@ -269,3 +276,17 @@ def run_stream_session(
         result.seen_done = True
 
     return result
+
+
+def resolve_terminal_run_status(result: StreamSessionResult) -> str:
+    """
+    收敛 CLI 终态（与前端/桌宠对齐的最小状态集合）。
+    """
+    status = _normalize_run_status(getattr(result, "last_run_status", ""))
+    if status in _TERMINAL_RUN_STATUSES or status == "waiting":
+        return status
+    if bool(getattr(result, "seen_error", False)):
+        return "failed"
+    if bool(getattr(result, "seen_done", False)):
+        return "done"
+    return ""

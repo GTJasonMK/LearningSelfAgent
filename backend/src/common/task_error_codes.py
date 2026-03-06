@@ -25,6 +25,9 @@ _SOURCE_FAILURE_CODE_EXACT = {
     "dns_resolution_failed",
     "tls_handshake_failed",
     "network_unreachable",
+    "low_relevance_candidates",
+    "candidate_preview_empty",
+    "candidate_missing_required_fields",
 }
 
 # 对未来新增 code 保持前向兼容：只要遵循统一前缀，即可自动被识别为源失败。

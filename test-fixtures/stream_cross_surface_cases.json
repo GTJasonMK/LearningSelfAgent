@@ -72,7 +72,7 @@
         "seen_done": true,
         "seen_error": false,
         "saw_business_state_event": true,
-        "last_run_status": "",
+        "last_run_status": "done",
         "replay_applied": 0,
         "replay_calls": 0
       },

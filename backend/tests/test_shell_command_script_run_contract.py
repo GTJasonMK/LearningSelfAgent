@@ -342,5 +342,56 @@ class TestShellCommandScriptRunContract(unittest.TestCase):
         self.assertEqual(extract_task_error_code(str(ctx.exception)), "script_args_missing")
 
 
+    def test_script_run_sys_argv_contract_overrides_stale_flag_required_args(self):
+        from backend.src.actions.handlers.shell_command import execute_shell_command
+
+        script_path = os.path.join(self._tmpdir.name, "verify_csv.py")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import sys\n"
+                "if len(sys.argv) != 2:\n"
+                "    raise SystemExit('用法: python verify_csv.py <csv_path>')\n"
+                "csv_path = sys.argv[1]\n"
+                "print(csv_path)\n"
+            )
+
+        payload = {
+            "script": script_path,
+            "args": ["--input", "data/gold.csv"],
+            "required_args": ["--input"],
+            "workdir": self._tmpdir.name,
+            "discover_required_args": True,
+        }
+        observed = {"payload": None}
+
+        def _fake_run_shell(p):
+            observed["payload"] = dict(p or {})
+            return {"stdout": "ok", "stderr": "", "returncode": 0, "ok": True}, None
+
+        with patch(
+            "backend.src.actions.handlers.shell_command.has_exec_permission",
+            return_value=True,
+        ), patch(
+            "backend.src.actions.handlers.shell_command.run_shell_command",
+            side_effect=_fake_run_shell,
+        ):
+            result, error = execute_shell_command(
+                task_id=1,
+                run_id=1,
+                step_row={"id": 1, "title": "shell_command:verify_csv"},
+                payload=payload,
+                context={"enforce_shell_script_dependency": False},
+            )
+
+        self.assertIsNone(error)
+        self.assertIsInstance(result, dict)
+        cmd = (observed.get("payload") or {}).get("command") or []
+        self.assertEqual(cmd[1], script_path)
+        self.assertEqual(cmd[2:], ["data/gold.csv"])
+        self.assertNotIn("--input", cmd)
+        required_args = list((result.get("script_contract") or {}).get("required_args") or [])
+        self.assertEqual(required_args, ["@pos:csv_path"])
+
+
 if __name__ == "__main__":
     unittest.main()

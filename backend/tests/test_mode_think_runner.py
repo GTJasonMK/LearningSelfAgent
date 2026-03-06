@@ -18,6 +18,10 @@ async def _iter_parallel_failed(*args, **kwargs):
     yield ("done", SimpleNamespace(run_status="failed", last_step_order=1))
 
 
+async def _iter_parallel_stopped(*args, **kwargs):
+    yield ("stop", "stopped")
+
+
 class TestModeThinkRunner(unittest.IsolatedAsyncioTestCase):
     def _build_kwargs(self):
         plan_struct = PlanStructure.from_legacy(
@@ -131,6 +135,30 @@ class TestModeThinkRunner(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(result.run_status, "done")
         mock_run.assert_awaited_once()
+
+    async def test_run_think_mode_execution_external_stop_converges(self):
+        kwargs = self._build_kwargs()
+        with patch(
+            "backend.src.agent.runner.mode_think_runner.run_think_parallel_loop",
+            return_value=object(),
+        ) as mock_parallel, patch(
+            "backend.src.agent.runner.mode_think_runner.pump_sync_generator",
+            side_effect=_iter_parallel_stopped,
+        ) as mock_pump, patch(
+            "backend.src.agent.runner.mode_think_runner.run_react_loop"
+        ) as mock_tail:
+            result = await run_think_mode_execution_from_config(
+                ThinkExecutionConfig(
+                    **kwargs,
+                    yield_func=lambda _msg: None,
+                    safe_write_debug=Mock(),
+                )
+            )
+        self.assertEqual(result.run_status, "stopped")
+        self.assertEqual(result.last_step_order, 0)
+        mock_parallel.assert_called_once()
+        mock_pump.assert_called_once()
+        mock_tail.assert_not_called()
 
 
 if __name__ == "__main__":

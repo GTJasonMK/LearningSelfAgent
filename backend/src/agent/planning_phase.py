@@ -13,6 +13,7 @@ from backend.src.agent.plan_utils import (
     _normalize_plan_titles,
     drop_non_artifact_file_write_steps,
     extract_file_write_target_path,
+    is_bootstrap_script_file_write_step,
     reorder_script_file_writes_before_exec_steps,
     repair_plan_artifacts_with_file_write_steps,
     sanitize_plan_brief,
@@ -23,8 +24,14 @@ from backend.src.agent.core.context_budget import apply_context_budgets
 from backend.src.actions.registry import action_types_line
 from backend.src.services.llm.llm_calls import create_llm_call
 from backend.src.constants import (
+    ACTION_TYPE_FILE_READ,
     ACTION_TYPE_FILE_WRITE,
+    ACTION_TYPE_HTTP_REQUEST,
+    ACTION_TYPE_JSON_PARSE,
+    ACTION_TYPE_LLM_CALL,
+    ACTION_TYPE_SHELL_COMMAND,
     ACTION_TYPE_TASK_OUTPUT,
+    ACTION_TYPE_TOOL_CALL,
     AGENT_EXPERIMENT_DIR_REL,
     AGENT_PLAN_HEARTBEAT_INTERVAL_SECONDS,
     AGENT_PLAN_MAX_WAIT_SECONDS,
@@ -37,6 +44,13 @@ from backend.src.constants import (
 from backend.src.services.debug.safe_debug import safe_write_debug as _safe_write_debug
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.agent.runner.react_helpers import call_llm_for_text_with_id
+from backend.src.agent.runner.goal_progress import detect_task_grounding_drift, summarize_task_grounding_for_prompt
+from backend.src.agent.runner.step_feedback import (
+    summarize_failure_guidance_for_prompt,
+    summarize_recent_step_feedback_for_prompt,
+    summarize_retry_requirements_for_prompt,
+)
+from backend.src.common.task_error_codes import extract_task_error_code, is_source_failure_error_code
 
 # 仅在用户明确表达“保存到某目录/某路径下”时启用的输出目录提示抽取。
 # 目的：让 plan 阶段 deterministic 地把 file_write/artifacts 绑定到用户指定目录，避免落盘到错误位置。
@@ -199,6 +213,177 @@ def _is_plain_json_object_text(text: str) -> bool:
     return raw.startswith("{") and raw.endswith("}")
 
 
+_STRUCTURED_DATA_EXTS = {".csv", ".tsv", ".json", ".ndjson", ".xlsx", ".parquet"}
+_SCRIPT_FILE_EXTS = {".py", ".js", ".ts", ".mjs", ".cjs", ".sh", ".ps1", ".bat", ".cmd", ".rb", ".php"}
+_SAMPLE_ACQUIRE_ACTIONS = {ACTION_TYPE_TOOL_CALL, ACTION_TYPE_HTTP_REQUEST, ACTION_TYPE_FILE_READ, ACTION_TYPE_SHELL_COMMAND}
+_PRE_SAMPLE_BLOCKED_ACTIONS = {ACTION_TYPE_LLM_CALL, ACTION_TYPE_JSON_PARSE, ACTION_TYPE_TASK_OUTPUT}
+
+
+def _has_real_sample(*, context: Optional[dict] = None) -> bool:
+    if not isinstance(context, dict):
+        return False
+    return bool(str(context.get("latest_parse_input_text") or "").strip())
+
+
+def _detect_sample_kind(sample_text: str) -> str:
+    raw = str(sample_text or "").strip()
+    lowered = raw.lower()
+    if not raw:
+        return "none"
+    if raw.startswith("{") or raw.startswith("["):
+        return "json"
+    if raw.startswith("<") and "<html" in lowered[:200]:
+        return "html"
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) >= 2 and "," in lines[0] and "," in lines[1]:
+        return "csv"
+    return "text"
+
+
+def _summarize_real_sample_status(*, context: Optional[dict] = None) -> str:
+    if not isinstance(context, dict):
+        return "- sample_available=no\n- reason=no_context"
+    sample_text = str(context.get("latest_parse_input_text") or "").strip()
+    latest_external_url = str(context.get("latest_external_url") or "").strip()
+    if not sample_text:
+        lines = ["- sample_available=no"]
+        if latest_external_url:
+            lines.append(f"- latest_external_url={latest_external_url}")
+            lines.append("- note=已有来源线索，但尚无可直接解析的真实样本")
+        else:
+            lines.append("- note=当前没有可直接解析的真实样本")
+        return "\n".join(lines)
+
+    lines = ["- sample_available=yes"]
+    lines.append(f"- sample_kind={_detect_sample_kind(sample_text)}")
+    if latest_external_url:
+        lines.append(f"- sample_source={latest_external_url}")
+    lines.append(f"- sample_preview={_truncate_observation(sample_text)}")
+    return "\n".join(lines)
+
+
+def _text_indicates_structured_data(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        token in lowered
+        for token in ("csv", "json", "tsv", "ndjson", "xlsx", "parquet", "表格", "结构化", "字段", "列")
+    )
+
+
+
+def _plan_targets_structured_data(*, titles: List[str], artifacts: List[str], message: str = "") -> bool:
+    if _text_indicates_structured_data(message):
+        return True
+    for item in artifacts or []:
+        ext = os.path.splitext(str(item or "").strip().lower())[1]
+        if ext in _STRUCTURED_DATA_EXTS:
+            return True
+    for title in titles or []:
+        target = extract_file_write_target_path(str(title or ""))
+        ext = os.path.splitext(str(target or "").strip().lower())[1]
+        if ext in _STRUCTURED_DATA_EXTS:
+            return True
+        if _text_indicates_structured_data(title):
+            return True
+    return False
+
+
+def _is_script_file_write_step(*, title: str, allow: List[str]) -> bool:
+    allow_set = set(allow or [])
+    if ACTION_TYPE_FILE_WRITE not in allow_set:
+        return False
+    target = extract_file_write_target_path(str(title or ""))
+    ext = os.path.splitext(str(target or "").strip().lower())[1]
+    return ext in _SCRIPT_FILE_EXTS
+
+
+def _is_sample_acquire_step(*, title: str, allow: List[str]) -> bool:
+    _ = title
+    allow_set = set(allow or [])
+    return bool(allow_set & _SAMPLE_ACQUIRE_ACTIONS)
+
+
+def _has_grounded_external_source(*, message: str, observations: List[str], context: Optional[dict]) -> bool:
+    candidates: List[str] = [str(message or "").strip()]
+    for item in observations or []:
+        candidates.append(str(item or "").strip())
+    if isinstance(context, dict):
+        for key in ("latest_external_url", "latest_source_url", "source_url"):
+            value = str(context.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+    for text in candidates:
+        if re.search(r"https?://[^\s\"'<>]+", str(text or "")):
+            return True
+    return False
+
+
+
+def _validate_source_discovery_contract(
+    *,
+    titles: List[str],
+    allows: List[List[str]],
+    message: str,
+    error: str,
+    observations: List[str],
+    context: Optional[dict],
+) -> Optional[str]:
+    code = extract_task_error_code(str(error or ""))
+    if not code or not is_source_failure_error_code(code):
+        return None
+    if _has_grounded_external_source(message=message, observations=observations, context=context):
+        return None
+    if not titles or not allows:
+        return None
+
+    first_title = str(titles[0] or "").strip().lower()
+    first_allow_set = set(allows[0] or [])
+    if ACTION_TYPE_HTTP_REQUEST in first_allow_set or first_title.startswith("http_request:"):
+        return "最近失败属于来源发现/可用性问题，且当前没有可用具体 URL/host 依据；剩余计划的首个抓取步骤不能直接是 http_request，应先继续发现来源。"
+    return None
+
+
+
+def _validate_structured_artifact_sample_contract(
+    *,
+    titles: List[str],
+    allows: List[List[str]],
+    artifacts: List[str],
+    real_sample_available: bool,
+    message: str = "",
+) -> Optional[str]:
+    if real_sample_available:
+        return None
+    if not _plan_targets_structured_data(titles=titles, artifacts=artifacts, message=message):
+        return None
+
+    first_acquire_idx: Optional[int] = None
+    for idx, (title, allow) in enumerate(zip(titles or [], allows or [])):
+        if _is_sample_acquire_step(title=str(title or ""), allow=list(allow or [])):
+            first_acquire_idx = idx
+            break
+    if first_acquire_idx is None:
+        return "当前尚无真实样本，但剩余计划没有优先安排获取样本步骤。对于结构化数据任务，应先获取样本再解析/写文件。"
+
+    bootstrap_script_count = 0
+    for idx in range(0, int(first_acquire_idx)):
+        title = str(titles[idx] or "") if idx < len(titles) else ""
+        allow = list(allows[idx] or []) if idx < len(allows) else []
+        allow_set = set(allow or [])
+        if ACTION_TYPE_FILE_WRITE in allow_set:
+            if _is_script_file_write_step(title=title, allow=allow):
+                if not is_bootstrap_script_file_write_step(title=title, brief=""):
+                    return "当前尚无真实样本，首次获取样本前只允许抓取/读取类脚本；不要先写解析、校验或格式化脚本。"
+                bootstrap_script_count += 1
+                if bootstrap_script_count > 1:
+                    return "当前尚无真实样本，首次获取样本前最多只能准备一个抓取/读取脚本；不要先连续写多个脚本。"
+                continue
+            return "当前尚无真实样本，首次获取样本前禁止写结果文件或非脚本类 file_write。"
+        if allow_set & _PRE_SAMPLE_BLOCKED_ACTIONS:
+            return "当前尚无真实样本，首次获取样本前不要先做 llm_call/json_parse/task_output；请先拿到真实样本。"
+    return None
+
+
 class PlanPhaseFailure(RuntimeError):
     """
     规划阶段失败：由上层负责收敛 task/run 状态并向前端输出 error event。
@@ -240,6 +425,7 @@ def run_replan_phase(
     error: str,
     observations: List[str],
     failure_signatures: Optional[dict] = None,
+    context: Optional[dict] = None,
 ) -> Generator[str, None, PlanPhaseResult]:
     """
     重新规划（Replan）：
@@ -254,10 +440,25 @@ def run_replan_phase(
         error=str(error or ""),
         failure_signatures=failure_signatures if isinstance(failure_signatures, dict) else None,
     )
+    agent_state_like = {
+        "step_feedback_history": (failure_signatures or {}).get("step_feedback_history")
+        if isinstance(failure_signatures, dict)
+        else None,
+        "pending_retry_requirements": (failure_signatures or {}).get("pending_retry_requirements")
+        if isinstance(failure_signatures, dict)
+        else None,
+    }
+    recent_step_feedback = summarize_recent_step_feedback_for_prompt(agent_state_like)
+    retry_requirements = summarize_retry_requirements_for_prompt(agent_state_like)
+    failure_guidance = summarize_failure_guidance_for_prompt(agent_state_like)
+    real_sample_status = _summarize_real_sample_status(context=context)
     sections = apply_context_budgets(
         {
             "observations": obs_text,
             "recent_source_failures": source_failure_summary,
+            "recent_step_feedback": recent_step_feedback,
+            "retry_requirements": retry_requirements,
+            "failure_guidance": failure_guidance,
             "tools": tools_hint,
             "skills": skills_hint,
             "solutions": solutions_hint,
@@ -274,6 +475,10 @@ def run_replan_phase(
         error=str(error or ""),
         observations=str(sections.get("observations") or ""),
         recent_source_failures=str(sections.get("recent_source_failures") or ""),
+        real_sample_status=str(real_sample_status or ""),
+        recent_step_feedback=str(sections.get("recent_step_feedback") or ""),
+        retry_requirements=str(sections.get("retry_requirements") or ""),
+        failure_guidance=str(sections.get("failure_guidance") or ""),
         tools=str(sections.get("tools") or ""),
         skills=str(sections.get("skills") or ""),
         solutions=str(sections.get("solutions") or ""),
@@ -281,6 +486,9 @@ def run_replan_phase(
         graph=str(sections.get("graph") or ""),
         action_types_line=action_types_line(),
     )
+    task_grounding_text = summarize_task_grounding_for_prompt(message)
+    if task_grounding_text and task_grounding_text != "(无)":
+        replan_prompt += f"\n原任务不可变约束（必须继承，不可改题）：\n{task_grounding_text}\n"
 
     text, err, llm_id = call_llm_for_text_with_id(
         create_llm_call,
@@ -369,6 +577,151 @@ def run_replan_phase(
             public_message="重新规划输出不合法: task_output 只能出现在最后一步",
         )
 
+    real_sample_available = _has_real_sample(context=context)
+    grounding_error = _validate_structured_artifact_sample_contract(
+        titles=plan_titles_new,
+        allows=plan_allows,
+        artifacts=list(plan_artifacts or []) + list(plan_artifacts_new or []),
+        real_sample_available=real_sample_available,
+        message=message,
+    )
+    source_discovery_error = _validate_source_discovery_contract(
+        titles=plan_titles_new,
+        allows=plan_allows,
+        message=message,
+        error=error,
+        observations=observations,
+        context=context,
+    )
+    task_grounding_error = detect_task_grounding_drift(
+        message=message,
+        plan_titles=plan_titles_new,
+        plan_briefs=plan_briefs,
+    )
+    contract_error = grounding_error or source_discovery_error or task_grounding_error
+    if contract_error:
+        _safe_write_debug(
+            int(task_id),
+            int(run_id),
+            message="agent.replan.grounding_invalid",
+            data={
+                "error": contract_error,
+                "sample_available": bool(real_sample_available),
+                "plan": list(plan_titles_new or []),
+                "has_grounded_external_source": _has_grounded_external_source(
+                    message=message,
+                    observations=observations,
+                    context=context,
+                ),
+                "task_grounding_error": task_grounding_error,
+            },
+            level="warning",
+        )
+        retry_constraints = []
+        if grounding_error:
+            retry_constraints.extend(
+                [
+                    "若当前没有真实样本，先安排获取样本步骤。",
+                    "获取样本前最多只允许一个抓取/读取脚本 file_write；不要先写解析脚本、校验脚本或结果文件。",
+                ]
+            )
+        if source_discovery_error:
+            retry_constraints.extend(
+                [
+                    "若当前没有可用具体 URL/host 依据，首个抓取步骤不能直接是 http_request。",
+                    "应先安排来源发现步骤（如 tool_call:web_fetch），或先拿到真实 URL 再做 http_request。",
+                ]
+            )
+        if task_grounding_error:
+            retry_constraints.extend(
+                [
+                    "可以更换来源、搜索词和实现路径，但不得改写原任务的单位、时间范围或输出格式。",
+                    "若用户明确要求元/克、最近三个月、CSV 等口径，剩余计划和搜索步骤必须继续继承这些约束。",
+                ]
+            )
+        retry_constraints.append("只输出剩余步骤 JSON。")
+        numbered_retry_constraints = "".join(
+            f"{idx}) {item}\n" for idx, item in enumerate(retry_constraints, start=1)
+        )
+        reprompt = (
+            replan_prompt
+            + "\n\n补充约束：你上一轮剩余计划不合法，因为 "
+            + contract_error
+            + "\n请重写剩余计划，并满足：\n"
+            + numbered_retry_constraints
+            + f"上一轮输出（供参考）：{json.dumps(plan, ensure_ascii=False)}\n"
+        )
+        retry_params = dict(parameters or {})
+        retry_params["temperature"] = 0
+        retry_text, retry_err, retry_llm_id = call_llm_for_text_with_id(
+            create_llm_call,
+            prompt=reprompt,
+            task_id=int(task_id),
+            run_id=int(run_id),
+            model=model,
+            parameters=retry_params,
+            variables={"source": "agent_replan_grounding_retry"},
+        )
+        retry_plan = _extract_json_object(retry_text or "")
+        if retry_err or not retry_plan:
+            raise PlanPhaseFailure(
+                reason=f"replan_grounding_retry_failed:{retry_err or 'invalid_json'}",
+                public_message=f"重新规划输出不合法: {contract_error}",
+            )
+        plan = retry_plan
+        if retry_llm_id is not None:
+            llm_id = retry_llm_id
+        plan_titles_new, plan_briefs, plan_allows, plan_artifacts_new, plan_error = _normalize_plan_titles(
+            plan, max_steps=max_steps
+        )
+        if plan_error or not plan_titles_new or not plan_allows:
+            raise PlanPhaseFailure(
+                reason=f"replan_invalid:{plan_error or 'empty_plan'}",
+                public_message=f"重新规划输出不合法: {plan_error or 'empty_plan'}",
+            )
+        if output_dir_rel:
+            plan_titles_new, plan_artifacts_new, _changed = _apply_output_dir_hint_to_plan(
+                output_dir_rel=output_dir_rel,
+                titles=plan_titles_new,
+                artifacts=plan_artifacts_new,
+            )
+        if plan_allows and ACTION_TYPE_TASK_OUTPUT not in set(plan_allows[-1] or []):
+            raise PlanPhaseFailure(
+                reason="replan_invalid:output_not_last",
+                public_message="重新规划输出不合法: 输出步骤必须是最后一步",
+            )
+        if any(ACTION_TYPE_TASK_OUTPUT in set(a or []) for a in plan_allows[:-1]):
+            raise PlanPhaseFailure(
+                reason="replan_invalid:task_output_not_last",
+                public_message="重新规划输出不合法: task_output 只能出现在最后一步",
+            )
+        grounding_error = _validate_structured_artifact_sample_contract(
+            titles=plan_titles_new,
+            allows=plan_allows,
+            artifacts=list(plan_artifacts or []) + list(plan_artifacts_new or []),
+            real_sample_available=real_sample_available,
+        )
+        source_discovery_error = _validate_source_discovery_contract(
+            titles=plan_titles_new,
+            allows=plan_allows,
+            message=message,
+            error=error,
+            observations=observations,
+            context=context,
+        )
+        task_grounding_error = detect_task_grounding_drift(
+            message=message,
+            plan_titles=plan_titles_new,
+            plan_briefs=plan_briefs,
+        )
+        contract_error = grounding_error or source_discovery_error or task_grounding_error
+        if contract_error:
+            raise PlanPhaseFailure(
+                reason="replan_invalid_grounding",
+                public_message=f"重新规划输出不合法: {contract_error}",
+            )
+
+    # 合并 artifacts（保留已有声明）
     # 合并 artifacts（保留已有声明）
     merged_artifacts = []
     for item in (plan_artifacts or []) + (plan_artifacts_new or []):
@@ -456,6 +809,37 @@ def run_replan_phase(
                 level="info",
             )
 
+        post_repair_grounding_error = _validate_structured_artifact_sample_contract(
+            titles=plan_titles_new,
+            allows=plan_allows,
+            artifacts=list(merged_artifacts or []),
+            real_sample_available=real_sample_available,
+            message=message,
+        )
+        post_repair_source_discovery_error = _validate_source_discovery_contract(
+            titles=plan_titles_new,
+            allows=plan_allows,
+            message=message,
+            error=error,
+            observations=observations,
+            context=context,
+        )
+        post_repair_task_grounding_error = detect_task_grounding_drift(
+            message=message,
+            plan_titles=plan_titles_new,
+            plan_briefs=plan_briefs,
+        )
+        post_repair_contract_error = (
+            post_repair_grounding_error
+            or post_repair_source_discovery_error
+            or post_repair_task_grounding_error
+        )
+        if post_repair_contract_error:
+            raise PlanPhaseFailure(
+                reason="replan_invalid_post_repair_contract",
+                public_message=f"重新规划输出不合法: {post_repair_contract_error}",
+            )
+
     plan_items = []
     for idx, brief in enumerate(plan_briefs or [], start=1):
         text = sanitize_plan_brief(
@@ -530,6 +914,10 @@ def run_planning_phase(
             "请确保所有需要落盘的文件（artifacts/file_write）都写入该目录下。\n\n"
             + plan_prompt
         )
+
+    task_grounding_text = summarize_task_grounding_for_prompt(message)
+    if task_grounding_text and task_grounding_text != "(无)":
+        plan_prompt += f"\n原任务不可变约束（规划时必须继承）：\n{task_grounding_text}\n"
 
     # 规划阶段可能耗时较长：放到后台线程执行，并周期性输出心跳，避免桌宠一直停在“正在规划”
     plan_queue: "queue.Queue[tuple[Optional[str], Optional[str], Optional[int]]]" = queue.Queue(maxsize=1)

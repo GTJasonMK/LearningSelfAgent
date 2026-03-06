@@ -9,6 +9,32 @@ function isObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+function mergeDefinedFields(base, patch) {
+  const next = { ...(isObject(base) ? base : {}) };
+  if (!isObject(patch)) return next;
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    next[key] = value;
+  }
+  return next;
+}
+
+function mergeSearchState(base, patch) {
+  const next = mergeDefinedFields(base, patch);
+  if (isObject(base?.selected) || isObject(patch?.selected)) {
+    next.selected = mergeDefinedFields(base?.selected, patch?.selected);
+  }
+  return next;
+}
+
+function mergeConvergenceState(base, patch) {
+  const next = mergeDefinedFields(base, patch);
+  if (isObject(base?.search) || isObject(patch?.search)) {
+    next.search = mergeSearchState(base?.search, patch?.search);
+  }
+  return next;
+}
+
 function buildEmptyRun() {
   return {
     task_title: "",
@@ -192,6 +218,42 @@ export function applyWorldAgentPlanDeltaState(prev, payload = {}) {
   };
 }
 
+export function applyWorldConvergenceEventState(prev, payload = {}) {
+  const prevState = isObject(prev) ? prev : {};
+  const runId = toPositiveInt(payload.runId);
+  const taskId = toPositiveInt(payload.taskId);
+  const status = String(payload.status || "").trim() || "running";
+  const convergencePatch = isObject(payload.convergencePatch) ? payload.convergencePatch : {};
+  const statePatch = isObject(payload.statePatch) ? payload.statePatch : {};
+
+  const prevRun = isObject(prevState.currentRun) ? prevState.currentRun : null;
+  const prevRunId = toPositiveInt(prevRun?.run_id);
+  const nextRun = (!prevRunId && runId)
+    ? buildRunPlaceholder(runId, taskId, status)
+    : prevRun;
+
+  const prevSnapshot = isObject(prevState.currentAgentSnapshot) ? prevState.currentAgentSnapshot : {};
+  const prevConvergence = isObject(prevSnapshot.convergence) ? prevSnapshot.convergence : {};
+  const nextConvergence = mergeConvergenceState(prevConvergence, convergencePatch);
+  const nextSnapshot = {
+    ...prevSnapshot,
+    convergence: nextConvergence
+  };
+
+  const prevAgentState = isObject(prevState.currentAgentState) ? prevState.currentAgentState : null;
+  let nextAgentState = prevAgentState;
+  if (Object.keys(statePatch).length > 0) {
+    nextAgentState = mergeDefinedFields(prevAgentState || {}, statePatch);
+  }
+
+  return {
+    ...prevState,
+    currentRun: nextRun,
+    currentAgentState: nextAgentState,
+    currentAgentSnapshot: nextSnapshot
+  };
+}
+
 export function applyWorldCurrentRunState(prev, payload = {}) {
   const prevState = isObject(prev) ? prev : {};
   const run = isObject(payload.run) ? { ...payload.run } : null;
@@ -205,11 +267,26 @@ export function applyWorldRunDetailState(prev, payload = {}) {
   const prevState = isObject(prev) ? prev : {};
   const detail = isObject(payload.detail) ? payload.detail : {};
   const meta = isObject(payload.lastRunMeta) ? payload.lastRunMeta : null;
+  const prevSnapshot = isObject(prevState.currentAgentSnapshot) ? prevState.currentAgentSnapshot : {};
+  const detailSnapshot = isObject(detail?.snapshot) ? detail.snapshot : null;
+
+  let nextSnapshot = detailSnapshot || null;
+  if (detailSnapshot) {
+    nextSnapshot = {
+      ...prevSnapshot,
+      ...detailSnapshot,
+      convergence: mergeConvergenceState(prevSnapshot?.convergence, detailSnapshot?.convergence),
+    };
+    if (!isObject(detailSnapshot?.plan) && isObject(prevSnapshot?.plan)) {
+      nextSnapshot.plan = prevSnapshot.plan;
+    }
+  }
+
   return {
     ...prevState,
     currentAgentPlan: detail?.agent_plan || null,
     currentAgentState: detail?.agent_state || null,
-    currentAgentSnapshot: detail?.snapshot || null,
+    currentAgentSnapshot: nextSnapshot,
     lastRunMeta: meta || prevState.lastRunMeta
   };
 }

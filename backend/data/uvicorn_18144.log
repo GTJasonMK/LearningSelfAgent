@@ -1,0 +1,7 @@
+INFO:     Started server process [4320]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:18144 (Press CTRL+C to quit)
+INFO:     127.0.0.1:63992 - "POST /api/agent/command/stream HTTP/1.1" 200 OK
+[agent.react.step_failed] task_id=1 run_id=1 step_id=1 step_order=1 action_type=tool_call code=low_relevance_candidates non_retriable=False budget_exceeded=False error=[code=low_relevance_candidates] web_fetch 候选页弱相关，未发现满足字段/时间/单位信号的来源：最近三个月 黄金价格 元/克 数据 | 黄金价格 元/克 三个月 CSV JSON API | 黄金价格 元/克 三个月 表格 | 三个月 黄金价格 元/克 | 黄金价格 元/克 三个月；尝试摘要：gold.hexun.com:weak:candidate_missing_required_fields | www.cngold.org:weak:candidate_missing_required_fields | www.cngold.org:weak:candidate_missing_required_fields | www.bilibili.com:weak:candidate_missing_required_fields | www.cngold.org:weak:candidate_missing_required_fields | www.cnblogs.com:weak:candidate_missing_required_fields
+[agent.react.step_failed] task_id=1 run_id=1 step_id=6 step_order=4 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=命令执行失败:Error: File recent_sample.html not found

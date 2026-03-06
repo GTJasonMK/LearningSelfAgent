@@ -86,6 +86,34 @@ class TestShellCommandDependencyGuard(unittest.TestCase):
         self.assertTrue(result.get("ok"))
         self.assertIn("ok", str(result.get("stdout") or ""))
 
+    def test_pass_when_script_bound_by_auto_materialize_context(self):
+        from backend.src.actions.handlers.shell_command import execute_shell_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script_path = os.path.join(tmp, "auto_materialized.py")
+            with open(script_path, "w", encoding="utf-8") as handle:
+                handle.write("print('ok')\n")
+
+            with patch(
+                "backend.src.actions.handlers.shell_command.list_task_steps_for_run",
+                return_value=[],
+            ):
+                result, error_message = execute_shell_command(
+                    task_id=1,
+                    run_id=1,
+                    step_row={"id": 5},
+                    payload={"command": ["python3", script_path], "workdir": tmp, "timeout_ms": 10000},
+                    context={
+                        "enforce_shell_script_dependency": True,
+                        "disallow_complex_python_c": False,
+                        "shell_dependency_auto_bind_paths": [script_path],
+                    },
+                )
+
+        self.assertIsNone(error_message)
+        self.assertTrue(result.get("ok"))
+        self.assertIn("ok", str(result.get("stdout") or ""))
+
 
 if __name__ == "__main__":
     unittest.main()

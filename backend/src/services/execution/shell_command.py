@@ -198,6 +198,28 @@ def run_shell_command(payload: dict) -> Tuple[Optional[dict], Optional[str]]:
     else:
         return None, ERROR_MESSAGE_PROMPT_RENDER_FAILED
 
+    # 当调用方以 {command, args} 结构传参时，统一在执行层做一次合并。
+    # 注意：若已走 script_run 归一化（payload.script 存在），command 通常已包含 args，
+    # 这里不再重复追加，避免参数重复。
+    if not str(payload.get("script") or "").strip():
+        extra_args_raw = payload.get("args")
+        extra_args: list[str] = []
+        if isinstance(extra_args_raw, list):
+            extra_args = [str(item) for item in extra_args_raw if str(item or "").strip()]
+        elif isinstance(extra_args_raw, str) and extra_args_raw.strip():
+            extra_args = shlex.split(extra_args_raw, posix=os.name != "nt")
+            if os.name == "nt":
+                cleaned: list[str] = []
+                for item in extra_args:
+                    token = str(item)
+                    if len(token) >= 2 and ((token[0] == token[-1] == '"') or (token[0] == token[-1] == "'")):
+                        token = token[1:-1]
+                    cleaned.append(token)
+                extra_args = cleaned
+        if extra_args:
+            if len(extra_args) > len(args) or args[-len(extra_args):] != extra_args:
+                args = list(args) + list(extra_args)
+
     # 统一 python 可执行文件：
     # - 许多机器上 `python` 不在 PATH（尤其是 Windows 环境），但后端进程本身一定有 sys.executable；
     # - 这样 Agent 通过 file_write + shell_command/tool_call 执行脚本时更稳定，不需要用户手动提供 python 路径。

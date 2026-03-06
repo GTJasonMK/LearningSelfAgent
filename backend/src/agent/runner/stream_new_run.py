@@ -17,6 +17,7 @@ from backend.src.agent.runner.pending_planning_wait_runner import (
     PendingPlanningWaitConfig,
     iter_pending_planning_wait_events,
 )
+from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.agent.runner.planning_enrich_runner import (
     PlanningEnrichRunConfig,
     iter_planning_enrich_events,
@@ -443,7 +444,7 @@ def stream_agent_command(payload: AgentCommandStreamRequest):
                 len(plan_artifacts or []),
             )
 
-            yield lifecycle.emit(sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items}))
+            yield lifecycle.emit(sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_items))
 
             # 持久化 agent 运行态：用于中途需要用户交互时可恢复执行
             agent_state = build_base_agent_state(

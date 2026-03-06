@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import FrozenSet, Tuple
 
-from backend.src.common.task_error_codes import extract_task_error_code, is_source_failure_error_code
+from backend.src.common.task_error_codes import extract_task_error_code
 
 _REACT_ERROR_POLICY_ENV = "AGENT_REACT_ERROR_POLICY_MATRIX"
 
@@ -39,8 +39,15 @@ _DEFAULT_MATRIX = ReactErrorPolicyMatrix(
             "policy_blocked_python_c",
             "script_arg_contract_mismatch",
             "script_args_missing",
+            "script_missing",
+            "script_dependency_unbound",
             "missing_expected_artifact",
+            "csv_artifact_quality_failed",
             "script_output_not_json",
+            "missing_tool_exec_spec",
+            "tool_exec_contract_error",
+            "http_response_empty",
+            "no_structured_data_extracted",
         }
     ),
     env_replan_codes=frozenset({"dependency_missing"}),
@@ -48,8 +55,6 @@ _DEFAULT_MATRIX = ReactErrorPolicyMatrix(
         {
             "invalid_action_payload",
             "invalid_tool_payload",
-            "missing_tool_exec_spec",
-            "tool_exec_contract_error",
         }
     ),
     legacy_keywords=(
@@ -58,14 +63,6 @@ _DEFAULT_MATRIX = ReactErrorPolicyMatrix(
         "action.payload 不是对象",
         "action.type 不能为空",
         "action.type 非法",
-        "LLM调用失败",
-        "Connection error",
-        "Read timed out",
-        "timeout",
-        "could not resolve host",
-        "too many requests",
-        "service unavailable",
-        "handshake",
         "csv_artifact_quality_failed",
         "高风险单行控制流 python -c",
         "complex python -c requires file_write script",
@@ -148,8 +145,9 @@ def should_force_replan_on_action_error(error_text: str) -> bool:
             return True
         if code in matrix.env_replan_codes:
             return True
-        if is_source_failure_error_code(code):
-            return True
+        # 注意：action_invalid 发生在“动作生成/校验阶段”，此时 source/timeout 类错误
+        # 多数来自 LLM 传输抖动，replan 无法改善，反而会放大时延和不确定性。
+        # 因此这里不再把 source failure code 视作强制 replan 信号。
         return any(keyword in str(error_text or "") for keyword in matrix.legacy_keywords)
     except Exception:
         return False

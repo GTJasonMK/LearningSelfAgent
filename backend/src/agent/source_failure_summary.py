@@ -76,6 +76,12 @@ def _infer_source_failure_code(text: str) -> str:
         return "http_5xx"
     if ("503" in lowered) or ("service unavailable" in lowered):
         return "service_unavailable"
+    if "low_relevance_candidates" in lowered or "弱相关" in lowered:
+        return "low_relevance_candidates"
+    if "candidate_preview_empty" in lowered or "候选页内容为空" in lowered:
+        return "candidate_preview_empty"
+    if "candidate_missing_required_fields" in lowered or "缺少 required_fields" in lowered:
+        return "candidate_missing_required_fields"
     if ("timeout" in lowered) or ("timed out" in lowered):
         return "timeout"
     return ""

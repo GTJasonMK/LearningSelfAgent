@@ -11,7 +11,7 @@ from backend.src.actions.handlers.file_append import execute_file_append
 from backend.src.actions.handlers.file_delete import execute_file_delete
 from backend.src.actions.handlers.file_list import execute_file_list
 from backend.src.actions.handlers.file_read import execute_file_read
-from backend.src.actions.handlers.file_write import execute_file_write
+from backend.src.actions.handlers.file_write import execute_file_write, validate_file_write_payload_semantics
 from backend.src.actions.handlers.http_request import execute_http_request
 from backend.src.actions.handlers.json_parse import execute_json_parse
 from backend.src.services.permissions.permissions_store import is_action_enabled
@@ -189,7 +189,16 @@ def _validate_file_write(payload: dict) -> Optional[str]:
     if path_error:
         return path_error
     # content 允许为空/缺失：执行器会把 None 视为 ""，但若提供则必须是字符串类型
-    return _validate_optional_string_field(payload, "content", "file_write.content 必须是字符串")
+    content_error = _validate_optional_string_field(payload, "content", "file_write.content 必须是字符串")
+    if content_error:
+        return content_error
+
+    content = payload.get("content")
+    if isinstance(content, str):
+        semantic_error = validate_file_write_payload_semantics(str(payload.get("path") or ""), content)
+        if semantic_error:
+            return semantic_error
+    return None
 
 
 def _validate_file_read(payload: dict) -> Optional[str]:
@@ -216,6 +225,9 @@ def _validate_http_request(payload: dict) -> Optional[str]:
     strict_status_code = payload.get("strict_status_code")
     if strict_status_code is not None and not isinstance(strict_status_code, bool):
         return "http_request.strict_status_code 必须是布尔值"
+    allow_empty_content = payload.get("allow_empty_content")
+    if allow_empty_content is not None and not isinstance(allow_empty_content, bool):
+        return "http_request.allow_empty_content 必须是布尔值"
     return None
 
 
@@ -236,7 +248,7 @@ def _validate_file_delete(payload: dict) -> Optional[str]:
 
 
 def _validate_json_parse(payload: dict) -> Optional[str]:
-    return _require_nonempty_string(payload.get("text"), "json_parse.text 不能为空")
+    return _validate_optional_string_field(payload, "text", "json_parse.text 必须是字符串")
 
 
 def _validate_user_prompt(payload: dict) -> Optional[str]:
@@ -334,8 +346,7 @@ def _exec_task_output(task_id: int, run_id: int, step_row: dict, payload: dict, 
 
 
 def _exec_tool_call(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
-    _ = context
-    return execute_tool_call(task_id, run_id, step_row, payload)
+    return execute_tool_call(task_id, run_id, step_row, payload, context=context)
 
 
 def _exec_shell_command(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
@@ -348,11 +359,59 @@ def _exec_shell_command(task_id: int, run_id: int, step_row: dict, payload: dict
     )
 
 
+def _looks_like_csv_text(text: object) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    header = lines[0]
+    first_row = lines[1]
+    return ("," in header) and ("," in first_row)
+
+
+
+def _autofill_file_write_content_from_context(payload: dict, context: Optional[dict]) -> tuple[dict, bool]:
+    current_payload = dict(payload or {})
+    content = current_payload.get("content")
+    if isinstance(content, str) and content.strip():
+        return current_payload, False
+    path = str(current_payload.get("path") or "").strip().lower()
+    if not path.endswith('.csv'):
+        return current_payload, False
+    if not isinstance(context, dict):
+        return current_payload, False
+    parse_text = str(context.get("latest_parse_input_text") or "").strip()
+    if not _looks_like_csv_text(parse_text):
+        return current_payload, False
+    current_payload["content"] = parse_text
+    context["file_write_content_auto_filled"] = True
+    return current_payload, True
+
+
+
+def _autofill_json_parse_text_from_context(payload: dict, context: Optional[dict]) -> tuple[dict, bool]:
+    current_payload = dict(payload or {})
+    text = current_payload.get("text")
+    if isinstance(text, str) and text.strip():
+        return current_payload, False
+    if not isinstance(context, dict):
+        return current_payload, False
+    parse_text = str(context.get("latest_parse_input_text") or "").strip()
+    if not parse_text:
+        return current_payload, False
+    current_payload["text"] = parse_text
+    context["json_parse_text_auto_filled"] = True
+    return current_payload, True
+
+
 def _exec_file_write(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
     _ = task_id
     _ = run_id
     _ = step_row
-    return execute_file_write(payload, context=context)
+    patched_payload, _ = _autofill_file_write_content_from_context(payload, context)
+    return execute_file_write(patched_payload, context=context)
 
 
 def _exec_file_append(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
@@ -383,7 +442,8 @@ def _exec_json_parse(task_id: int, run_id: int, step_row: dict, payload: dict, c
     _ = task_id
     _ = run_id
     _ = step_row
-    return execute_json_parse(payload, context=context)
+    patched_payload, _ = _autofill_json_parse_text_from_context(payload, context)
+    return execute_json_parse(patched_payload, context=context)
 
 
 def _exec_file_read(task_id: int, run_id: int, step_row: dict, payload: dict, context: Optional[dict]):
@@ -433,7 +493,6 @@ _PAYLOAD_REQUIRED_ONE_OF_KEYS: Dict[str, List[List[str]]] = {
     ACTION_TYPE_HTTP_REQUEST: [["url"]],
     ACTION_TYPE_FILE_WRITE: [["path"]],
     ACTION_TYPE_FILE_APPEND: [["path"]],
-    ACTION_TYPE_JSON_PARSE: [["text"]],
 }
 
 
@@ -715,6 +774,7 @@ def _register_builtin_specs() -> None:
                 "strict_business_success",
                 "strict_status_code",
                 "fallback_urls",
+                "allow_empty_content",
             },
             aliases={"http", "http_request", "request"},
             executor=_exec_http_request,

@@ -20,6 +20,7 @@ import { AGENT_EVENT_NAME, emitAgentEvent, initAgentEventBridge } from "./agent_
 import { bindPetImageFallback } from "./pet_image.js";
 import { isTerminalRunStatus, normalizeRunStatusValue } from "./run_status.js";
 import {
+  applyWorldConvergenceEventState,
   applyWorldAgentPlanDeltaState,
   applyWorldAgentPlanState,
   applyWorldAgentStageState,
@@ -405,6 +406,285 @@ function applyAgentStageEventToWorld(payload) {
   }
 }
 
+function toEventInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+function normalizeEventText(value) {
+  const text = String(value || "").trim();
+  return text || "";
+}
+
+function normalizeSearchPreviewList(rawItems, limit = 5) {
+  const items = Array.isArray(rawItems) ? rawItems : [];
+  return items.slice(0, Math.max(1, limit)).map((raw) => {
+    const item = raw && typeof raw === "object" ? raw : {};
+    return {
+      host: truncateInline(item.host || "", 80),
+      url: truncateInline(item.url || "", 200),
+      query: truncateInline(item.query || "", 120),
+      reason: truncateInline(item.reason || "", 120),
+      detail: truncateInline(item.detail || "", 220),
+      preview: truncateInline(item.preview || "", 220),
+      initial_score: toEventInt(item.initial_score),
+      score: toEventInt(item.score)
+    };
+  });
+}
+
+function normalizeSearchSelected(rawSelected) {
+  const item = rawSelected && typeof rawSelected === "object" ? rawSelected : {};
+  return {
+    host: truncateInline(item.host || "", 80),
+    url: truncateInline(item.url || "", 200),
+    query: truncateInline(item.query || "", 120),
+    preview: truncateInline(item.preview || "", 220),
+    score: toEventInt(item.score),
+    evidence: Array.isArray(item.evidence)
+      ? item.evidence.map((it) => truncateInline(it, 80)).filter(Boolean).slice(0, 5)
+      : []
+  };
+}
+
+function buildSearchConvergencePatch(existingSearch, obj, type) {
+  const base = existingSearch && typeof existingSearch === "object" ? { ...existingSearch } : {};
+  const next = { ...base, last_event_type: type };
+
+  if (type === "search_progress") {
+    const stage = normalizeEventText(obj.stage);
+    const status = normalizeEventText(obj.status);
+    const query = normalizeEventText(obj.query);
+    const message = normalizeEventText(obj.message);
+    const host = normalizeEventText(obj.host);
+    const url = normalizeEventText(obj.url);
+    const errorCode = normalizeEventText(obj.error_code);
+    const queryIndex = toEventInt(obj.query_index);
+    const totalQueries = toEventInt(obj.total_queries);
+    if (stage) next.stage = stage;
+    if (status) next.status = status;
+    if (query) next.query = query;
+    if (message) next.message = message;
+    if (host) next.host = host;
+    if (url) next.url = url;
+    if (errorCode) next.error_code = errorCode;
+    if (queryIndex != null) next.query_index = queryIndex;
+    if (totalQueries != null) next.total_queries = totalQueries;
+    if (stage === "search_failed" || errorCode) {
+      next.status = "failed";
+    } else if (!next.status) {
+      next.status = "running";
+    }
+    return next;
+  }
+
+  if (type === "search_candidates") {
+    next.total_candidates = toEventInt(obj.total_candidates);
+    next.candidates = normalizeSearchPreviewList(obj.candidates, 5);
+    next.status = "candidates";
+    return next;
+  }
+
+  if (type === "search_rejected") {
+    next.total_rejected = toEventInt(obj.total_rejected);
+    next.rejected = normalizeSearchPreviewList(obj.rejected, 5);
+    if (!next.status || next.status === "running") next.status = "rejected";
+    return next;
+  }
+
+  if (type === "search_selected") {
+    next.selected = normalizeSearchSelected(obj.selected);
+    next.status = "selected";
+    next.stage = "selected";
+    return next;
+  }
+
+  return next;
+}
+
+function applyAgentConvergenceEventToWorld(payload) {
+  const obj = payload && typeof payload === "object" ? payload : null;
+  if (!obj) return;
+  const type = String(obj.type || "").trim();
+  if (!type) return;
+
+  const runId = Number(obj.run_id);
+  if (!Number.isFinite(runId) || runId <= 0) return;
+  const taskId = Number(obj.task_id);
+
+  const session = worldSession.getState();
+  const currentRunId = Number(session?.currentRun?.run_id);
+  if (Number.isFinite(currentRunId) && currentRunId > 0 && currentRunId !== runId) return;
+
+  const convergencePatch = {};
+  const statePatch = {};
+  const existingConvergence = session?.currentAgentSnapshot?.convergence && typeof session.currentAgentSnapshot.convergence === "object"
+    ? session.currentAgentSnapshot.convergence
+    : {};
+  const existingSearch = existingConvergence?.search && typeof existingConvergence.search === "object"
+    ? existingConvergence.search
+    : {};
+
+  if (type === "strategy_update") {
+    const attemptIndex = toEventInt(obj.attempt_index);
+    const strategyFingerprint = normalizeEventText(obj.strategy_fingerprint);
+    const failureClass = normalizeEventText(obj.failure_class);
+    const reason = normalizeEventText(obj.reason);
+    if (attemptIndex != null) convergencePatch.attempt_index = attemptIndex;
+    if (strategyFingerprint) convergencePatch.strategy_fingerprint = strategyFingerprint;
+    if (failureClass) convergencePatch.last_failure_class = failureClass;
+    if (reason) convergencePatch.last_strategy_reason = reason;
+    if (failureClass) statePatch.last_failure_class = failureClass;
+  } else if (type === "progress_update") {
+    const score = toEventInt(obj.score);
+    const noProgressStreak = toEventInt(obj.no_progress_streak);
+    const attemptIndex = toEventInt(obj.attempt_index);
+    const strategyFingerprint = normalizeEventText(obj.strategy_fingerprint);
+    if (score != null) convergencePatch.progress_score = score;
+    if (noProgressStreak != null) convergencePatch.no_progress_streak = noProgressStreak;
+    if (attemptIndex != null) convergencePatch.attempt_index = attemptIndex;
+    if (strategyFingerprint) convergencePatch.strategy_fingerprint = strategyFingerprint;
+  } else if (type === "unreachable_proof") {
+    const proofId = normalizeEventText(obj.proof_id);
+    const failureClass = normalizeEventText(obj.failure_class);
+    const reason = normalizeEventText(obj.reason);
+    const attemptIndex = toEventInt(obj.attempt_index);
+    const strategyFingerprint = normalizeEventText(obj.strategy_fingerprint);
+    if (proofId) convergencePatch.proof_id = proofId;
+    if (failureClass) convergencePatch.last_failure_class = failureClass;
+    if (reason) convergencePatch.proof_reason = reason;
+    if (attemptIndex != null) convergencePatch.attempt_index = attemptIndex;
+    if (strategyFingerprint) convergencePatch.strategy_fingerprint = strategyFingerprint;
+    if (failureClass) statePatch.last_failure_class = failureClass;
+    if (proofId) {
+      const proofObj = { proof_id: proofId, run_id: runId };
+      if (failureClass) proofObj.failure_class = failureClass;
+      if (reason) proofObj.reason = reason;
+      statePatch.unreachable_proof = {
+        ...(statePatch.unreachable_proof && typeof statePatch.unreachable_proof === "object" ? statePatch.unreachable_proof : {}),
+        ...proofObj
+      };
+    }
+  } else if (type === "step_error") {
+    const failureClass = normalizeEventText(obj.failure_class);
+    const strategyFingerprint = normalizeEventText(obj.strategy_fingerprint);
+    const attemptIndex = toEventInt(obj.attempt_index);
+    const stepOrder = toEventInt(obj.step_order);
+    const message = normalizeEventText(obj.message || obj.error_message);
+    if (failureClass) convergencePatch.last_failure_class = failureClass;
+    if (strategyFingerprint) convergencePatch.strategy_fingerprint = strategyFingerprint;
+    if (attemptIndex != null) convergencePatch.attempt_index = attemptIndex;
+    if (stepOrder != null || message) {
+      convergencePatch.last_step_error = {
+        step_order: stepOrder,
+        message
+      };
+    }
+    if (failureClass) statePatch.last_failure_class = failureClass;
+  } else if (type === "step_progress") {
+    const stepOrder = toEventInt(obj.step_order);
+    const phase = normalizeEventText(obj.phase);
+    const status = normalizeEventText(obj.status);
+    const actionType = normalizeEventText(obj.action_type);
+    const message = normalizeEventText(obj.message);
+    const elapsedMs = toEventInt(obj.elapsed_ms);
+    const tick = toEventInt(obj.tick);
+    const attempt = toEventInt(obj.attempt);
+    const totalAttempts = toEventInt(obj.total_attempts);
+    if (
+      stepOrder != null
+      || phase
+      || status
+      || actionType
+      || message
+      || elapsedMs != null
+      || tick != null
+      || attempt != null
+      || totalAttempts != null
+    ) {
+      convergencePatch.last_step_progress = {
+        step_order: stepOrder,
+        phase,
+        status,
+        action_type: actionType,
+        message,
+        elapsed_ms: elapsedMs,
+        tick,
+        attempt,
+        total_attempts: totalAttempts
+      };
+    }
+  } else if (type === "step_warning") {
+    const stepOrder = toEventInt(obj.step_order);
+    const warningCount = toEventInt(obj.warning_count);
+    const attemptCount = toEventInt(obj.attempt_count);
+    const failedAttemptCount = toEventInt(obj.failed_attempt_count);
+    const successfulAttemptCount = toEventInt(obj.successful_attempt_count);
+    const primaryWarning = normalizeEventText(obj.primary_warning);
+    const title = normalizeEventText(obj.title);
+    const actionType = normalizeEventText(obj.action_type);
+    const tool = normalizeEventText(obj.tool);
+    const protocolSource = normalizeEventText(obj.protocol_source);
+    const fallbackUsed = !!obj.fallback_used;
+    if (
+      stepOrder != null
+      || primaryWarning
+      || title
+      || actionType
+      || tool
+      || warningCount != null
+      || attemptCount != null
+      || failedAttemptCount != null
+      || successfulAttemptCount != null
+      || protocolSource
+      || fallbackUsed
+    ) {
+      convergencePatch.last_step_warning = {
+        step_order: stepOrder,
+        warning_count: warningCount,
+        primary_warning: primaryWarning,
+        title,
+        action_type: actionType,
+        tool,
+        attempt_count: attemptCount,
+        failed_attempt_count: failedAttemptCount,
+        successful_attempt_count: successfulAttemptCount,
+        fallback_used: fallbackUsed,
+        protocol_source: protocolSource
+      };
+    }
+  } else if (
+    type === "search_progress"
+    || type === "search_candidates"
+    || type === "search_rejected"
+    || type === "search_selected"
+  ) {
+    convergencePatch.search = buildSearchConvergencePatch(existingSearch, obj, type);
+  } else {
+    return;
+  }
+
+  if (!Object.keys(convergencePatch).length && !Object.keys(statePatch).length) return;
+
+  worldSession.setState(
+    (prev) => applyWorldConvergenceEventState(
+      prev,
+      {
+        runId,
+        taskId,
+        status: "running",
+        convergencePatch,
+        statePatch
+      }
+    ),
+    { reason: `agent_${type}_event` }
+  );
+
+  if (pageWorldEl?.classList?.contains("is-visible")) {
+    rerenderWorldThoughtsFromState();
+  }
+}
+
 function computePlanSnapshotFromItems(items, agentState, snapshot) {
   const list = Array.isArray(items) ? items : [];
   const byStatus = {};
@@ -533,6 +813,20 @@ try {
       if (obj?.type === "agent_stage") applyAgentStageEventToWorld(obj);
       if (obj?.type === "plan") applyAgentPlanEventToWorld(obj);
       if (obj?.type === "plan_delta") applyAgentPlanDeltaEventToWorld(obj);
+      if (
+        obj?.type === "strategy_update"
+        || obj?.type === "progress_update"
+        || obj?.type === "unreachable_proof"
+        || obj?.type === "step_error"
+        || obj?.type === "step_progress"
+        || obj?.type === "step_warning"
+        || obj?.type === "search_progress"
+        || obj?.type === "search_candidates"
+        || obj?.type === "search_rejected"
+        || obj?.type === "search_selected"
+      ) {
+        applyAgentConvergenceEventToWorld(obj);
+      }
       if (obj?.type === "need_input_resolved") {
         const runId = Number(obj?.run_id);
         if (Number.isFinite(runId) && runId > 0) {
@@ -1271,6 +1565,7 @@ function renderWorldThoughts(runMeta, stateObj) {
     const done = Number(plan?.done);
     const progress = Number(plan?.progress);
     const counters = snapshot?.counters && typeof snapshot.counters === "object" ? snapshot.counters : {};
+    const convergence = snapshot?.convergence && typeof snapshot.convergence === "object" ? snapshot.convergence : {};
     const llm = counters?.llm && typeof counters.llm === "object" ? counters.llm : {};
     const tools = counters?.tools && typeof counters.tools === "object" ? counters.tools : {};
     const lastErr = counters?.last_error && typeof counters.last_error === "object" ? counters.last_error : null;
@@ -1301,6 +1596,173 @@ function renderWorldThoughts(runMeta, stateObj) {
       const title = String(lastErr.title || "").trim();
       const err = String(lastErr.error || "").trim();
       lines.push(`- ${UI_TEXT.WORLD_THOUGHTS_LABEL_LAST_ERROR || "最近错误"}：${head}${truncateInline(title || err, 220)}`);
+    }
+
+    const progressScore = Number(convergence?.progress_score);
+    const noProgressStreak = Number(convergence?.no_progress_streak);
+    const attemptIndex = Number(convergence?.attempt_index);
+    const strategyFingerprint = String(convergence?.strategy_fingerprint || "").trim();
+    const failureClass = String(convergence?.last_failure_class || "").trim();
+    const proofId = String(convergence?.proof_id || "").trim();
+    const proofReason = String(convergence?.proof_reason || "").trim();
+    const lastStepError = convergence?.last_step_error && typeof convergence.last_step_error === "object"
+      ? convergence.last_step_error
+      : null;
+    const lastStepErrorStep = Number(lastStepError?.step_order);
+    const lastStepErrorMessage = String(lastStepError?.message || "").trim();
+    const lastStepWarning = convergence?.last_step_warning && typeof convergence.last_step_warning === "object"
+      ? convergence.last_step_warning
+      : null;
+    const lastStepWarningStep = Number(lastStepWarning?.step_order);
+    const lastStepWarningMessage = String(lastStepWarning?.primary_warning || "").trim();
+    const lastStepWarningTool = String(lastStepWarning?.tool || lastStepWarning?.action_type || "").trim();
+    const lastStepWarningAttemptCount = Number(lastStepWarning?.attempt_count);
+    const lastStepWarningFailedCount = Number(lastStepWarning?.failed_attempt_count);
+    const lastStepWarningSuccessCount = Number(lastStepWarning?.successful_attempt_count);
+    const lastStepWarningProtocol = String(lastStepWarning?.protocol_source || "").trim();
+    const lastStepWarningFallbackUsed = !!lastStepWarning?.fallback_used;
+
+    const hasConvergence = Number.isFinite(progressScore)
+      || Number.isFinite(noProgressStreak)
+      || Number.isFinite(attemptIndex)
+      || !!strategyFingerprint
+      || !!failureClass
+      || !!proofId
+      || !!lastStepErrorMessage
+      || !!lastStepWarningMessage;
+    if (hasConvergence) {
+      lines.push("");
+      lines.push(UI_TEXT.WORLD_THOUGHTS_SECTION_CONVERGENCE || "【收敛】");
+      if (Number.isFinite(progressScore)) {
+        lines.push(`- ${UI_TEXT.WORLD_THOUGHTS_LABEL_PROGRESS_SCORE || "收敛分"}：${Math.max(0, Math.min(100, Math.round(progressScore)))}`);
+      }
+      if (Number.isFinite(noProgressStreak)) {
+        lines.push(`- ${UI_TEXT.WORLD_THOUGHTS_LABEL_NO_PROGRESS_STREAK || "无进展轮次"}：${Math.max(0, Math.round(noProgressStreak))}`);
+      }
+      if (Number.isFinite(attemptIndex)) {
+        lines.push(`- ${UI_TEXT.WORLD_THOUGHTS_LABEL_ATTEMPT || "尝试序号"}：${Math.max(0, Math.round(attemptIndex))}`);
+      }
+      if (strategyFingerprint) {
+        lines.push(`- ${UI_TEXT.WORLD_THOUGHTS_LABEL_STRATEGY || "策略指纹"}：${truncateInline(strategyFingerprint, 64)}`);
+      }
+      if (failureClass) {
+        lines.push(`- [WARN] ${UI_TEXT.WORLD_THOUGHTS_LABEL_FAILURE_CLASS || "失败分类"}：${truncateInline(failureClass, 120)}`);
+      }
+      if (lastStepErrorMessage) {
+        const head = Number.isFinite(lastStepErrorStep) && lastStepErrorStep > 0 ? `#${Math.round(lastStepErrorStep)} ` : "";
+        lines.push(`- [WARN] ${UI_TEXT.WORLD_THOUGHTS_LABEL_LAST_ERROR || "最近错误"}：${head}${truncateInline(lastStepErrorMessage, 220)}`);
+      }
+      if (lastStepWarningMessage) {
+        const head = Number.isFinite(lastStepWarningStep) && lastStepWarningStep > 0 ? `#${Math.round(lastStepWarningStep)} ` : "";
+        const toolHead = lastStepWarningTool ? `${truncateInline(lastStepWarningTool, 40)} | ` : "";
+        lines.push(`- [WARN] 最近告警：${head}${toolHead}${truncateInline(lastStepWarningMessage, 220)}`);
+        const warningDetails = [];
+        if (Number.isFinite(lastStepWarningAttemptCount)) {
+          warningDetails.push(`attempts=${Math.max(0, Math.round(lastStepWarningAttemptCount))}`);
+        }
+        if (Number.isFinite(lastStepWarningFailedCount) || Number.isFinite(lastStepWarningSuccessCount)) {
+          const failed = Number.isFinite(lastStepWarningFailedCount) ? Math.max(0, Math.round(lastStepWarningFailedCount)) : 0;
+          const success = Number.isFinite(lastStepWarningSuccessCount) ? Math.max(0, Math.round(lastStepWarningSuccessCount)) : 0;
+          warningDetails.push(`failed=${failed} success=${success}`);
+        }
+        if (lastStepWarningFallbackUsed) warningDetails.push("fallback=yes");
+        if (lastStepWarningProtocol) warningDetails.push(`source=${truncateInline(lastStepWarningProtocol, 40)}`);
+        if (warningDetails.length) {
+          lines.push(`- [WARN] 告警细节：${warningDetails.join(" | ")}`);
+        }
+      }
+      if (proofId) {
+        const suffix = proofReason ? ` (${truncateInline(proofReason, 80)})` : "";
+        lines.push(`- [FAIL] ${UI_TEXT.WORLD_THOUGHTS_LABEL_PROOF || "不可达证明"}：${truncateInline(proofId, 80)}${suffix}`);
+      }
+    }
+
+    const searchState = convergence?.search && typeof convergence.search === "object"
+      ? convergence.search
+      : null;
+    const searchStatus = String(searchState?.status || "").trim();
+    const searchStage = String(searchState?.stage || "").trim();
+    const searchQuery = String(searchState?.query || "").trim();
+    const searchMessage = String(searchState?.message || "").trim();
+    const searchErrorCode = String(searchState?.error_code || "").trim();
+    const searchCandidates = Array.isArray(searchState?.candidates) ? searchState.candidates : [];
+    const searchRejected = Array.isArray(searchState?.rejected) ? searchState.rejected : [];
+    const searchSelected = searchState?.selected && typeof searchState.selected === "object"
+      ? searchState.selected
+      : null;
+    const totalCandidates = Number(searchState?.total_candidates);
+    const totalRejected = Number(searchState?.total_rejected);
+    const queryIndex = Number(searchState?.query_index);
+    const totalQueries = Number(searchState?.total_queries);
+    const hasSearch = !!searchStatus
+      || !!searchStage
+      || !!searchQuery
+      || !!searchMessage
+      || !!searchErrorCode
+      || !!searchSelected
+      || searchCandidates.length > 0
+      || searchRejected.length > 0
+      || Number.isFinite(totalCandidates)
+      || Number.isFinite(totalRejected);
+    if (hasSearch) {
+      lines.push("");
+      lines.push("【搜索】");
+      if (searchStatus || searchStage) {
+        const parts = [];
+        if (searchStatus) parts.push(`状态=${truncateInline(searchStatus, 40)}`);
+        if (searchStage) parts.push(`阶段=${truncateInline(searchStage, 60)}`);
+        lines.push(`- 概览：${parts.join(" | ")}`);
+      }
+      if (searchQuery) {
+        let queryHead = truncateInline(searchQuery, 180);
+        if (Number.isFinite(queryIndex) && queryIndex > 0 && Number.isFinite(totalQueries) && totalQueries > 0) {
+          queryHead = `${queryHead} (${Math.round(queryIndex)}/${Math.round(totalQueries)})`;
+        }
+        lines.push(`- 查询：${queryHead}`);
+      }
+      if (searchMessage) {
+        const badge = searchStatus === "failed" ? "[WARN] " : "";
+        lines.push(`- ${badge}进展：${truncateInline(searchMessage, 220)}`);
+      }
+      if (searchErrorCode) {
+        lines.push(`- [WARN] 错误码：${truncateInline(searchErrorCode, 80)}`);
+      }
+      if (Number.isFinite(totalCandidates)) {
+        lines.push(`- 候选数：${Math.max(0, Math.round(totalCandidates))}`);
+      }
+      if (searchCandidates.length) {
+        lines.push(`- 候选预览：`);
+        searchCandidates.slice(0, 4).forEach((item) => {
+          const parts = [];
+          if (item.host) parts.push(item.host);
+          if (Number.isFinite(item.initial_score)) parts.push(`initial=${Math.round(item.initial_score)}`);
+          if (item.url) parts.push(item.url);
+          lines.push(`  - ${truncateInline(parts.join(" | "), 240)}`);
+        });
+      }
+      if (searchSelected) {
+        const parts = [];
+        if (searchSelected.host) parts.push(searchSelected.host);
+        if (Number.isFinite(searchSelected.score)) parts.push(`score=${Math.round(searchSelected.score)}`);
+        if (searchSelected.url) parts.push(searchSelected.url);
+        lines.push(`- [OK] 命中：${truncateInline(parts.join(" | "), 240)}`);
+        if (Array.isArray(searchSelected.evidence) && searchSelected.evidence.length) {
+          lines.push(`  - 证据：${truncateInline(searchSelected.evidence.join(" | "), 220)}`);
+        }
+      }
+      if (Number.isFinite(totalRejected)) {
+        lines.push(`- 拒绝数：${Math.max(0, Math.round(totalRejected))}`);
+      }
+      if (searchRejected.length) {
+        const firstRejected = searchRejected[0];
+        const rejectedParts = [];
+        if (firstRejected?.host) rejectedParts.push(firstRejected.host);
+        if (firstRejected?.reason) rejectedParts.push(firstRejected.reason);
+        if (firstRejected?.detail) rejectedParts.push(firstRejected.detail);
+        if (rejectedParts.length) {
+          lines.push(`- [WARN] 最近拒绝：${truncateInline(rejectedParts.join(" | "), 240)}`);
+        }
+      }
     }
   }
 
@@ -2172,6 +2634,29 @@ async function streamToWorld(makeRequest, options = {}) {
         }
         if (obj?.type === "agent_stage") {
           emitAgentEvent(obj, { broadcast: false });
+          return;
+        }
+        if (
+          obj?.type === "search_progress"
+          || obj?.type === "search_candidates"
+          || obj?.type === "search_rejected"
+          || obj?.type === "search_selected"
+        ) {
+          emitAgentEvent({ ...(obj || {}), _source: AGENT_EVENT_SOURCE_PANEL }, { broadcast: false });
+        }
+        if (
+          obj?.type === "strategy_update"
+          || obj?.type === "progress_update"
+          || obj?.type === "unreachable_proof"
+          || obj?.type === "step_error"
+          || obj?.type === "step_progress"
+          || obj?.type === "step_warning"
+          || obj?.type === "search_progress"
+          || obj?.type === "search_candidates"
+          || obj?.type === "search_rejected"
+          || obj?.type === "search_selected"
+        ) {
+          applyAgentConvergenceEventToWorld(obj);
         }
       },
       onReviewDelta: () => "", // 世界页不展开评估明细，避免刷屏

@@ -1,0 +1,41 @@
+{
+  "status": "pending",
+  "generated_at_utc": "2026-03-01T14:20:34.460389Z",
+  "time_window": {
+    "type": "last_3_months",
+    "start_date": null,
+    "end_date": null
+  },
+  "frequency": "daily",
+  "unit": "CNY_per_gram",
+  "price_type": null,
+  "files": {
+    "csv": "gold_price_last_3_months_cny_per_g.csv"
+  },
+  "data_sources": [],
+  "transform": {
+    "notes": "Awaiting real price data ingestion and normalization.",
+    "fx": null,
+    "unit_conversion": null
+  },
+  "quality": {
+    "csv_bytes_observed": 12,
+    "row_count": null,
+    "missing_dates": null,
+    "outliers": null,
+    "validation": "not_run"
+  },
+  "errors": [
+    {
+      "type": "upstream_fetch",
+      "host": "api.metals.live",
+      "code": "web_fetch_blocked",
+      "count": 1
+    },
+    {
+      "type": "upstream_fetch",
+      "code": "timeout",
+      "count": 1
+    }
+  ]
+}

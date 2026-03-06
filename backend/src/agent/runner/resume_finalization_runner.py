@@ -4,12 +4,16 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Callable, Dict, List
 
+from backend.src.agent.runner.finalization_pipeline import (
+    check_and_report_missing_artifacts,
+    enforce_done_visible_output_contract,
+)
+from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.constants import (
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
     RUN_STATUS_STOPPED,
     RUN_STATUS_WAITING,
-    STREAM_TAG_FAIL,
     SSE_TYPE_MEMORY_ITEM,
 )
 from backend.src.services.llm.llm_client import sse_json
@@ -26,7 +30,6 @@ class ResumeFinalizationConfig:
     plan_items: List[dict]
     plan_artifacts: List[str]
     safe_write_debug: Callable[..., None]
-    check_missing_artifacts: Callable[..., List[str]]
     finalize_run_and_task_status: Callable[..., None]
     enqueue_review_on_feedback_waiting: Callable[..., None]
     enqueue_postprocess_thread: Callable[..., None]
@@ -51,24 +54,35 @@ async def iter_resume_finalization_events(
     plan_artifacts = list(config.plan_artifacts or [])
     agent_state = dict(config.agent_state or {})
 
-    if run_status == RUN_STATUS_DONE and plan_artifacts:
-        missing = list(config.check_missing_artifacts(artifacts=plan_artifacts, workdir=workdir) or [])
-        if missing:
-            run_status = RUN_STATUS_FAILED
-            config.safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.artifacts.missing",
-                data={"missing": missing},
-                level="error",
-            )
-            yield ("msg", sse_json({"delta": f"{STREAM_TAG_FAIL} 未生成文件：{', '.join(missing)}\n"}))
+    buffered_chunks: List[str] = []
+
+    def _emit(chunk: str) -> None:
+        text = str(chunk or "")
+        if text:
+            buffered_chunks.append(text)
+
+    run_status = await check_and_report_missing_artifacts(
+        run_status=str(run_status),
+        plan_artifacts=list(plan_artifacts or []),
+        workdir=str(workdir or ""),
+        yield_func=_emit,
+        task_id=int(task_id),
+        run_id=int(run_id),
+    )
+    run_status = await enforce_done_visible_output_contract(
+        run_status=str(run_status),
+        task_id=int(task_id),
+        run_id=int(run_id),
+        yield_func=_emit,
+    )
+    for chunk in buffered_chunks:
+        yield ("msg", chunk)
 
     if plan_items and run_status in {RUN_STATUS_DONE, RUN_STATUS_FAILED}:
         for item in plan_items:
             if isinstance(item, dict) and item.get("status") == "running":
                 item["status"] = "done" if run_status == RUN_STATUS_DONE else "failed"
-        yield ("msg", sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items}))
+        yield ("msg", sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_items))
 
     await asyncio.to_thread(
         config.finalize_run_and_task_status,

@@ -219,6 +219,37 @@ test("streamSse keeps need_input when prompt token changes", async () => {
   }
 });
 
+test("streamSse treats search events as structured events without appending transcript", async () => {
+  const response = buildSseResponse([
+    encodeSseChunk("message", { type: "search_progress", stage: "search_query", query: "黄金 价格 元/克" }),
+    encodeSseChunk("message", { type: "search_candidates", total_candidates: 2, candidates: [{ host: "data.example.com", url: "https://data.example.com/gold.csv" }] }),
+    encodeSseChunk("done", { type: "done", run_status: "done" }),
+  ]);
+  const seen = [];
+  const previousRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0);
+  try {
+    const result = await streamSse(
+      async () => response,
+      {
+        displayMode: "status",
+        onEvent: (obj) => {
+          seen.push(String(obj?.type || ""));
+        },
+      }
+    );
+    assert.equal(result.hadError, false);
+    assert.deepEqual(seen.slice(0, 2), ["search_progress", "search_candidates"]);
+    assert.equal(result.transcript, "");
+  } finally {
+    if (typeof previousRaf === "function") {
+      globalThis.requestAnimationFrame = previousRaf;
+    } else {
+      delete globalThis.requestAnimationFrame;
+    }
+  }
+});
+
 test("streamSse replays when done has no business state", async () => {
   const response = buildSseResponse([
     "event: done\ndata: {\"type\":\"stream_end\",\"task_id\":8,\"run_id\":11}\n\n",

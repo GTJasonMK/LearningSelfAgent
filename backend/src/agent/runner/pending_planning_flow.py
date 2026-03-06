@@ -13,6 +13,7 @@ from backend.src.agent.runner.pending_planning_state import (
     build_waiting_followup_state,
 )
 from backend.src.agent.runner.planning_runner import run_do_planning_phase_with_stream
+from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.agent.runner.stream_convergence import build_stream_error_payload
 from backend.src.constants import (
     AGENT_KNOWLEDGE_SUFFICIENCY_KIND,
@@ -200,7 +201,7 @@ async def enter_pending_planning_waiting(
     )
     plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
 
-    yield_func(sse_json({"type": "plan", "task_id": int(task_id), "run_id": int(run_id), "items": plan_items}))
+    yield_func(sse_plan(task_id=int(task_id), run_id=int(run_id), plan_items=plan_items))
 
     agent_state = build_initial_pending_state(
         message=message,
@@ -521,7 +522,7 @@ async def resume_pending_planning_after_user_input(
         )
         new_plan_titles, new_plan_items, new_plan_allows, new_plan_artifacts = new_plan_struct.to_legacy_lists()
 
-        yield_func(sse_json({"type": "plan", "task_id": int(task_id), "run_id": int(run_id), "items": new_plan_items}))
+        yield_func(sse_plan(task_id=int(task_id), run_id=int(run_id), plan_items=new_plan_items))
 
         agent_state = build_waiting_followup_state(
             agent_state=agent_state,
@@ -763,7 +764,7 @@ async def resume_pending_planning_after_user_input(
         )
         merged_titles, merged_items, merged_allows, plan_artifacts_new = merged_plan_struct.to_legacy_lists()
 
-        yield_func(sse_json({"type": "plan", "task_id": int(task_id), "run_id": int(run_id), "items": merged_items}))
+        yield_func(sse_plan(task_id=int(task_id), run_id=int(run_id), plan_items=merged_items))
 
         resume_step_order = 2
         extra_state: Dict[str, Any] = {

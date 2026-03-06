@@ -120,12 +120,26 @@ def verify_and_normalize_action_result(
             else:
                 result_obj = _merge_warning(result_obj, "task_output.content is empty")
 
-    # http_request：缺少关键字段时打告警（不硬失败，避免 mock/兼容链路受影响）。
+    # http_request：默认必须拿到可解析正文，避免“空响应被当作成功样本”。
     if normalized_action_type == ACTION_TYPE_HTTP_REQUEST:
         if result_obj.get("status_code") is None:
             result_obj = _merge_warning(result_obj, "http_request.status_code missing")
+        allow_empty_content = bool(payload_obj.get("allow_empty_content"))
+        method = str(payload_obj.get("method") or "GET").strip().upper()
+        status_code_value = result_obj.get("status_code")
+        try:
+            status_code_int = int(status_code_value)
+        except Exception:
+            status_code_int = None
+        empty_body_allowed_by_protocol = method == "HEAD" or status_code_int in {204, 205, 304}
         if not str(result_obj.get("content") or "").strip():
-            result_obj = _merge_warning(result_obj, "http_request.content is empty")
+            if allow_empty_content or empty_body_allowed_by_protocol:
+                result_obj = _merge_warning(result_obj, "http_request.content is empty")
+            else:
+                return None, format_task_error(
+                    code="http_response_empty",
+                    message="http_request 响应正文为空，未获得可解析样本",
+                )
 
     # tool_call：输出为空会影响后续 json_parse，提前标记。
     if normalized_action_type == ACTION_TYPE_TOOL_CALL:

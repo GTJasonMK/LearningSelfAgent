@@ -129,12 +129,14 @@ def apply_artifacts_gates(
                 autofix_attempts = 0
 
             can_autofix = (
-                max_steps_limit is not None
-                and plan_struct.step_count < int(max_steps_limit)
+                (max_steps_limit is None or plan_struct.step_count < int(max_steps_limit))
                 and autofix_attempts < int(AGENT_REACT_ARTIFACT_AUTOFIX_MAX_ATTEMPTS or 0)
             )
             if can_autofix:
-                remaining = int(max_steps_limit) - plan_struct.step_count
+                if max_steps_limit is None:
+                    remaining = len(missing)
+                else:
+                    remaining = int(max_steps_limit) - plan_struct.step_count
                 to_insert = list(missing[: max(0, int(remaining))])
                 new_steps = []
                 for rel in to_insert:

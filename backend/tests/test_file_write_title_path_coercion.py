@@ -2,12 +2,19 @@ import unittest
 
 
 class TestFileWriteTitlePathCoercion(unittest.TestCase):
-    def test_coerce_uses_title_path_when_it_looks_like_a_path(self):
+    def test_coerce_uses_title_path_when_payload_path_missing(self):
         from backend.src.agent.plan_utils import coerce_file_write_payload_path_from_title
 
-        payload = {"path": "a.py", "content": "x"}
+        payload = {"content": "x"}
         patched = coerce_file_write_payload_path_from_title("file_write:test/demo.txt 写入文件", payload)
         self.assertEqual(patched.get("path"), "test/demo.txt")
+
+    def test_coerce_keeps_existing_payload_path_when_title_differs(self):
+        from backend.src.agent.plan_utils import coerce_file_write_payload_path_from_title
+
+        payload = {"path": "backend/.agent/workspace/fetch.py", "content": "print('ok')"}
+        patched = coerce_file_write_payload_path_from_title("file_write:artifacts/out.csv 写入文件", payload)
+        self.assertEqual(patched.get("path"), "backend/.agent/workspace/fetch.py")
 
     def test_coerce_keeps_payload_path_when_title_is_not_a_path(self):
         """

@@ -99,7 +99,6 @@ from backend.src.services.tasks.task_queries import get_task_run
 from backend.src.services.llm.llm_client import resolve_default_model, sse_json
 from backend.src.services.skills.skills_publish import publish_skill_file
 from backend.src.services.tasks.task_run_lifecycle import (
-    check_missing_artifacts,
     enqueue_postprocess_thread,
     enqueue_review_on_feedback_waiting,
     enqueue_stop_task_run_records,
@@ -554,11 +553,7 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                 return
 
             question = str(paused.get("question") or "").strip()
-            if not skip_execution:
-                answer_line = f"user_input: {_truncate_observation(user_input)}"
-                if question:
-                    answer_line = f"user_prompt: {_truncate_observation(question)} => {_truncate_observation(user_input)}"
-                observations.append(answer_line)
+            resume_input_value = str(user_input or "")
 
             if not skip_execution:
                 plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
@@ -587,6 +582,24 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                     plan_artifacts=list(plan_artifacts or []),
                 )
                 plan_titles, plan_items, plan_allows, plan_artifacts = plan_struct.to_legacy_lists()
+                resume_input_value = str(state_obj.get("last_user_input") or resume_input_value)
+                raw_resume_input = str(state_obj.get("last_user_input_raw") or user_input or "")
+                choice_info = state_obj.get("last_user_choice") if isinstance(state_obj.get("last_user_choice"), dict) else None
+                if isinstance(choice_info, dict):
+                    choice_label = str(choice_info.get("label") or "").strip()
+                    choice_value = str(choice_info.get("value") or "").strip()
+                    answer_tail = f"{choice_label} => {choice_value}" if choice_label and choice_value else resume_input_value
+                elif resume_input_value and resume_input_value != raw_resume_input:
+                    answer_tail = f"{raw_resume_input} => {resume_input_value}"
+                else:
+                    answer_tail = resume_input_value or raw_resume_input
+                answer_line = f"user_input: {_truncate_observation(answer_tail)}"
+                if question:
+                    answer_line = (
+                        f"user_prompt: {_truncate_observation(question)} => "
+                        f"{_truncate_observation(answer_tail)}"
+                    )
+                observations.append(answer_line)
 
             yield _emit(sse_json({"delta": f"{STREAM_TAG_EXEC} 已收到输入，继续执行…\n"}))
             status_event = _emit_run_status(RUN_STATUS_RUNNING)
@@ -600,7 +613,7 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                     task_builder=lambda emit: resume_pending_planning_after_user_input(
                         task_id=int(task_id),
                         run_id=int(run_id),
-                        user_input=str(user_input or ""),
+                        user_input=str(resume_input_value or user_input or ""),
                         message=message,
                         workdir=workdir,
                         model=model,
@@ -765,7 +778,6 @@ def stream_agent_command_resume(payload: AgentCommandResumeStreamRequest):
                     plan_items=plan_items,
                     plan_artifacts=plan_artifacts,
                     safe_write_debug=_safe_write_debug,
-                    check_missing_artifacts=check_missing_artifacts,
                     finalize_run_and_task_status=finalize_run_and_task_status,
                     enqueue_review_on_feedback_waiting=enqueue_review_on_feedback_waiting,
                     enqueue_postprocess_thread=enqueue_postprocess_thread,

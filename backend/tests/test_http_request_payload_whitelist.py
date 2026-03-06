@@ -13,7 +13,7 @@ class TestHttpRequestPayloadWhitelist(unittest.TestCase):
         def _fake_execute_http_request(payload):
             captured_payload.clear()
             captured_payload.update(dict(payload or {}))
-            return {"ok": True}, None
+            return {"ok": True, "status_code": 200, "content": "pong"}, None
 
         action_registry.execute_http_request = _fake_execute_http_request
         try:
@@ -28,6 +28,7 @@ class TestHttpRequestPayloadWhitelist(unittest.TestCase):
                                 "https://example.org/backup",
                             ],
                             "strict_status_code": True,
+                            "allow_empty_content": True,
                             "unknown_field_should_drop": "x",
                         },
                     }
@@ -40,22 +41,20 @@ class TestHttpRequestPayloadWhitelist(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(isinstance(result, dict))
         self.assertEqual(result.get("ok"), True)
-        # 执行器会统一附加 result_contract；本用例的 fake result 缺少 status_code/content，
-        # 应被后置验证器标记为 warn（但不应阻塞主链路）。
+        # 执行器会统一附加 result_contract；本用例验证白名单字段保留且结果正常通过。
         contract = result.get("result_contract") if isinstance(result, dict) else None
         self.assertTrue(isinstance(contract, dict))
         self.assertEqual(contract.get("action_type"), "http_request")
-        self.assertEqual(contract.get("status"), "warn")
+        self.assertEqual(contract.get("status"), "ok")
         warnings = result.get("warnings") if isinstance(result, dict) else None
-        self.assertTrue(isinstance(warnings, list))
-        self.assertIn("http_request.status_code missing", warnings)
-        self.assertIn("http_request.content is empty", warnings)
+        self.assertFalse(warnings)
         self.assertEqual(captured_payload.get("url"), "https://example.com/primary")
         self.assertEqual(
             captured_payload.get("fallback_urls"),
             ["https://example.net/fallback", "https://example.org/backup"],
         )
         self.assertIs(captured_payload.get("strict_status_code"), True)
+        self.assertIs(captured_payload.get("allow_empty_content"), True)
         self.assertNotIn("unknown_field_should_drop", captured_payload)
 
 

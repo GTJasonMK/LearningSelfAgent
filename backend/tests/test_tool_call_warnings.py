@@ -460,6 +460,346 @@ class TestToolCallWarnings(unittest.TestCase):
         attempts = record.get("attempts") or []
         self.assertTrue(any(str(item.get("status") or "") == "skipped" for item in attempts if isinstance(item, dict)))
 
+    def test_web_fetch_keyword_search_hits_candidate_page(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 关键词检索"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "最近三个月 黄金 价格 元/克",
+            "output": "",
+        }
+
+        def fake_exec(_exec_spec, tool_input):
+            current = str(tool_input or "")
+            if current.startswith("https://search.example.com/"):
+                return (
+                    "[候选1](https://blocked.example.com/gold)\n"
+                    "[候选2](https://good.example.org/gold-cny)\n",
+                    None,
+                )
+            if current == "https://blocked.example.com/gold":
+                return "", "工具执行失败: HTTP 403 Forbidden"
+            if current == "https://good.example.org/gold-cny":
+                return "date,price\n2026-02-01,680.2", None
+            return "", "工具执行失败: unexpected source"
+
+        def fake_create_tool_record(current_payload):
+            return {
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": str(current_payload.get("input") or ""),
+                    "output": str(current_payload.get("output") or ""),
+                }
+            }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_WEB_FETCH_SEARCH_URL_TEMPLATES_JSON": '["https://search.example.com/?q={query}"]',
+            },
+            clear=False,
+        ), patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            side_effect=fake_exec,
+        ) as mocked_exec, patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            side_effect=fake_create_tool_record,
+        ):
+            record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNone(error)
+        self.assertIsInstance(record, dict)
+        self.assertIn("date,price", str(record.get("output")))
+        self.assertIn("关键词检索命中页面", str(record.get("warnings")))
+        called_urls = [str(call.args[1] or "") for call in mocked_exec.call_args_list]
+        self.assertTrue(any(item.startswith("https://search.example.com/") for item in called_urls))
+        self.assertIn("https://good.example.org/gold-cny", called_urls)
+        attempts = record.get("attempts") or []
+        self.assertTrue(
+            any(
+                isinstance(item, dict)
+                and str(item.get("stage") or "") == "search"
+                and str(item.get("status") or "") == "ok"
+                for item in attempts
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(item, dict)
+                and str(item.get("stage") or "") == "page"
+                and str(item.get("status") or "") == "ok"
+                for item in attempts
+            )
+        )
+
+    def test_web_fetch_keyword_search_all_candidates_failed_returns_error(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 关键词检索"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "黄金 价格 数据",
+            "output": "",
+        }
+
+        def fake_exec(_exec_spec, tool_input):
+            current = str(tool_input or "")
+            if current.startswith("https://search.example.com/"):
+                return (
+                    "[候选1](https://a.example.com/gold)\n"
+                    "[候选2](https://b.example.com/gold)\n",
+                    None,
+                )
+            if current == "https://a.example.com/gold":
+                return "", "工具执行失败: HTTP 403 Forbidden"
+            if current == "https://b.example.com/gold":
+                return "", "工具执行失败: HTTP 429 Too Many Requests"
+            return "", "工具执行失败: unexpected source"
+
+        def fake_create_tool_record(current_payload):
+            return {
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": str(current_payload.get("input") or ""),
+                    "output": str(current_payload.get("output") or ""),
+                }
+            }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_WEB_FETCH_SEARCH_URL_TEMPLATES_JSON": '["https://search.example.com/?q={query}"]',
+            },
+            clear=False,
+        ), patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            side_effect=fake_exec,
+        ), patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            side_effect=fake_create_tool_record,
+        ):
+            record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsInstance(record, dict)
+        self.assertIsNotNone(error)
+        self.assertIn("关键词检索后候选页面全部失败", str(error))
+        self.assertTrue(
+            any(
+                isinstance(item, dict) and str(item.get("stage") or "") == "page"
+                for item in (record.get("attempts") or [])
+            )
+        )
+
+    def test_web_fetch_keyword_search_avoids_namespace_noise_link(self):
+        from backend.src.actions.handlers import tool_call as tool_call_module
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 关键词检索"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "gold price csv api",
+            "output": "",
+        }
+
+        def fake_exec(_exec_spec, tool_input):
+            current = str(tool_input or "")
+            if current.startswith("https://search.example.com/"):
+                return (
+                    "[xhtml namespace](http://www.w3.org/1999/xhtml)\n"
+                    "[gold data](https://api.example.com/gold-price.csv)\n",
+                    None,
+                )
+            if current == "https://api.example.com/gold-price.csv":
+                return "date,price\n2026-02-01,680.2", None
+            if current == "http://www.w3.org/1999/xhtml":
+                return "should-not-prefer-namespace", None
+            return "", "工具执行失败: unexpected source"
+
+        def fake_create_tool_record(current_payload):
+            return {
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": str(current_payload.get("input") or ""),
+                    "output": str(current_payload.get("output") or ""),
+                }
+            }
+
+        with patch.object(tool_call_module, "AGENT_WEB_FETCH_SEARCH_MAX_PAGES", 1), patch.dict(
+            os.environ,
+            {
+                "AGENT_WEB_FETCH_SEARCH_URL_TEMPLATES_JSON": '["https://search.example.com/?q={query}"]',
+            },
+            clear=False,
+        ), patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            side_effect=fake_exec,
+        ) as mocked_exec, patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            side_effect=fake_create_tool_record,
+        ):
+            record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNone(error)
+        self.assertIsInstance(record, dict)
+        self.assertIn("date,price", str(record.get("output")))
+        called_urls = [str(call.args[1] or "") for call in mocked_exec.call_args_list]
+        self.assertIn("https://api.example.com/gold-price.csv", called_urls)
+        self.assertNotIn("http://www.w3.org/1999/xhtml", called_urls)
+
+    def test_web_fetch_keyword_search_filters_search_engine_subdomain_noise(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 关键词检索"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "gold price cny csv",
+            "output": "",
+        }
+
+        def fake_exec(_exec_spec, tool_input):
+            current = str(tool_input or "")
+            if current.startswith("https://www.bing.com/search?"):
+                return (
+                    "[噪声](https://cn.bing.com/edge)\n"
+                    "[有效](https://data.example.com/gold.csv)\n",
+                    None,
+                )
+            if current == "https://cn.bing.com/edge":
+                return "should-not-hit-subdomain", None
+            if current == "https://data.example.com/gold.csv":
+                return "date,price\n2026-02-01,680.2", None
+            return "", "工具执行失败: unexpected source"
+
+        def fake_create_tool_record(current_payload):
+            return {
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": str(current_payload.get("input") or ""),
+                    "output": str(current_payload.get("output") or ""),
+                }
+            }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_WEB_FETCH_SEARCH_URL_TEMPLATES_JSON": '["https://www.bing.com/search?q={query}"]',
+            },
+            clear=False,
+        ), patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            side_effect=fake_exec,
+        ) as mocked_exec, patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            side_effect=fake_create_tool_record,
+        ):
+            record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNone(error)
+        self.assertIsInstance(record, dict)
+        self.assertIn("date,price", str(record.get("output")))
+        called_urls = [str(call.args[1] or "") for call in mocked_exec.call_args_list]
+        self.assertIn("https://data.example.com/gold.csv", called_urls)
+        self.assertNotIn("https://cn.bing.com/edge", called_urls)
+
+    def test_web_fetch_keyword_search_unwraps_redirect_link(self):
+        from backend.src.actions.handlers.tool_call import execute_tool_call
+
+        step_row = {"id": 1, "title": "tool_call:web_fetch 关键词检索"}
+        payload = {
+            "tool_name": "web_fetch",
+            "tool_metadata": {
+                "exec": {"type": "shell", "command": "echo ok", "workdir": "/tmp"},
+            },
+            "input": "gold price cny csv",
+            "output": "",
+        }
+
+        redirect = "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fdata.example.com%2Fgold.csv"
+
+        def fake_exec(_exec_spec, tool_input):
+            current = str(tool_input or "")
+            if current.startswith("https://duckduckgo.com/html/?"):
+                return f"[跳转]({redirect})", None
+            if current == "https://data.example.com/gold.csv":
+                return "date,price\n2026-02-01,680.2", None
+            if current == redirect:
+                return "should-not-hit-redirect-wrapper", None
+            return "", "工具执行失败: unexpected source"
+
+        def fake_create_tool_record(current_payload):
+            return {
+                "record": {
+                    "tool_id": 1,
+                    "tool_name": "web_fetch",
+                    "input": str(current_payload.get("input") or ""),
+                    "output": str(current_payload.get("output") or ""),
+                }
+            }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_WEB_FETCH_SEARCH_URL_TEMPLATES_JSON": '["https://duckduckgo.com/html/?q={query}"]',
+            },
+            clear=False,
+        ), patch("backend.src.actions.handlers.tool_call.is_tool_enabled", return_value=True), patch(
+            "backend.src.actions.handlers.tool_call.get_tool_by_name",
+            return_value={"id": 1, "name": "web_fetch", "metadata": "{}"},
+        ), patch(
+            "backend.src.actions.handlers.tool_call._enforce_tool_exec_script_dependency", return_value=None
+        ), patch(
+            "backend.src.actions.handlers.tool_call._execute_tool_with_exec_spec",
+            side_effect=fake_exec,
+        ) as mocked_exec, patch(
+            "backend.src.actions.handlers.tool_call._create_tool_record",
+            side_effect=fake_create_tool_record,
+        ):
+            record, error = execute_tool_call(task_id=1, run_id=1, step_row=step_row, payload=payload)
+
+        self.assertIsNone(error)
+        self.assertIsInstance(record, dict)
+        self.assertIn("date,price", str(record.get("output")))
+        called_urls = [str(call.args[1] or "") for call in mocked_exec.call_args_list]
+        self.assertIn("https://data.example.com/gold.csv", called_urls)
+        self.assertNotIn(redirect, called_urls)
+
 
 if __name__ == "__main__":
     unittest.main()

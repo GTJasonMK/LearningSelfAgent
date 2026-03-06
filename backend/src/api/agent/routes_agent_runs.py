@@ -61,6 +61,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _safe_optional_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     """
     解析 now_iso() 生成的时间戳（以 Z 结尾），或 sqlite 中已有的 ISO 字符串。
@@ -199,6 +208,30 @@ def _compute_plan_snapshot(*, agent_plan: Optional[dict], agent_state: Optional[
     }
 
 
+def _compute_convergence_snapshot(*, agent_state: Optional[dict]) -> dict:
+    """
+    汇总运行收敛态（策略/进展/失败分类）的简要快照。
+    """
+    state = agent_state if isinstance(agent_state, dict) else {}
+    progress_score = _safe_optional_int(state.get("progress_score"))
+    no_progress_streak = _safe_optional_int(state.get("no_progress_streak"))
+    attempt_index = _safe_optional_int(state.get("attempt_index"))
+    strategy_fingerprint = str(state.get("strategy_fingerprint") or "").strip() or None
+    last_failure_class = str(state.get("last_failure_class") or "").strip() or None
+
+    proof_obj = state.get("unreachable_proof") if isinstance(state.get("unreachable_proof"), dict) else {}
+    proof_id = str(proof_obj.get("proof_id") or "").strip() or None
+
+    return {
+        "progress_score": progress_score,
+        "no_progress_streak": no_progress_streak,
+        "strategy_fingerprint": strategy_fingerprint,
+        "attempt_index": attempt_index,
+        "last_failure_class": last_failure_class,
+        "proof_id": proof_id,
+    }
+
+
 def _compute_run_counters(*, run_id: int) -> dict:
     """
     为前端 UI 生成“运行计数器”（基于 DB 聚合）。
@@ -331,6 +364,7 @@ def get_agent_run_detail(run_id: int) -> dict:
 
     # ===== 运行快照（P3：可观测性）=====
     plan_snapshot = _compute_plan_snapshot(agent_plan=agent_plan, agent_state=agent_state)
+    convergence_snapshot = _compute_convergence_snapshot(agent_state=agent_state)
     counters = _compute_run_counters(run_id=rid)
 
     # stage：优先以 run.status 收敛（waiting/done/failed/stopped），running 时再看 agent_state.stage。
@@ -370,6 +404,7 @@ def get_agent_run_detail(run_id: int) -> dict:
         "mode": str(row["mode"] or "").strip() if "mode" in set(row.keys()) else None,
         "stage": stage,
         "plan": plan_snapshot,
+        "convergence": convergence_snapshot,
         "counters": counters if isinstance(counters, dict) else {"ok": False},
         "elapsed_ms": elapsed_ms,
         "started_at": started_at,

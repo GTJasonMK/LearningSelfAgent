@@ -1,9 +1,12 @@
+import csv
 import json
+from pathlib import Path
 import os
 import re
 import shlex
 import sys
-from typing import List, Optional, Set, Tuple
+import ast
+from typing import Dict, List, Optional, Set, Tuple
 
 from backend.src.common.python_code import (
     can_compile_python_source,
@@ -11,6 +14,7 @@ from backend.src.common.python_code import (
     normalize_python_c_source,
 )
 from backend.src.common.path_utils import normalize_windows_abs_path_on_posix
+from backend.src.common.csv_artifact_quality import build_csv_quality_failure_text, load_csv_quality_stats
 from backend.src.common.task_error_codes import format_task_error
 from backend.src.common.utils import is_test_env, parse_json_value
 from backend.src.actions.handlers.common_utils import (
@@ -363,14 +367,20 @@ def _enforce_script_dependency(
             unbound_paths.append(absolute_path)
 
     if missing_paths:
-        return (
-            f"{ERROR_MESSAGE_COMMAND_FAILED}:脚本不存在: {', '.join(missing_paths)}"
-            "（请先通过 file_write 创建并确认落盘）"
+        return format_task_error(
+            code="script_missing",
+            message=(
+                f"{ERROR_MESSAGE_COMMAND_FAILED}:脚本不存在: {', '.join(missing_paths)}"
+                "（请先通过 file_write 创建并确认落盘）"
+            ),
         )
     if unbound_paths:
-        return (
-            f"{ERROR_MESSAGE_COMMAND_FAILED}:脚本依赖未绑定: {', '.join(unbound_paths)}"
-            "（当前 run 未发现对应的 file_write/file_append 成功步骤）"
+        return format_task_error(
+            code="script_dependency_unbound",
+            message=(
+                f"{ERROR_MESSAGE_COMMAND_FAILED}:脚本依赖未绑定: {', '.join(unbound_paths)}"
+                "（当前 run 未发现对应的 file_write/file_append 成功步骤）"
+            ),
         )
     return None
 
@@ -448,6 +458,64 @@ def _build_retry_payload_with_context_stdin(
     return patched, len(parse_text)
 
 
+
+_MATERIALIZABLE_SAMPLE_FILE_EXTS = {".html", ".htm", ".json", ".csv", ".tsv", ".txt", ".xml"}
+
+
+def _extract_missing_input_file_path(result: dict) -> str:
+    stderr = str((result or {}).get("stderr") or "")
+    stdout = str((result or {}).get("stdout") or "")
+    detail = f"{stderr}\n{stdout}"
+    if not detail.strip():
+        return ""
+    patterns = (
+        r'No such file or directory:\s*["\']([^"\']+)["\']',
+        r'cannot find the file specified:\s*["\']([^"\']+)["\']',
+        r'error reading file:\s*\[errno\s*2\]\s*no such file or directory:\s*["\']([^"\']+)["\']',
+        r'file\s+([^\s"\']+\.(?:html?|json|csv|tsv|txt|xml))\s+not found',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, detail, re.IGNORECASE)
+        if match:
+            return str(match.group(1) or "").strip()
+    return ""
+
+
+def _build_retry_payload_with_materialized_context_file(
+    *,
+    payload: dict,
+    result: dict,
+    context: Optional[dict],
+    workdir: str,
+) -> Tuple[Optional[dict], str]:
+    if not isinstance(context, dict):
+        return None, ""
+    parse_text = str(context.get("latest_parse_input_text") or "").strip()
+    if not parse_text:
+        return None, ""
+
+    missing_path = _extract_missing_input_file_path(result)
+    if not missing_path or os.path.isabs(missing_path):
+        return None, ""
+    ext = os.path.splitext(str(missing_path or ""))[1].lower()
+    if ext not in _MATERIALIZABLE_SAMPLE_FILE_EXTS:
+        return None, ""
+
+    abs_workdir = resolve_path_with_workdir(".", workdir)
+    abs_target = resolve_path_with_workdir(missing_path, workdir)
+    if not abs_target or not abs_workdir:
+        return None, ""
+    try:
+        common = os.path.commonpath([abs_workdir, abs_target])
+    except Exception:
+        return None, ""
+    if common != abs_workdir:
+        return None, ""
+
+    os.makedirs(os.path.dirname(abs_target) or abs_workdir, exist_ok=True)
+    with open(abs_target, "w", encoding="utf-8", newline="") as handle:
+        handle.write(parse_text)
+    return dict(payload or {}), abs_target
 def _maybe_attach_context_stdin_before_run(
     *,
     payload: dict,
@@ -531,9 +599,35 @@ def _build_retry_payload_with_default_url(
 
 
 _WARNING_ONLY_LINE_RE = re.compile(r"(?:^warning:|deprecationwarning)", re.IGNORECASE)
-_SCRIPT_REQUIRED_OPTION_RE = re.compile(
-    r"add_argument\(\s*['\"](?P<flag>--[a-zA-Z0-9][a-zA-Z0-9_-]*)['\"](?P<body>.*?)\)",
-    re.IGNORECASE | re.DOTALL,
+_POSITIONAL_REQUIRED_PREFIX = "@pos:"
+_CSV_REQUIRED_COLUMNS_RE = re.compile(
+    r"missing required columns:\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
+_CSV_ALIAS_DATE_KEYS = (
+    "date",
+    "timestamp",
+    "datetime",
+    "time",
+    "day",
+    "trade_date",
+    "trading_date",
+    "日期",
+    "时间",
+)
+_CSV_ALIAS_PRICE_KEYS = (
+    "price",
+    "close",
+    "value",
+    "amount",
+    "cny_per_g",
+    "cnyg",
+    "price_cny",
+    "price_cny_per_gram",
+    "price_cny_per_g",
+    "金价",
+    "价格",
+    "收盘",
 )
 
 
@@ -558,6 +652,41 @@ def _merge_unique_args(base: List[str], extra: List[str]) -> List[str]:
     return out
 
 
+def _is_cli_option_token(token: str) -> bool:
+    value = str(token or "").strip()
+    if not value:
+        return False
+    if not value.startswith("-"):
+        return False
+    # 保留负数作为位置参数值，避免误判。
+    if re.match(r"^-\d", value):
+        return False
+    return True
+
+
+def _normalize_script_run_target(script: str, args: List[str]) -> Tuple[str, List[str], Optional[str]]:
+    target = str(script or "").strip()
+    normalized_args = [str(item) for item in list(args or []) if str(item).strip()]
+    if not target:
+        return "", normalized_args, None
+
+    # 回归防护：模型有时会把 script 错写为 python/python3/py，
+    # 并把真实脚本路径塞进 args[0]。
+    if _is_python_executable(target):
+        first_arg = str(normalized_args[0] or "").strip() if normalized_args else ""
+        if first_arg.lower().endswith(".py"):
+            return first_arg, [str(item) for item in normalized_args[1:] if str(item).strip()], None
+        return (
+            "",
+            normalized_args,
+            format_task_error(
+                code="script_payload_invalid",
+                message="shell_command.script 不能是 python 可执行程序，请填写脚本路径（例如 backend/.agent/workspace/x.py）",
+            ),
+        )
+    return target, normalized_args, None
+
+
 def _build_script_command_payload(payload: dict, context: Optional[dict]) -> Tuple[dict, Optional[str]]:
     patched = dict(payload or {})
     script = str(patched.get("script") or "").strip()
@@ -571,57 +700,821 @@ def _build_script_command_payload(payload: dict, context: Optional[dict]) -> Tup
     elif isinstance(args_raw, str) and args_raw.strip():
         args = parse_command_tokens(args_raw)
 
+    script, args, target_error = _normalize_script_run_target(script, args)
+    if target_error:
+        return patched, target_error
+
     python_exec = str((context or {}).get("python_executable_override") or "").strip()
     if not python_exec:
         python_exec = str(sys.executable or "").strip() or "python"
 
+    patched["script"] = script
+    patched["args"] = list(args)
     patched["command"] = [python_exec, script] + args
     return patched, None
+
+
+def _extract_python_constant_str(node: object) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return str(node.value)
+    if isinstance(node, ast.Str):
+        return str(node.s)
+    return ""
+
+
+def _extract_python_constant_str_list(node: object) -> List[str]:
+    values: List[str] = []
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        for item in list(node.elts or []):
+            text = _extract_python_constant_str(item)
+            if text:
+                values.append(text)
+    return _merge_unique_args([], values)
+
+
+def _extract_python_constant_bool(node: object) -> Optional[bool]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return bool(node.value)
+    if isinstance(node, ast.NameConstant):
+        value = node.value
+        if isinstance(value, bool):
+            return bool(value)
+    return None
+
+
+def _extract_python_constant_int(node: object) -> Optional[int]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return int(node.value)
+    if isinstance(node, ast.Num) and isinstance(node.n, int):
+        return int(node.n)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _extract_python_constant_int(node.operand)
+        if inner is not None:
+            return -int(inner)
+    return None
+
+
+
+def _unwrap_simple_sequence_wrapper(node: ast.AST) -> ast.AST:
+    current = node
+    while isinstance(current, ast.Call):
+        func_name = ''
+        if isinstance(current.func, ast.Name):
+            func_name = str(current.func.id or '').strip()
+        if func_name not in {'list', 'tuple'} or len(list(current.args or [])) != 1:
+            break
+        current = current.args[0]
+    return current
+
+
+
+def _is_sys_argv_attr(node: ast.AST) -> bool:
+    current = _unwrap_simple_sequence_wrapper(node)
+    return (
+        isinstance(current, ast.Attribute)
+        and isinstance(current.value, ast.Name)
+        and str(current.value.id or '').strip() == 'sys'
+        and str(current.attr or '').strip() == 'argv'
+    )
+
+
+
+def _extract_simple_name(target: ast.AST) -> str:
+    if isinstance(target, ast.Name):
+        return str(target.id or '').strip()
+    return ''
+
+
+
+def _sanitize_positional_name(raw: object) -> str:
+    text = str(raw or '').strip()
+    if not text:
+        return ''
+    text = re.sub(r'^[<\[(\{\s]+|[>\])\}\s]+$', '', text)
+    text = re.sub(r'^[<\[(\{\s]+', '', text)
+    text = re.sub(r'[>\])\}\s]+$', '', text)
+    text = re.sub(r'\s+', '_', text).strip('_')
+    return text[:64]
+
+
+
+def _extract_usage_placeholder_names(source: str) -> List[str]:
+    names: List[str] = []
+    for match in re.finditer(r'<([^<>]{1,64})>', str(source or '')):
+        name = _sanitize_positional_name(match.group(1))
+        if name:
+            names.append(name)
+    return _merge_unique_args([], names)
+
+
+
+def _extract_subscript_index(node: ast.Subscript) -> Optional[int]:
+    target = node.slice
+    if isinstance(target, ast.Index):
+        target = target.value
+    return _extract_python_constant_int(target)
+
+
+
+def _extract_sys_argv_alias_offset(node: ast.AST) -> Optional[int]:
+    current = _unwrap_simple_sequence_wrapper(node)
+    if _is_sys_argv_attr(current):
+        return 0
+    if not isinstance(current, ast.Subscript):
+        return None
+    base = _unwrap_simple_sequence_wrapper(current.value)
+    if not _is_sys_argv_attr(base):
+        return None
+    target = current.slice
+    if isinstance(target, ast.Index):
+        target = target.value
+    if not isinstance(target, ast.Slice):
+        return None
+    if target.upper is not None:
+        return None
+    lower = _extract_python_constant_int(target.lower) if target.lower is not None else 0
+    if lower is None or lower < 0:
+        return None
+    return int(lower)
+
+
+
+def _discover_sys_argv_alias_offsets(tree: ast.AST) -> Dict[str, int]:
+    aliases: Dict[str, int] = {}
+    for node in ast.walk(tree):
+        target = None
+        value = None
+        if isinstance(node, ast.Assign) and len(list(node.targets or [])) == 1:
+            target = node.targets[0]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+            value = node.value
+        if target is None or value is None:
+            continue
+        name = _extract_simple_name(target)
+        if not name:
+            continue
+        offset = _extract_sys_argv_alias_offset(value)
+        if offset is None:
+            continue
+        aliases[name] = int(offset)
+    return aliases
+
+
+
+def _resolve_sys_argv_container_offset(node: ast.AST, alias_offsets: Dict[str, int]) -> Optional[int]:
+    current = _unwrap_simple_sequence_wrapper(node)
+    if _is_sys_argv_attr(current):
+        return 0
+    if isinstance(current, ast.Name):
+        name = str(current.id or '').strip()
+        if name in alias_offsets:
+            return int(alias_offsets[name])
+    return None
+
+
+
+def _extract_sys_argv_positional_index(node: ast.AST, alias_offsets: Dict[str, int]) -> Optional[int]:
+    current = _unwrap_simple_sequence_wrapper(node)
+    if not isinstance(current, ast.Subscript):
+        return None
+    container_offset = _resolve_sys_argv_container_offset(current.value, alias_offsets)
+    if container_offset is None:
+        return None
+    index_value = _extract_subscript_index(current)
+    if index_value is None:
+        return None
+    position = int(index_value) + int(container_offset)
+    if container_offset == 0 and position <= 0:
+        return None
+    if position <= 0:
+        return None
+    return position
+
+
+
+def _extract_sys_argv_len_required_count(node: ast.AST, alias_offsets: Dict[str, int]) -> Optional[int]:
+    if not isinstance(node, ast.Compare):
+        return None
+    if len(list(node.ops or [])) != 1 or len(list(node.comparators or [])) != 1:
+        return None
+    op = node.ops[0]
+    if not isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+        return None
+
+    left = node.left
+    right = node.comparators[0]
+    if not isinstance(left, ast.Call):
+        return None
+    if not isinstance(left.func, ast.Name) or str(left.func.id or '').strip() != 'len':
+        return None
+    if len(list(left.args or [])) != 1:
+        return None
+    offset = _resolve_sys_argv_container_offset(left.args[0], alias_offsets)
+    if offset is None:
+        return None
+    constant = _extract_python_constant_int(right)
+    if constant is None:
+        return None
+    required = int(constant) + int(offset) - 1
+    if required <= 0:
+        return None
+    return required
+
+
+
+def _extract_sys_argv_contract(script_path: str) -> Dict[str, object]:
+    empty = {
+        'known_options': [],
+        'required_options': [],
+        'required_positionals': [],
+        'positional_choices': {},
+    }
+    if not script_path:
+        return empty
+    try:
+        source = Path(script_path).read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return empty
+    if not str(source or '').strip():
+        return empty
+    try:
+        tree = ast.parse(source, filename=script_path)
+    except Exception:
+        return empty
+
+    alias_offsets = _discover_sys_argv_alias_offsets(tree)
+    required_positions: Set[int] = set()
+    position_names: Dict[int, str] = {}
+
+    for node in ast.walk(tree):
+        position = _extract_sys_argv_positional_index(node, alias_offsets)
+        if position is not None:
+            required_positions.add(int(position))
+
+        target = None
+        value = None
+        if isinstance(node, ast.Assign) and len(list(node.targets or [])) == 1:
+            target = node.targets[0]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+            value = node.value
+        if target is not None and value is not None:
+            position = _extract_sys_argv_positional_index(value, alias_offsets)
+            if position is not None:
+                name = _sanitize_positional_name(_extract_simple_name(target))
+                if name:
+                    position_names.setdefault(int(position), name)
+
+        required_from_len = _extract_sys_argv_len_required_count(node, alias_offsets)
+        if required_from_len is not None:
+            for idx in range(1, int(required_from_len) + 1):
+                required_positions.add(idx)
+
+    if not required_positions:
+        return empty
+
+    usage_names = _extract_usage_placeholder_names(source)
+    max_position = max(required_positions)
+    required_positionals: List[str] = []
+    for idx in range(1, int(max_position) + 1):
+        if idx not in required_positions:
+            continue
+        name = position_names.get(idx) or (usage_names[idx - 1] if idx - 1 < len(usage_names) else '') or f'arg{idx}'
+        required_positionals.append(_to_positional_required(name))
+
+    return {
+        'known_options': [],
+        'required_options': [],
+        'required_positionals': _merge_unique_args([], required_positionals),
+        'positional_choices': {},
+    }
+
+
+
+def _extract_script_contract(script_path: str) -> Dict[str, object]:
+    argparse_contract = _extract_argparse_contract(script_path)
+    sys_argv_contract = _extract_sys_argv_contract(script_path)
+    positional_choices: Dict[str, List[str]] = {}
+    for source in (
+        argparse_contract.get('positional_choices') or {},
+        sys_argv_contract.get('positional_choices') or {},
+    ):
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            name = str(key or '').strip()
+            if not name:
+                continue
+            items = [str(item).strip() for item in (value or []) if str(item).strip()]
+            if items:
+                positional_choices[name] = _merge_unique_args(positional_choices.get(name, []), items)
+    return {
+        'known_options': _merge_unique_args([], list(argparse_contract.get('known_options') or []) + list(sys_argv_contract.get('known_options') or [])),
+        'required_options': _merge_unique_args([], list(argparse_contract.get('required_options') or []) + list(sys_argv_contract.get('required_options') or [])),
+        'required_positionals': _merge_unique_args([], list(argparse_contract.get('required_positionals') or []) + list(sys_argv_contract.get('required_positionals') or [])),
+        'positional_choices': positional_choices,
+    }
+
+
+def _extract_argparse_contract(script_path: str) -> Dict[str, List[str]]:
+    """
+    解析脚本中的 argparse.add_argument 调用，提取：
+    - known_options: 所有可选参数（含短参数和长参数）
+    - required_options: 必填可选参数（优先长参数，不存在时使用短参数）
+    - required_positionals: 必填位置参数（@pos:name）
+    - positional_choices: 位置参数可选值（如 mode=run/self_test）
+    """
+    if not script_path:
+        return {
+            "known_options": [],
+            "required_options": [],
+            "required_positionals": [],
+            "positional_choices": {},
+        }
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="replace") as handle:
+            source = str(handle.read() or "")
+    except Exception:
+        return {
+            "known_options": [],
+            "required_options": [],
+            "required_positionals": [],
+            "positional_choices": {},
+        }
+    if not source.strip():
+        return {
+            "known_options": [],
+            "required_options": [],
+            "required_positionals": [],
+            "positional_choices": {},
+        }
+    try:
+        tree = ast.parse(source, filename=script_path)
+    except Exception:
+        return {
+            "known_options": [],
+            "required_options": [],
+            "required_positionals": [],
+            "positional_choices": {},
+        }
+
+    known_options: List[str] = []
+    required_options: List[str] = []
+    required_positionals: List[str] = []
+    positional_choices: Dict[str, List[str]] = {}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if str(func.attr or "").strip() != "add_argument":
+            continue
+
+        literal_args: List[str] = []
+        for arg_node in list(node.args or []):
+            text = str(_extract_python_constant_str(arg_node) or "").strip()
+            if text:
+                literal_args.append(text)
+        if not literal_args:
+            continue
+
+        required_kw: Optional[bool] = None
+        nargs_kw: str = ""
+        choices_kw: List[str] = []
+        for kw in list(node.keywords or []):
+            if not isinstance(kw, ast.keyword):
+                continue
+            key = str(kw.arg or "").strip()
+            if key == "required":
+                required_kw = _extract_python_constant_bool(kw.value)
+            elif key == "nargs":
+                nargs_kw = str(_extract_python_constant_str(kw.value) or "").strip()
+            elif key == "choices":
+                choices_kw = _extract_python_constant_str_list(kw.value)
+
+        option_flags = [item for item in literal_args if str(item or "").strip().startswith("-")]
+        if option_flags:
+            known_options = _merge_unique_args(known_options, option_flags)
+            if required_kw is True:
+                long_flags = [item for item in option_flags if str(item).startswith("--")]
+                if long_flags:
+                    required_options.append(str(long_flags[0]))
+                else:
+                    required_options.append(str(option_flags[0]))
+            continue
+
+        positional_name = str(literal_args[0] or "").strip()
+        if not positional_name:
+            continue
+        if choices_kw:
+            positional_choices[positional_name] = list(choices_kw)
+        # positional 默认必填；nargs='?'/'*' 表示可选。
+        if nargs_kw in {"?", "*"}:
+            continue
+        if required_kw is False:
+            continue
+        required_positionals.append(_to_positional_required(positional_name))
+
+    return {
+        "known_options": _merge_unique_args([], known_options),
+        "required_options": _merge_unique_args([], required_options),
+        "required_positionals": _merge_unique_args([], required_positionals),
+        "positional_choices": {key: list(value) for key, value in positional_choices.items() if value},
+    }
 
 
 def _discover_required_script_optional_args(script_path: str) -> List[str]:
     """
     从脚本文本中提取 argparse.required=True 的可选参数（--flag）。
     """
-    if not script_path:
-        return []
-    try:
-        with open(script_path, "r", encoding="utf-8", errors="replace") as handle:
-            source = handle.read()
-    except Exception:
-        return []
-
-    found: List[str] = []
-    for match in _SCRIPT_REQUIRED_OPTION_RE.finditer(source):
-        flag = str(match.group("flag") or "").strip()
-        body = str(match.group("body") or "")
-        if not flag:
-            continue
-        if not re.search(r"required\s*=\s*True", body):
-            continue
-        found.append(flag)
-    return _merge_unique_args([], found)
+    contract = _extract_script_contract(script_path)
+    return _merge_unique_args([], contract.get("required_options") or [])
 
 
 def _discover_script_optional_args(script_path: str) -> List[str]:
     """
     从脚本文本中提取 argparse 可选参数（--flag）。
     """
-    if not script_path:
-        return []
-    try:
-        with open(script_path, "r", encoding="utf-8", errors="replace") as handle:
-            source = handle.read()
-    except Exception:
+    contract = _extract_script_contract(script_path)
+    return _merge_unique_args([], contract.get("known_options") or [])
+
+
+def _to_positional_required(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    if text.startswith(_POSITIONAL_REQUIRED_PREFIX):
+        return text
+    return f"{_POSITIONAL_REQUIRED_PREFIX}{text}"
+
+
+def _is_positional_required(required: str) -> bool:
+    return str(required or "").strip().startswith(_POSITIONAL_REQUIRED_PREFIX)
+
+
+def _display_required_arg(required: str) -> str:
+    text = str(required or "").strip()
+    if not text:
+        return ""
+    if _is_positional_required(text):
+        name = text[len(_POSITIONAL_REQUIRED_PREFIX) :].strip() or "arg"
+        return f"位置参数({name})"
+    return text
+
+
+def _discover_required_script_positional_args(script_path: str) -> List[str]:
+    """
+    从脚本文本提取 argparse 必填位置参数。
+    """
+    contract = _extract_script_contract(script_path)
+    return _merge_unique_args([], contract.get("required_positionals") or [])
+
+
+def _discover_script_positional_choices(script_path: str) -> Dict[str, List[str]]:
+    contract = _extract_script_contract(script_path)
+    raw = contract.get("positional_choices") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        if not name:
+            continue
+        if isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            if items:
+                out[name] = items
+    return out
+
+
+def _select_preferred_positional_choice(choices: List[str]) -> str:
+    values = [str(item).strip() for item in choices if str(item).strip()]
+    if not values:
+        return ""
+    preferred_order = ("run", "execute", "main", "start", "fetch")
+    lowered = {item.lower(): item for item in values}
+    for key in preferred_order:
+        if key in lowered:
+            return lowered[key]
+    for item in values:
+        lowered_item = item.lower()
+        if lowered_item not in {"self_test", "test", "dry_run", "dry-run", "check"}:
+            return item
+    return values[0]
+
+
+def _extract_provided_positional_args(tokens: List[str]) -> List[str]:
+    out: List[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = str(tokens[idx] or "").strip()
+        if not token:
+            idx += 1
+            continue
+        if _is_cli_option_token(token):
+            if "=" in token:
+                idx += 1
+                continue
+            if idx + 1 < len(tokens):
+                candidate = str(tokens[idx + 1] or "").strip()
+                if candidate and not _is_cli_option_token(candidate):
+                    idx += 2
+                    continue
+            idx += 1
+            continue
+        out.append(token)
+        idx += 1
+    return out
+
+
+def _collect_missing_required_args(required_args: List[str], args_tokens: List[str]) -> List[str]:
+    missing: List[str] = []
+    positional_args = _extract_provided_positional_args(args_tokens)
+    positional_required_seen = 0
+    for item in required_args:
+        required = str(item or "").strip()
+        if not required:
+            continue
+        if _is_positional_required(required):
+            positional_required_seen += 1
+            if len(positional_args) < int(positional_required_seen):
+                missing.append(required)
+            continue
+        if not _arg_is_provided(args_tokens, required):
+            missing.append(required)
+    return missing
+
+
+def _extract_missing_required_columns(result: dict) -> List[str]:
+    stderr = str((result or {}).get("stderr") or "")
+    stdout = str((result or {}).get("stdout") or "")
+    detail = f"{stderr}\n{stdout}"
+    if not detail.strip():
         return []
 
-    found: List[str] = []
-    for match in _SCRIPT_REQUIRED_OPTION_RE.finditer(source):
-        flag = str(match.group("flag") or "").strip()
-        if not flag:
+    match = _CSV_REQUIRED_COLUMNS_RE.search(detail)
+    if not match:
+        return []
+    body = str(match.group(1) or "").strip()
+    if not body:
+        return []
+    items = [str(item or "").strip() for item in body.split(",")]
+    out: List[str] = []
+    for item in items:
+        if not item:
             continue
-        found.append(flag)
-    return _merge_unique_args([], found)
+        out.append(item)
+    return _merge_unique_args([], out)
+
+
+def _normalize_csv_header_key(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = text.replace("（", "(").replace("）", ")")
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text
+
+
+def _is_date_like_column_name(name: str) -> bool:
+    raw = _normalize_csv_header_key(name)
+    if not raw:
+        return False
+    return any(token in raw for token in _CSV_ALIAS_DATE_KEYS)
+
+
+def _is_price_like_column_name(name: str) -> bool:
+    raw = _normalize_csv_header_key(name)
+    if not raw:
+        return False
+    return any(token in raw for token in _CSV_ALIAS_PRICE_KEYS)
+
+
+def _candidate_alias_keys_for_required_column(required: str) -> List[str]:
+    raw = _normalize_csv_header_key(required)
+    if not raw:
+        return []
+    aliases: List[str] = [raw]
+    if _is_date_like_column_name(raw):
+        aliases.extend(_CSV_ALIAS_DATE_KEYS)
+    if _is_price_like_column_name(raw):
+        aliases.extend(_CSV_ALIAS_PRICE_KEYS)
+    if raw == "price_cny_per_g":
+        aliases.extend(
+            [
+                "price_cny_per_gram",
+                "price",
+                "close",
+                "value",
+                "amount",
+                "cny_per_g",
+                "价格",
+                "金价",
+            ]
+        )
+    if raw == "timestamp":
+        aliases.extend(["date", "datetime", "time", "day", "日期", "时间"])
+    return _merge_unique_args([], [_normalize_csv_header_key(item) for item in aliases])
+
+
+def _resolve_csv_required_column_mapping(
+    *,
+    headers: List[str],
+    missing_required_columns: List[str],
+) -> Dict[str, str]:
+    normalized_to_header: Dict[str, str] = {}
+    for item in headers:
+        normalized = _normalize_csv_header_key(item)
+        if not normalized:
+            continue
+        if normalized not in normalized_to_header:
+            normalized_to_header[normalized] = str(item)
+
+    mapping: Dict[str, str] = {}
+    used_sources: Set[str] = set()
+    for required in missing_required_columns:
+        required_name = str(required or "").strip()
+        if not required_name:
+            continue
+        alias_keys = _candidate_alias_keys_for_required_column(required_name)
+        selected = ""
+        for key in alias_keys:
+            candidate = str(normalized_to_header.get(key) or "").strip()
+            if candidate and candidate not in used_sources:
+                selected = candidate
+                break
+        if not selected and _is_date_like_column_name(required_name):
+            for header in headers:
+                candidate = str(header or "").strip()
+                if not candidate or candidate in used_sources:
+                    continue
+                if _is_date_like_column_name(candidate):
+                    selected = candidate
+                    break
+        if not selected and _is_price_like_column_name(required_name):
+            for header in headers:
+                candidate = str(header or "").strip()
+                if not candidate or candidate in used_sources:
+                    continue
+                if _is_price_like_column_name(candidate):
+                    selected = candidate
+                    break
+        if not selected:
+            continue
+        mapping[required_name] = selected
+        used_sources.add(selected)
+    return mapping
+
+
+def _extract_csv_paths_from_command(payload: dict) -> List[str]:
+    tokens = parse_command_tokens(payload.get("command"))
+    if not tokens:
+        return []
+
+    out: List[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = str(tokens[idx] or "").strip()
+        if not token:
+            idx += 1
+            continue
+        if token.startswith("--"):
+            if "=" in token:
+                _flag, value = token.split("=", 1)
+                value_text = str(value or "").strip()
+                if value_text.lower().endswith(".csv"):
+                    out.append(value_text)
+                idx += 1
+                continue
+            if idx + 1 < len(tokens):
+                candidate = str(tokens[idx + 1] or "").strip()
+                if candidate and not candidate.startswith("--") and candidate.lower().endswith(".csv"):
+                    out.append(candidate)
+                    idx += 2
+                    continue
+            idx += 1
+            continue
+        if token.lower().endswith(".csv"):
+            out.append(token)
+        idx += 1
+    return _merge_unique_args([], out)
+
+
+def _replace_command_csv_path(command: object, *, source_path: str, target_path: str) -> List[str]:
+    source_norm = os.path.normcase(str(source_path or "").strip())
+    tokens = parse_command_tokens(command)
+    if not tokens:
+        return []
+    out: List[str] = []
+    for token in tokens:
+        current = str(token or "")
+        if os.path.normcase(current.strip()) == source_norm:
+            out.append(str(target_path))
+        else:
+            out.append(current)
+    return out
+
+
+def _build_retry_payload_with_csv_alias_mapping(
+    *,
+    payload: dict,
+    result: dict,
+    workdir: str,
+) -> Tuple[Optional[dict], Dict[str, object]]:
+    missing_columns = _extract_missing_required_columns(result)
+    if not missing_columns:
+        return None, {}
+
+    csv_candidates = _extract_csv_paths_from_command(payload)
+    if not csv_candidates:
+        return None, {}
+
+    selected_token = ""
+    selected_abs = ""
+    for candidate in csv_candidates:
+        resolved = resolve_path_with_workdir(candidate, workdir)
+        if not resolved or not os.path.exists(resolved):
+            continue
+        selected_token = candidate
+        selected_abs = resolved
+        break
+    if not selected_abs:
+        return None, {}
+
+    try:
+        with open(selected_abs, "r", encoding="utf-8", errors="replace", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+            headers = list(reader.fieldnames or [])
+    except Exception:
+        return None, {}
+
+    if not headers:
+        return None, {}
+
+    mapping = _resolve_csv_required_column_mapping(
+        headers=headers,
+        missing_required_columns=missing_columns,
+    )
+    if not mapping:
+        return None, {}
+
+    unresolved = [item for item in missing_columns if str(item or "").strip() not in mapping]
+    if unresolved:
+        return None, {}
+
+    base, ext = os.path.splitext(selected_abs)
+    mapped_abs = f"{base}.alias_mapped{ext or '.csv'}"
+    target_headers = list(headers)
+    for required in missing_columns:
+        required_name = str(required or "").strip()
+        if required_name and required_name not in target_headers:
+            target_headers.append(required_name)
+
+    try:
+        os.makedirs(os.path.dirname(mapped_abs), exist_ok=True)
+        with open(mapped_abs, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=target_headers)
+            writer.writeheader()
+            for row in rows:
+                out_row = dict(row or {})
+                for required_name, source_name in mapping.items():
+                    if str(required_name or "").strip() and str(required_name or "").strip() not in out_row:
+                        out_row[required_name] = str(out_row.get(source_name) or "")
+                    elif str(required_name or "").strip():
+                        if not str(out_row.get(required_name) or "").strip():
+                            out_row[required_name] = str(out_row.get(source_name) or "")
+                writer.writerow(out_row)
+    except Exception:
+        return None, {}
+
+    mapped_token = mapped_abs
+    try:
+        mapped_token = os.path.relpath(mapped_abs, os.path.abspath(workdir or os.getcwd())).replace("\\", "/")
+    except Exception:
+        mapped_token = mapped_abs
+
+    patched = dict(payload or {})
+    patched["command"] = _replace_command_csv_path(
+        payload.get("command"),
+        source_path=selected_token,
+        target_path=mapped_token,
+    )
+    meta = {
+        "trigger": "missing_required_columns",
+        "csv_source": selected_token,
+        "csv_mapped": mapped_token,
+        "required_columns": list(missing_columns),
+        "column_mapping": dict(mapping),
+    }
+    return patched, meta
 
 
 def _extract_script_and_args_from_payload(payload: dict) -> Tuple[str, List[str]]:
@@ -646,7 +1539,7 @@ def _arg_is_provided(tokens: List[str], expected: str) -> bool:
         current = str(token or "").strip()
         if current == normalized_expected:
             return True
-        if normalized_expected.startswith("--") and current.startswith(normalized_expected + "="):
+        if normalized_expected.startswith("-") and current.startswith(normalized_expected + "="):
             return True
     return False
 
@@ -655,7 +1548,142 @@ def _is_output_like_flag(flag: str) -> bool:
     raw = str(flag or "").strip().lower()
     if not raw:
         return False
+    if raw in {"-o"}:
+        return True
     return any(token in raw for token in ("--out", "--output", "result", "target"))
+
+
+def _is_input_like_flag(flag: str) -> bool:
+    raw = str(flag or "").strip().lower()
+    if not raw:
+        return False
+    if raw in {"-i"}:
+        return True
+    return any(token in raw for token in ("--in", "--input", "source", "src", "from", "raw"))
+
+
+def _is_name_like_flag(flag: str) -> bool:
+    raw = str(flag or "").strip().lower()
+    if not raw:
+        return False
+    if raw in {"-n"}:
+        return True
+    return any(token in raw for token in ("--name", "--filename", "--file-name", "--file_name"))
+
+
+def _load_script_source_text(script_path: str) -> str:
+    if not script_path:
+        return ""
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="replace") as handle:
+            return str(handle.read() or "")
+    except Exception:
+        return ""
+
+
+def _infer_script_output_extension(script_path: str) -> str:
+    source = _load_script_source_text(script_path).lower()
+    if not source:
+        return ".json"
+    if "dictwriter" in source or "csv." in source or ".writerow(" in source:
+        return ".csv"
+    if "json.dump" in source or "json.dumps" in source:
+        return ".json"
+    if "yaml.safe_dump" in source or ".yaml" in source or ".yml" in source:
+        return ".yaml"
+    return ".json"
+
+
+def _infer_script_input_extensions(script_path: str) -> List[str]:
+    source = _load_script_source_text(script_path).lower()
+    exts: List[str] = []
+    if "json.load" in source or ".json" in source:
+        exts.append(".json")
+    if "csv." in source or ".csv" in source:
+        exts.append(".csv")
+    if "yaml.safe_load" in source or ".yaml" in source or ".yml" in source:
+        exts.append(".yaml")
+        exts.append(".yml")
+    if not exts:
+        exts.extend([".json", ".csv", ".txt"])
+    # 去重并保持顺序
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in exts:
+        current = str(item or "").strip().lower()
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        out.append(current)
+    return out
+
+
+def _build_default_script_output_path(script: str, workdir: str) -> str:
+    script_abs = resolve_path_with_workdir(script, workdir)
+    base_name = os.path.splitext(os.path.basename(str(script_abs or script).strip()))[0] or "script"
+    ext = _infer_script_output_extension(str(script_abs or script))
+
+    workspace_dir = resolve_path_with_workdir("backend/.agent/workspace", workdir)
+    if not workspace_dir:
+        workspace_dir = os.path.dirname(str(script_abs or ""))
+    if not workspace_dir:
+        workspace_dir = os.path.abspath(workdir or os.getcwd())
+
+    out_abs = os.path.abspath(os.path.join(workspace_dir, f"{base_name}_output{ext}"))
+    workdir_abs = os.path.abspath(workdir or os.getcwd())
+    try:
+        rel = os.path.relpath(out_abs, workdir_abs).replace("\\", "/")
+        return rel
+    except Exception:
+        return out_abs
+
+
+def _build_default_name_arg_value(script: str) -> str:
+    script_name = os.path.splitext(os.path.basename(str(script or "").strip()))[0]
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", script_name).strip("_")
+    if not cleaned:
+        cleaned = "artifact"
+    return cleaned[:48]
+
+
+def _pick_recent_artifact_paths(
+    *,
+    workdir: str,
+    preferred_exts: Optional[Set[str]] = None,
+    max_items: int = 3,
+) -> List[str]:
+    preferred = {str(item or "").strip().lower() for item in (preferred_exts or set()) if str(item or "").strip()}
+    artifacts = _collect_arg_binding_artifacts(workdir, max_items=120, max_depth=4)
+    if not artifacts:
+        return []
+
+    sortable: List[Tuple[int, str, str]] = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        ext = str(item.get("ext") or "").strip().lower()
+        if not path:
+            continue
+        if preferred and ext and ext not in preferred:
+            continue
+        try:
+            mtime = int(item.get("mtime") or 0)
+        except Exception:
+            mtime = 0
+        sortable.append((mtime, path, ext))
+
+    sortable.sort(key=lambda row: int(row[0]), reverse=True)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for _mtime, path, _ext in sortable:
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+        if len(out) >= int(max_items):
+            break
+    return out
 
 
 def _extract_option_value_pairs(tokens: List[str]) -> List[Tuple[str, str]]:
@@ -663,7 +1691,7 @@ def _extract_option_value_pairs(tokens: List[str]) -> List[Tuple[str, str]]:
     idx = 0
     while idx < len(tokens):
         token = str(tokens[idx] or "").strip()
-        if not token.startswith("--"):
+        if not _is_cli_option_token(token):
             idx += 1
             continue
         if "=" in token:
@@ -677,7 +1705,7 @@ def _extract_option_value_pairs(tokens: List[str]) -> List[Tuple[str, str]]:
         next_value = ""
         if idx + 1 < len(tokens):
             candidate = str(tokens[idx + 1] or "").strip()
-            if candidate and not candidate.startswith("--"):
+            if candidate and not _is_cli_option_token(candidate):
                 next_value = candidate
                 idx += 2
             else:
@@ -689,28 +1717,33 @@ def _extract_option_value_pairs(tokens: List[str]) -> List[Tuple[str, str]]:
     return out
 
 
-def _filter_script_args_by_known_options(tokens: List[str], known_options: Set[str]) -> List[str]:
-    if not known_options:
+def _filter_script_args_by_known_options(
+    tokens: List[str],
+    known_options: Set[str],
+    *,
+    strip_unknown_when_empty: bool = False,
+) -> List[str]:
+    if not known_options and not strip_unknown_when_empty:
         return list(tokens)
     out: List[str] = []
     idx = 0
     while idx < len(tokens):
         token = str(tokens[idx] or "").strip()
-        if not token.startswith("--"):
+        if not _is_cli_option_token(token):
             out.append(token)
             idx += 1
             continue
         if "=" in token:
             key, _value = token.split("=", 1)
-            if str(key or "").strip() in known_options:
+            if known_options and str(key or "").strip() in known_options:
                 out.append(token)
             idx += 1
             continue
-        if token in known_options:
+        if known_options and token in known_options:
             out.append(token)
             if idx + 1 < len(tokens):
                 candidate = str(tokens[idx + 1] or "").strip()
-                if candidate and not candidate.startswith("--"):
+                if candidate and not _is_cli_option_token(candidate):
                     out.append(candidate)
                     idx += 2
                     continue
@@ -719,11 +1752,88 @@ def _filter_script_args_by_known_options(tokens: List[str], known_options: Set[s
         # unknown option: 丢弃该 flag 及其 value（如存在）
         if idx + 1 < len(tokens):
             candidate = str(tokens[idx + 1] or "").strip()
-            if candidate and not candidate.startswith("--"):
+            if candidate and not _is_cli_option_token(candidate):
                 idx += 2
                 continue
         idx += 1
     return out
+
+
+def _semantic_tokens(text: str) -> Set[str]:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return set()
+    tokens = [item for item in re.split(r"[^a-z0-9]+", raw) if item]
+    stopwords = {
+        "arg",
+        "args",
+        "input",
+        "output",
+        "file",
+        "path",
+        "value",
+        "data",
+        "raw",
+        "tmp",
+    }
+    out: Set[str] = set()
+    for token in tokens:
+        if len(token) <= 1:
+            continue
+        if token in stopwords:
+            continue
+        out.add(token)
+    return out
+
+
+def _score_arg_binding_candidate(*, required: str, source_option: str, value: str) -> int:
+    required_tokens = _semantic_tokens(required)
+    source_tokens = _semantic_tokens(source_option)
+    value_tokens = _semantic_tokens(os.path.basename(str(value or "")))
+    if not required_tokens:
+        return 0
+
+    score = 0
+    overlap_source = required_tokens.intersection(source_tokens)
+    overlap_value = required_tokens.intersection(value_tokens)
+    score += int(len(overlap_source) * 4)
+    score += int(len(overlap_value) * 3)
+
+    required_text = str(required or "").strip().lower()
+    source_text = str(source_option or "").strip().lower()
+    value_text = str(value or "").strip().lower()
+    if required_text and required_text in source_text:
+        score += 4
+    if required_text and required_text in value_text:
+        score += 3
+    return int(score)
+
+
+def _pick_best_binding_candidate(
+    *,
+    required: str,
+    candidates: List[Tuple[str, str]],
+    used_indexes: Set[int],
+    allow_zero_score: bool,
+) -> Optional[Tuple[int, str, str, int]]:
+    best: Optional[Tuple[int, str, str, int]] = None
+    for idx, (source_option, value) in enumerate(candidates):
+        if idx in used_indexes:
+            continue
+        score = _score_arg_binding_candidate(
+            required=required,
+            source_option=source_option,
+            value=value,
+        )
+        if score <= 0 and not allow_zero_score:
+            continue
+        if best is None:
+            best = (idx, source_option, value, score)
+            continue
+        if score > int(best[3]):
+            best = (idx, source_option, value, score)
+            continue
+    return best
 
 
 def _is_truthy(value: object, *, default: bool = False) -> bool:
@@ -878,7 +1988,8 @@ def _build_llm_script_arg_prompt(
         "1) args 只包含脚本参数，不要包含 python 可执行程序和脚本路径。\n"
         "2) 必须覆盖 missing_args；优先复用 provided_args 里的值。\n"
         "3) 仅使用 known_options 或 required_args 中存在的选项名，禁止杜撰新选项。\n"
-        "4) 若无法确定，请返回 args=[] 且给出 reason，confidence 设为 0。\n\n"
+        "4) 若 required_args 里出现 `@pos:<name>`，表示这是必填位置参数，args 中应直接放值，不要加 --flag。\n"
+        "5) 若无法确定，请返回 args=[] 且给出 reason，confidence 设为 0。\n\n"
         "输入：\n"
         f"{payload_json}"
     )
@@ -987,15 +2098,16 @@ def _try_llm_bind_script_missing_args(
         }
 
     allowed_options = set(
-        [item for item in required_args if str(item).strip().startswith("--")]
-        + [item for item in known_options if str(item).strip().startswith("--")]
+        [item for item in required_args if str(item).strip().startswith("-")]
+        + [item for item in known_options if str(item).strip().startswith("-")]
     )
-    normalized_tokens = _filter_script_args_by_known_options(candidate_tokens, allowed_options)
+    normalized_tokens = _filter_script_args_by_known_options(
+        candidate_tokens,
+        allowed_options,
+        strip_unknown_when_empty=(not allowed_options and any(_is_positional_required(item) for item in required_args)),
+    )
 
-    missing_after: List[str] = []
-    for item in required_args:
-        if not _arg_is_provided(normalized_tokens, item):
-            missing_after.append(item)
+    missing_after = _collect_missing_required_args(required_args=required_args, args_tokens=normalized_tokens)
     if missing_after:
         return None, {
             "status": "contract_not_satisfied",
@@ -1043,17 +2155,17 @@ def _try_autofill_script_missing_args(
     missing_args: List[str],
     provided_args: List[str],
     known_options: Optional[Set[str]] = None,
+    context: Optional[dict] = None,
 ) -> Optional[dict]:
     if not missing_args:
         return None
 
     option_pairs = _extract_option_value_pairs(provided_args)
-    if not option_pairs:
-        return None
 
     options = set(known_options or [])
+    script_abs = resolve_path_with_workdir(script, workdir)
+    positional_choices = _discover_script_positional_choices(script_abs)
     if not options:
-        script_abs = resolve_path_with_workdir(script, workdir)
         options = set(_discover_script_optional_args(script_abs))
 
     input_candidates: List[Tuple[str, str]] = []
@@ -1071,29 +2183,173 @@ def _try_autofill_script_missing_args(
             if path:
                 output_candidates.append(("expected_outputs", path))
 
+    missing_output_flags = [item for item in missing_args if (not _is_positional_required(item)) and _is_output_like_flag(item)]
+    missing_input_flags = [
+        item
+        for item in missing_args
+        if _is_positional_required(item) or _is_input_like_flag(item) or not _is_output_like_flag(item)
+    ]
+
+    if missing_output_flags and not output_candidates:
+        default_output = _build_default_script_output_path(script, workdir)
+        if default_output:
+            output_candidates.append(("auto_default_output", default_output))
+
+    if missing_input_flags and not input_candidates:
+        preferred_input_exts = set(_infer_script_input_extensions(str(script_abs or script)))
+        context_artifacts: List[str] = []
+        default_url = str((context or {}).get("shell_default_url") or "").strip()
+        if not default_url:
+            default_url = str((context or {}).get("latest_external_url") or "").strip()
+        if default_url:
+            input_candidates.append(("latest_external_url", default_url))
+        latest_script_artifacts = (context or {}).get("latest_script_artifacts")
+        if isinstance(latest_script_artifacts, list):
+            for item in latest_script_artifacts:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("exists") is False:
+                    continue
+                path = str(item.get("path") or "").strip()
+                if not path:
+                    continue
+                resolved = resolve_path_with_workdir(path, workdir)
+                if not resolved or not os.path.exists(resolved):
+                    continue
+                ext = str(os.path.splitext(path)[1] or "").lower()
+                if preferred_input_exts and ext and ext not in preferred_input_exts:
+                    continue
+                context_artifacts.append(path)
+        latest_write_path = str((context or {}).get("latest_file_write_path") or "").strip()
+        if latest_write_path:
+            resolved = resolve_path_with_workdir(latest_write_path, workdir)
+            if resolved and os.path.exists(resolved):
+                ext = str(os.path.splitext(latest_write_path)[1] or "").lower()
+                if (not preferred_input_exts) or (not ext) or (ext in preferred_input_exts):
+                    context_artifacts.append(latest_write_path)
+        for path in _merge_unique_args([], context_artifacts)[:3]:
+            input_candidates.append(("artifact_context", path))
+
+    if missing_input_flags and not input_candidates:
+        for path in _pick_recent_artifact_paths(
+            workdir=workdir,
+            preferred_exts=preferred_input_exts,
+            max_items=3,
+        ):
+            input_candidates.append(("artifact_recent", path))
+
     if not input_candidates and not output_candidates:
         return None
 
     # 先按脚本真实契约裁剪未知参数，避免 argparse 因旧 flag 报 unrecognized。
-    normalized_args = _filter_script_args_by_known_options(provided_args, options)
+    normalized_args = _filter_script_args_by_known_options(
+        provided_args,
+        options,
+        strip_unknown_when_empty=(not options and any(_is_positional_required(item) for item in required_args)),
+    )
 
-    used_input = 0
-    used_output = 0
+    used_input_indexes: Set[int] = set()
+    used_output_indexes: Set[int] = set()
     applied: List[dict] = []
 
     for required in required_args:
-        if not required or _arg_is_provided(normalized_args, required):
+        if not required:
+            continue
+        if _is_positional_required(required):
+            required_positional_total = sum(1 for item in required_args if _is_positional_required(item))
+            provided_positionals = _extract_provided_positional_args(normalized_args)
+            required_positional_so_far = 0
+            for item in required_args:
+                if _is_positional_required(str(item or "").strip()):
+                    required_positional_so_far += 1
+                if item == required:
+                    break
+            if required_positional_so_far <= len(provided_positionals):
+                continue
+            positional_name = str(required[len(_POSITIONAL_REQUIRED_PREFIX):] or "").strip()
+            choice_value = _select_preferred_positional_choice(positional_choices.get(positional_name) or [])
+            if choice_value:
+                normalized_args.append(choice_value)
+                applied.append(
+                    {
+                        "required": required,
+                        "source_option": "argparse_choices",
+                        "value": choice_value,
+                        "score": 10,
+                    }
+                )
+                continue
+            selected = _pick_best_binding_candidate(
+                required=required,
+                candidates=input_candidates,
+                used_indexes=used_input_indexes,
+                allow_zero_score=(required_positional_total == 1),
+            )
+            if selected is None and input_candidates:
+                selected = _pick_best_binding_candidate(
+                    required=required,
+                    candidates=input_candidates,
+                    used_indexes=used_input_indexes,
+                    allow_zero_score=True,
+                )
+            if selected is None:
+                continue
+            selected_idx, selected_key, selected_value, selected_score = selected
+            used_input_indexes.add(int(selected_idx))
+            if not selected_value:
+                continue
+            normalized_args.append(selected_value)
+            applied.append(
+                {
+                    "required": required,
+                    "source_option": selected_key,
+                    "value": selected_value,
+                    "score": int(selected_score),
+                }
+            )
+            continue
+        if _arg_is_provided(normalized_args, required):
             continue
         selected_key = ""
         selected_value = ""
+        selected_score = 0
         if _is_output_like_flag(required):
-            if used_output < len(output_candidates):
-                selected_key, selected_value = output_candidates[used_output]
-                used_output += 1
+            selected = _pick_best_binding_candidate(
+                required=required,
+                candidates=output_candidates,
+                used_indexes=used_output_indexes,
+                allow_zero_score=True,
+            )
+            if selected is not None:
+                selected_idx, selected_key, selected_value, selected_score = selected
+                used_output_indexes.add(int(selected_idx))
         else:
-            if used_input < len(input_candidates):
-                selected_key, selected_value = input_candidates[used_input]
-                used_input += 1
+            selected = _pick_best_binding_candidate(
+                required=required,
+                candidates=input_candidates,
+                used_indexes=used_input_indexes,
+                allow_zero_score=(len(missing_input_flags) == 1),
+            )
+            if (
+                selected is None
+                and len(input_candidates) == len(missing_input_flags)
+                and len(input_candidates) > 0
+            ):
+                # 当输入候选与缺失参数数量完全一致时，允许按顺序兜底一次，
+                # 避免“低语义可辨识但一一对应明确”的场景被卡死。
+                selected = _pick_best_binding_candidate(
+                    required=required,
+                    candidates=input_candidates,
+                    used_indexes=used_input_indexes,
+                    allow_zero_score=True,
+                )
+            if selected is not None:
+                selected_idx, selected_key, selected_value, selected_score = selected
+                used_input_indexes.add(int(selected_idx))
+            elif _is_name_like_flag(required):
+                selected_key = "auto_default_name"
+                selected_value = _build_default_name_arg_value(script)
+                selected_score = 1
         if not selected_value:
             continue
         normalized_args.extend([required, selected_value])
@@ -1102,6 +2358,7 @@ def _try_autofill_script_missing_args(
                 "required": required,
                 "source_option": selected_key,
                 "value": selected_value,
+                "score": int(selected_score),
             }
         )
 
@@ -1136,22 +2393,60 @@ def _preflight_script_arg_contract(
     script, script_args = _extract_script_and_args_from_payload(payload)
     if not script:
         return {}, None
+    original_script_args = list(script_args)
 
     required_from_payload = []
     raw_required = payload.get("required_args")
     if _looks_like_nonempty_string_list(raw_required):
-        required_from_payload = [str(item).strip() for item in raw_required if str(item).strip()]
+        required_from_payload = []
+        for item in raw_required:
+            text = str(item).strip()
+            if not text:
+                continue
+            if text.startswith("-"):
+                required_from_payload.append(text)
+            else:
+                required_from_payload.append(_to_positional_required(text))
 
     discover_required = payload.get("discover_required_args")
     if discover_required is None:
         discover_required = True
     required_auto: List[str] = []
+    required_positional_auto: List[str] = []
     script_abs = resolve_path_with_workdir(script, workdir)
     if bool(discover_required):
         required_auto = _discover_required_script_optional_args(script_abs)
+        required_positional_auto = _discover_required_script_positional_args(script_abs)
     known_options = _discover_script_optional_args(script_abs)
 
-    required = _merge_unique_args(required_from_payload, required_auto)
+    # 无论是否存在缺失参数，都先用脚本真实可识别选项裁剪未知 flag，
+    # 避免运行阶段直接触发 argparse "unrecognized arguments"。
+    if script_args and (known_options or required_positional_auto):
+        normalized_initial_args = _filter_script_args_by_known_options(
+            script_args,
+            set(known_options),
+            strip_unknown_when_empty=(not known_options and bool(required_positional_auto)),
+        )
+        if normalized_initial_args != script_args:
+            patched_payload = dict(payload or {})
+            patched_payload["args"] = list(normalized_initial_args)
+            python_exec = str(sys.executable or "").strip() or "python"
+            command_tokens = parse_command_tokens(payload.get("command"))
+            if command_tokens and _is_python_executable(str(command_tokens[0] or "").strip()):
+                python_exec = str(command_tokens[0] or "").strip() or python_exec
+            patched_payload["command"] = [python_exec, script] + list(normalized_initial_args)
+            payload.clear()
+            payload.update(patched_payload)
+            _script, script_args = _extract_script_and_args_from_payload(payload)
+            if _script != script:
+                script_args = list(normalized_initial_args)
+
+    discovered_required = _merge_unique_args(required_auto, required_positional_auto)
+    # 以脚本真实契约为准：只在无法发现脚本契约时回退 payload.required_args。
+    if bool(discover_required) and discovered_required:
+        required = list(discovered_required)
+    else:
+        required = _merge_unique_args(required_from_payload, discovered_required)
     if not required:
         return {
             "mode": "script_run",
@@ -1162,11 +2457,7 @@ def _preflight_script_arg_contract(
         }, None
 
     def _collect_missing(args_tokens: List[str]) -> List[str]:
-        out: List[str] = []
-        for item in required:
-            if not _arg_is_provided(args_tokens, item):
-                out.append(item)
-        return out
+        return _collect_missing_required_args(required_args=required, args_tokens=args_tokens)
 
     missing = _collect_missing(script_args)
     autofill_meta = None
@@ -1179,8 +2470,9 @@ def _preflight_script_arg_contract(
             script=script,
             required_args=required,
             missing_args=missing,
-            provided_args=script_args,
+            provided_args=original_script_args,
             known_options=set(known_options),
+            context=context,
         )
         if isinstance(autofill_meta, dict):
             patched_payload = autofill_meta.get("patched_payload")
@@ -1199,7 +2491,7 @@ def _preflight_script_arg_contract(
                 required_args=required,
                 known_options=list(known_options),
                 missing_args=missing,
-                provided_args=script_args,
+                provided_args=original_script_args,
                 task_id=task_id,
                 run_id=run_id,
                 context=context,
@@ -1254,7 +2546,7 @@ def _preflight_script_arg_contract(
         return contract, format_task_error(
             code="script_args_missing",
             message=(
-                f"{ERROR_MESSAGE_COMMAND_FAILED}: 脚本参数缺失（{', '.join(missing)}）；"
+                f"{ERROR_MESSAGE_COMMAND_FAILED}: 脚本参数缺失（{', '.join(_display_required_arg(item) for item in missing)}）；"
                 f"脚本={script}{autofill_tail}{llm_tail}"
             ),
         )
@@ -1278,17 +2570,67 @@ def _maybe_apply_stdin_from_context(payload: dict, context: Optional[dict]) -> T
     return patched, len(parse_text)
 
 
-def _collect_expected_output_artifacts(payload: dict, workdir: str) -> Tuple[List[dict], List[str]]:
-    outputs = payload.get("expected_outputs")
-    if not isinstance(outputs, list):
-        return [], []
+def _looks_like_declared_output_path(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered in {"-", "stdout", "stderr", "/dev/stdout", "/dev/stderr"}:
+        return False
+    if text.startswith("http://") or text.startswith("https://"):
+        return False
+    if any(sep in text for sep in ("/", "\\")):
+        return True
+    if os.path.splitext(text)[1]:
+        return True
+    if text.startswith("."):
+        return True
+    return False
 
+
+def _collect_declared_output_paths(payload: dict) -> List[str]:
+    out: List[str] = []
+    raw_outputs = payload.get("expected_outputs")
+    if isinstance(raw_outputs, list):
+        for item in raw_outputs:
+            text = str(item or "").strip()
+            if text:
+                out.append(text)
+
+    script, script_args = _extract_script_and_args_from_payload(payload)
+    if script_args:
+        candidate_tokens = list(script_args)
+    else:
+        raw_args = payload.get("args")
+        if isinstance(raw_args, list):
+            candidate_tokens = [str(item).strip() for item in raw_args if str(item).strip()]
+        elif isinstance(raw_args, str) and raw_args.strip():
+            candidate_tokens = parse_command_tokens(raw_args)
+        else:
+            candidate_tokens = []
+        if not candidate_tokens and not script:
+            candidate_tokens = parse_command_tokens(payload.get("command"))
+
+    for key, value in _extract_option_value_pairs(candidate_tokens):
+        if not _is_output_like_flag(key):
+            continue
+        if not _looks_like_declared_output_path(value):
+            continue
+        out.append(str(value).strip())
+
+    return _merge_unique_args([], out)
+
+
+def _collect_declared_output_artifacts(
+    payload: dict,
+    workdir: str,
+    *,
+    declared_paths: Optional[List[str]] = None,
+) -> Tuple[List[dict], List[str]]:
     artifacts: List[dict] = []
     missing: List[str] = []
-    for raw_item in outputs:
-        rel_path = str(raw_item or "").strip()
-        if not rel_path:
-            continue
+    output_paths = list(declared_paths) if isinstance(declared_paths, list) else _collect_declared_output_paths(payload)
+    for rel_path in output_paths:
         absolute_path = resolve_path_with_workdir(rel_path, workdir)
         exists = bool(absolute_path) and os.path.exists(absolute_path)
         item = {
@@ -1306,6 +2648,47 @@ def _collect_expected_output_artifacts(payload: dict, workdir: str) -> Tuple[Lis
             missing.append(rel_path)
         artifacts.append(item)
     return artifacts, missing
+
+
+def _collect_csv_artifact_quality_failures(
+    artifacts: List[dict],
+    *,
+    context: Optional[dict] = None,
+) -> List[str]:
+    strict = (context or {}).get("enforce_csv_artifact_quality")
+    if strict is None:
+        strict = True
+    if not bool(strict):
+        return []
+
+    failures: List[str] = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        rel_path = str(item.get("path") or "").strip()
+        abs_path = str(item.get("absolute_path") or "").strip()
+        if not rel_path or not abs_path:
+            continue
+        if not abs_path.lower().endswith('.csv'):
+            continue
+        if item.get("exists") is False or not os.path.exists(abs_path):
+            continue
+        stats = load_csv_quality_stats(abs_path)
+        item["csv_quality"] = stats
+        rows_total = int(stats.get("rows_total") or 0)
+        numeric_rows = int(stats.get("numeric_rows") or 0)
+        placeholder_ratio = float(stats.get("placeholder_ratio") or 0.0)
+        root_issues: List[str] = []
+        if rows_total <= 0:
+            root_issues.append("rows_insufficient")
+        if numeric_rows <= 0:
+            root_issues.append("numeric_rows_insufficient")
+        if rows_total > 0 and placeholder_ratio >= 1.0:
+            root_issues.append("placeholder_ratio_high")
+        if root_issues:
+            slim_stats = {"issues": root_issues}
+            failures.append(build_csv_quality_failure_text(rel_path, slim_stats))
+    return failures
 
 
 def _build_shell_failure_detail(*, stdout: str, stderr: str, returncode: object) -> str:
@@ -1398,6 +2781,14 @@ def execute_shell_command(
     # 避免“权限被拒绝但仍写入 _auto_python_c_*.py”的副作用。
     workdir = str(payload.get("workdir") or "").strip() or os.getcwd()
     payload["workdir"] = workdir
+    explicit_expected_outputs: List[str] = []
+    raw_expected_outputs = payload.get("expected_outputs")
+    if isinstance(raw_expected_outputs, list):
+        for item in raw_expected_outputs:
+            text_item = str(item or "").strip()
+            if text_item:
+                explicit_expected_outputs.append(text_item)
+    original_declared_output_paths = _collect_declared_output_paths(payload)
     if not has_exec_permission(workdir):
         raise ValueError(ERROR_MESSAGE_PERMISSION_DENIED)
 
@@ -1459,6 +2850,8 @@ def execute_shell_command(
         retry_url = ""
         retry_stdin_len = 0
         retry_trigger = ""
+        retry_meta: Dict[str, object] = {}
+        retry_materialized_input_path = ""
 
         retry_reason = _extract_missing_url_failure_reason(result)
         if retry_reason:
@@ -1487,6 +2880,27 @@ def execute_shell_command(
                 if isinstance(retry_payload, dict):
                     retry_trigger = "missing_input_data"
 
+
+        if not isinstance(retry_payload, dict):
+            retry_payload, retry_materialized_input_path = _build_retry_payload_with_materialized_context_file(
+                payload=payload,
+                result=result,
+                context=ctx,
+                workdir=workdir,
+            )
+            if isinstance(retry_payload, dict):
+                retry_trigger = "missing_input_file"
+                retry_reason = "missing_input_file"
+        if not isinstance(retry_payload, dict):
+            retry_payload, retry_meta = _build_retry_payload_with_csv_alias_mapping(
+                payload=payload,
+                result=result,
+                workdir=workdir,
+            )
+            if isinstance(retry_payload, dict):
+                retry_trigger = "missing_required_columns"
+                retry_reason = "missing_required_columns"
+
         if isinstance(retry_payload, dict):
             retry_result, retry_error = run_shell_command(retry_payload)
             if not retry_error and isinstance(retry_result, dict) and bool(retry_result.get("ok")):
@@ -1496,11 +2910,14 @@ def execute_shell_command(
                     "reason": retry_reason or retry_trigger or "auto_retry",
                     "fallback_url": retry_url,
                     "stdin_chars": int(retry_stdin_len or 0),
+                    "materialized_input_path": retry_materialized_input_path,
                     "initial_returncode": result.get("returncode"),
                     "initial_stdout": str(result.get("stdout") or ""),
                     "initial_stderr": str(result.get("stderr") or ""),
                     "retry_command": retry_payload.get("command"),
                 }
+                if retry_meta:
+                    auto_retry_payload.update(dict(retry_meta))
                 if retry_stdin_len > 0:
                     auto_retry_payload["retry_stdin_attached"] = True
                 merged_result["auto_retry"] = auto_retry_payload
@@ -1548,6 +2965,24 @@ def execute_shell_command(
                 )
             )
 
+        # 需要 API Key：归类为可换源的 source failure，避免在同一脚本上反复重试。
+        if any(
+            marker in combined_lower
+            for marker in (
+                "missing_access_key",
+                "api access key",
+                "api key",
+                "access key",
+                "requires an api key",
+            )
+        ):
+            raise ValueError(
+                format_task_error(
+                    code="missing_api_key",
+                    message=f"{ERROR_MESSAGE_COMMAND_FAILED}: 外部源需要 API Key（{detail or 'missing_access_key'}）",
+                )
+            )
+
         # 参数契约错配（脚本定义与命令传参不一致）：常见于位置参数/命名参数混用。
         if (
             re.search(r"invalid isoformat string:\s*['\"]--[a-z0-9_-]+", combined, re.IGNORECASE)
@@ -1558,6 +2993,23 @@ def execute_shell_command(
                 format_task_error(
                     code="script_arg_contract_mismatch",
                     message=f"{ERROR_MESSAGE_COMMAND_FAILED}: 脚本参数契约不匹配（{detail or '请检查脚本入参与命令是否一致'}）",
+                )
+            )
+
+        if any(
+            marker in combined_lower
+            for marker in (
+                "未解析出任何价格数据",
+                "未解析到任何价格数据",
+                "no data parsed",
+                "no price data parsed",
+                "no structured data extracted",
+            )
+        ):
+            raise ValueError(
+                format_task_error(
+                    code="no_structured_data_extracted",
+                    message=f"{ERROR_MESSAGE_COMMAND_FAILED}: 未从当前样本中解析出可用结构化数据（{detail or 'no structured data extracted'}）",
                 )
             )
 
@@ -1587,7 +3039,15 @@ def execute_shell_command(
             ctx[emit_as] = parsed_obj
             result["emitted_context_key"] = emit_as
 
-    artifacts, missing_outputs = _collect_expected_output_artifacts(payload, workdir)
+    final_declared_output_paths = _collect_declared_output_paths(payload)
+    original_declared_set = {str(item) for item in original_declared_output_paths}
+    stable_declared_outputs = [item for item in final_declared_output_paths if item in original_declared_set]
+    declared_output_paths = _merge_unique_args(explicit_expected_outputs, stable_declared_outputs)
+    artifacts, missing_outputs = _collect_declared_output_artifacts(
+        payload,
+        workdir,
+        declared_paths=declared_output_paths,
+    )
     if artifacts:
         result["artifacts"] = artifacts
     if missing_outputs:
@@ -1596,6 +3056,17 @@ def execute_shell_command(
                 code="missing_expected_artifact",
                 message=(
                     f"{ERROR_MESSAGE_COMMAND_FAILED}: 缺少预期产物（{', '.join(missing_outputs)}）"
+                ),
+            )
+        )
+
+    csv_quality_failures = _collect_csv_artifact_quality_failures(artifacts, context=ctx)
+    if csv_quality_failures:
+        raise ValueError(
+            format_task_error(
+                code="csv_artifact_quality_failed",
+                message=(
+                    f"{ERROR_MESSAGE_COMMAND_FAILED}: CSV 产物质量未通过（{' | '.join(csv_quality_failures)}）"
                 ),
             )
         )

@@ -1,0 +1,12 @@
+INFO:     Started server process [31600]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8125 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58959 - "POST /api/agent/command/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65355 - "POST /api/agent/command/resume/stream HTTP/1.1" 200 OK
+[agent.react.action_gen.error] task_id=1 run_id=1 step_order=5 attempt=0 kind=transient elapsed_ms=45032 error=LLM call timeout after 45s
+[agent.react.step_failed] task_id=1 run_id=1 step_id=9 step_order=9 action_type=file_write code=step_failed non_retriable=False budget_exceeded=False error=file_write 拒绝写入空 CSV：请先完成数据抓取/换算后再写入结果文件。
+[agent.react.action_gen.error] task_id=1 run_id=1 step_order=9 attempt=0 kind=transient elapsed_ms=45031 error=LLM call timeout after 45s
+[agent.react.step_failed] task_id=1 run_id=1 step_id=13 step_order=12 action_type=shell_command code=script_arg_contract_mismatch non_retriable=False budget_exceeded=False error=[code=script_arg_contract_mismatch] 命令执行失败: 脚本参数契约不匹配（parse_gold_prices.py: error: unrecognized arguments: --input backend/.agent/workspace/web_fetch_1.html --output data/gold_price_last_3_months_cny_per_g.csv）
+[agent.react.action_gen.error] task_id=1 run_id=1 step_order=13 attempt=0 kind=transient elapsed_ms=45094 error=LLM call timeout after 45s
+[agent.react.step_failed] task_id=1 run_id=1 step_id=18 step_order=16 action_type=shell_command code=script_arg_contract_mismatch non_retriable=False budget_exceeded=False error=[code=script_arg_contract_mismatch] 命令执行失败: 脚本参数契约不匹配（parse_gold_prices.py: error: unrecognized arguments: --in backend/.agent/workspace/gold_source_primary.html --out data/gold_price_last_3_months_cny_per_g.csv）

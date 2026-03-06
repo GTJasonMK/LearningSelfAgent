@@ -21,6 +21,7 @@ from backend.src.agent.runner.pending_planning_wait_runner import (
     PendingPlanningWaitConfig,
     iter_pending_planning_wait_events,
 )
+from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.agent.runner.run_context_knowledge import apply_knowledge_identity_to_run_ctx
 from backend.src.agent.runner.stream_entry_common import (
     iter_finalization_events,
@@ -469,7 +470,7 @@ def stream_agent_think_command(payload: AgentCommandStreamRequest):
                 str(think_plan_result.winning_planner_id or ""),
             )
 
-            yield lifecycle.emit(sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": plan_items}))
+            yield lifecycle.emit(sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_items))
 
             # 持久化 agent 运行态
             base_state = build_base_agent_state(

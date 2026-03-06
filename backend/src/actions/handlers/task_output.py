@@ -1,9 +1,9 @@
 import os
 import re
-from datetime import date
 from typing import Dict, List, Optional, Tuple
 
 from backend.src.actions.handlers.common_utils import load_json_object
+from backend.src.common.csv_artifact_quality import load_csv_quality_stats
 from backend.src.common.serializers import task_output_from_row
 from backend.src.common.utils import dedupe_keep_order
 from backend.src.constants import (
@@ -266,119 +266,6 @@ def _merge_content_with_evidence(
     return f"{current}\n\n{fallback}".strip()
 
 
-def _parse_numeric(text: str) -> Optional[float]:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    raw = raw.replace(",", "")
-    raw = raw.replace("，", "")
-    raw = raw.replace("元/克", "")
-    raw = raw.replace("元", "")
-    if raw.endswith("%"):
-        raw = raw[:-1]
-    if not raw:
-        return None
-    try:
-        return float(raw)
-    except Exception:
-        return None
-
-
-def _parse_iso_date(text: str) -> Optional[date]:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    normalized = raw.replace("/", "-").replace(".", "-")
-    if not re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", normalized):
-        return None
-    parts = normalized.split("-")
-    try:
-        y = int(parts[0])
-        m = int(parts[1])
-        d = int(parts[2])
-        return date(y, m, d)
-    except Exception:
-        return None
-
-
-def _load_csv_quality_stats(path: str) -> Dict[str, object]:
-    rows_total = 0
-    numeric_rows = 0
-    placeholder_rows = 0
-    date_values: List[date] = []
-    placeholders = ("暂无", "n/a", "na", "none", "null", "无数据", "待补充", "tbd")
-
-    with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-        raw_lines = [str(line or "").strip() for line in handle.readlines()]
-
-    clean_lines = [line for line in raw_lines if line]
-    if not clean_lines:
-        return {
-            "rows_total": 0,
-            "numeric_rows": 0,
-            "placeholder_rows": 0,
-            "numeric_ratio": 0.0,
-            "placeholder_ratio": 0.0,
-            "date_span_days": 0,
-            "issues": ["csv_empty"],
-        }
-
-    # 允许第一行是表头
-    data_lines = clean_lines[1:] if clean_lines and ("日期" in clean_lines[0] or "date" in clean_lines[0].lower()) else clean_lines
-
-    for line in data_lines:
-        if not line:
-            continue
-        cells = [cell.strip() for cell in re.split(r"[,，]\s*", line) if str(cell).strip()]
-        if not cells:
-            continue
-        rows_total += 1
-
-        text_joined = " ".join(cells).lower()
-        if any(mark in text_joined for mark in placeholders):
-            placeholder_rows += 1
-
-        numeric_hit = False
-        for cell in cells[1:] if len(cells) > 1 else cells:
-            if _parse_numeric(cell) is not None:
-                numeric_hit = True
-                break
-        if numeric_hit:
-            numeric_rows += 1
-
-        date_candidate = _parse_iso_date(cells[0])
-        if date_candidate is not None:
-            date_values.append(date_candidate)
-
-    numeric_ratio = float(numeric_rows) / float(rows_total) if rows_total > 0 else 0.0
-    placeholder_ratio = float(placeholder_rows) / float(rows_total) if rows_total > 0 else 0.0
-    span_days = 0
-    if len(date_values) >= 2:
-        span_days = abs((max(date_values) - min(date_values)).days)
-
-    issues: List[str] = []
-    if rows_total < int(AGENT_ARTIFACT_CSV_MIN_ROWS):
-        issues.append("rows_insufficient")
-    if numeric_rows < int(AGENT_ARTIFACT_CSV_MIN_NUMERIC_ROWS):
-        issues.append("numeric_rows_insufficient")
-    if numeric_ratio < float(AGENT_ARTIFACT_CSV_MIN_NUMERIC_RATIO):
-        issues.append("numeric_ratio_low")
-    if placeholder_ratio > float(AGENT_ARTIFACT_CSV_MAX_PLACEHOLDER_RATIO):
-        issues.append("placeholder_ratio_high")
-    if span_days < int(AGENT_ARTIFACT_CSV_MIN_DATE_SPAN_DAYS):
-        issues.append("date_span_too_short")
-
-    return {
-        "rows_total": rows_total,
-        "numeric_rows": numeric_rows,
-        "placeholder_rows": placeholder_rows,
-        "numeric_ratio": round(numeric_ratio, 4),
-        "placeholder_ratio": round(placeholder_ratio, 4),
-        "date_span_days": span_days,
-        "issues": issues,
-    }
-
-
 def _enforce_csv_artifact_quality(
     *,
     task_id: int,
@@ -431,7 +318,7 @@ def _enforce_csv_artifact_quality(
             failed_reasons.append(f"csv_missing:{raw_path}")
             continue
         try:
-            stats = _load_csv_quality_stats(norm)
+            stats = load_csv_quality_stats(norm)
         except Exception as exc:
             failed_reasons.append(f"csv_unreadable:{raw_path}:{exc}")
             continue

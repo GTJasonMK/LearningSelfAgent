@@ -34,8 +34,7 @@ where py >nul 2>nul
 if %errorlevel%==0 (
   echo Using Python Launcher: py -3
   py -3 "%~dp0reset_agent_data.py"
-  pause
-  goto :eof
+  goto :after_run
 )
 
 rem Last fallback: rely on PATH
@@ -44,4 +43,6 @@ echo Using Python (PATH): %PY_EXE%
 
 :run
 "%PY_EXE%" "%~dp0reset_agent_data.py"
-pause
+
+:after_run
+if /i "%RESET_AGENT_DATA_PAUSE%"=="1" pause

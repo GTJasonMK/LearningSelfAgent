@@ -48,6 +48,34 @@ class TestPostActionVerifier(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn("[code=missing_script_parsed_output]", str(error or ""))
 
+    def test_http_request_empty_content_is_now_hard_failure(self):
+        from backend.src.actions.post_action_verifier import verify_and_normalize_action_result
+
+        result, error = verify_and_normalize_action_result(
+            action_type="http_request",
+            payload={"url": "https://example.com/data", "method": "GET"},
+            result={"status_code": 200, "content": ""},
+            error=None,
+            context={},
+        )
+        self.assertIsNone(result)
+        self.assertIn("[code=http_response_empty]", str(error or ""))
+
+    def test_http_request_can_explicitly_allow_empty_content(self):
+        from backend.src.actions.post_action_verifier import verify_and_normalize_action_result
+
+        result, error = verify_and_normalize_action_result(
+            action_type="http_request",
+            payload={"url": "https://example.com/ping", "method": "HEAD", "allow_empty_content": True},
+            result={"status_code": 200, "content": ""},
+            error=None,
+            context={},
+        )
+        self.assertIsNone(error)
+        self.assertTrue(isinstance(result, dict))
+        warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+        self.assertIn("http_request.content is empty", warnings)
+
 
 if __name__ == "__main__":
     unittest.main()

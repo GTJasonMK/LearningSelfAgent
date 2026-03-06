@@ -1,5 +1,7 @@
 import unittest
 from unittest.mock import patch
+import tempfile
+import os
 
 
 class TestShellCommandDependencyMissingErrorCode(unittest.TestCase):
@@ -113,6 +115,34 @@ class TestShellCommandDependencyMissingErrorCode(unittest.TestCase):
         err = str(ctx.exception)
         self.assertEqual(extract_task_error_code(err), "script_arg_contract_mismatch")
 
+    def test_no_structured_data_extracted_is_coded(self):
+        from backend.src.actions.handlers.shell_command import execute_shell_command
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        fake_result = {
+            "ok": False,
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "ERROR: 未解析出任何价格数据",
+        }
+
+        with patch("backend.src.actions.handlers.shell_command.run_shell_command", return_value=(fake_result, None)):
+            with self.assertRaises(ValueError) as ctx:
+                execute_shell_command(
+                    task_id=1,
+                    run_id=1,
+                    step_row={"id": 5},
+                    payload={"command": ["python", "x.py"], "workdir": ".", "timeout_ms": 1000},
+                    context={
+                        "enforce_shell_script_dependency": False,
+                        "disallow_complex_python_c": False,
+                        "auto_rewrite_complex_python_c": False,
+                    },
+                )
+
+        err = str(ctx.exception)
+        self.assertEqual(extract_task_error_code(err), "no_structured_data_extracted")
+
     def test_shell_operator_chain_is_rejected_with_code(self):
         from backend.src.actions.handlers.shell_command import execute_shell_command
         from backend.src.common.task_error_codes import extract_task_error_code
@@ -137,6 +167,33 @@ class TestShellCommandDependencyMissingErrorCode(unittest.TestCase):
         err = str(ctx.exception)
         self.assertEqual(extract_task_error_code(err), "shell_operators_not_supported")
         self.assertIn("&&", err)
+
+    def test_script_missing_is_coded(self):
+        from backend.src.actions.handlers.shell_command import execute_shell_command
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_script = os.path.join(tmp, "not_exists.py")
+            with self.assertRaises(ValueError) as ctx:
+                execute_shell_command(
+                    task_id=1,
+                    run_id=1,
+                    step_row={"id": 5},
+                    payload={
+                        "command": ["python", missing_script],
+                        "workdir": tmp,
+                        "timeout_ms": 1000,
+                    },
+                    context={
+                        "enforce_shell_script_dependency": True,
+                        "disallow_complex_python_c": False,
+                        "auto_rewrite_complex_python_c": False,
+                    },
+                )
+
+        err = str(ctx.exception)
+        self.assertEqual(extract_task_error_code(err), "script_missing")
+        self.assertIn("脚本不存在", err)
 
 
 if __name__ == "__main__":

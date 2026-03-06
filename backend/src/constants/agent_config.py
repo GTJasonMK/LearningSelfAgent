@@ -239,7 +239,7 @@ AUTO_SKILL_SUFFIX: Final = "技能"
 
 # 内置工具
 TOOL_NAME_WEB_FETCH: Final = "web_fetch"
-TOOL_DESCRIPTION_WEB_FETCH: Final = "抓取指定 URL 内容（curl -fsSL + UA，HTTP>=400 视为失败，带重试）"
+TOOL_DESCRIPTION_WEB_FETCH: Final = "抓取网页/接口内容（支持 URL 或关键词检索，HTTP>=400 视为失败，带重试）"
 TOOL_VERSION_WEB_FETCH: Final = "0.1.0"
 TOOL_WEB_FETCH_TIMEOUT_MS: Final = 15000
 # web_fetch 拦截页/限流页判定：
@@ -271,6 +271,23 @@ AGENT_WEB_FETCH_FALLBACK_MAX_CANDIDATES: Final = _read_int_env(
 )
 WEB_FETCH_FALLBACK_URL_TEMPLATES_DEFAULT: Final[Tuple[str, ...]] = (
     "https://r.jina.ai/{url}",
+)
+AGENT_WEB_FETCH_SEARCH_URL_TEMPLATES_ENV: Final = "AGENT_WEB_FETCH_SEARCH_URL_TEMPLATES_JSON"
+WEB_FETCH_SEARCH_URL_TEMPLATES_DEFAULT: Final[Tuple[str, ...]] = (
+    "https://www.so.com/s?q={query}",
+    "https://www.bing.com/search?q={query}",
+    "https://duckduckgo.com/html/?q={query}",
+    "https://www.baidu.com/s?wd={query}",
+)
+AGENT_WEB_FETCH_SEARCH_MAX_RESULTS: Final = _read_int_env(
+    "AGENT_WEB_FETCH_SEARCH_MAX_RESULTS",
+    8,
+    min_value=1,
+)
+AGENT_WEB_FETCH_SEARCH_MAX_PAGES: Final = _read_int_env(
+    "AGENT_WEB_FETCH_SEARCH_MAX_PAGES",
+    5,
+    min_value=1,
 )
 
 # curl:

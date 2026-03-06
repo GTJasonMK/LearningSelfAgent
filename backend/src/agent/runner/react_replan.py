@@ -10,6 +10,7 @@ from backend.src.agent.runner.feedback import (
     canonicalized_feedback_meta,
     is_task_feedback_step_title,
 )
+from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.common.utils import now_iso
 from backend.src.services.llm.llm_client import sse_json
 from backend.src.services.tasks.task_queries import update_task_run
@@ -39,6 +40,7 @@ def run_replan_and_merge(
     graph_hint: str,
     plan_struct: PlanStructure,
     agent_state: dict,
+    context: Optional[dict] = None,
     observations: List[str],
     done_count: int,
     error: str,
@@ -96,6 +98,7 @@ def run_replan_and_merge(
             done_steps=done_steps,
             error=str(error or ""),
             observations=replan_observations,
+            context=context if isinstance(context, dict) else None,
             failure_signatures=(
                 agent_state.get("failure_signatures")
                 if isinstance(agent_state, dict) and isinstance(agent_state.get("failure_signatures"), dict)
@@ -195,7 +198,7 @@ def run_replan_and_merge(
             data={"error": str(exc)},
             level="warning",
         )
-    yield sse_json({"type": "plan", "task_id": task_id, "run_id": run_id, "items": merged_plan.get_items_payload()})
+    yield sse_plan(task_id=task_id, run_id=run_id, plan_items=merged_plan.get_items_payload())
     return ReplanMergeResult(
         plan_struct=merged_plan,
         done_count=done_count,

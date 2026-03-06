@@ -52,13 +52,26 @@ class TestReactLoopActionNormalization(unittest.TestCase):
             run_id = int(cursor.lastrowid)
         return task_id, run_id
 
-    def _run_react_loop_once(self, *, plan_title: str, allow: list[str], llm_actions: list[dict]):
+    def _run_react_loop_once(
+        self,
+        *,
+        plan_title: str,
+        allow: list[str],
+        llm_actions: list[dict],
+        prepare_files: list[str] | None = None,
+    ):
         from backend.src.agent.core.plan_structure import PlanStructure
         from backend.src.agent.runner.react_loop import run_react_loop
         from backend.src.constants import RUN_STATUS_DONE
 
         task_id, run_id = self._create_task_and_run()
-        workdir = os.getcwd()
+        workdir = self._tmp.name
+        if isinstance(prepare_files, list):
+            for rel_path in prepare_files:
+                full_path = Path(workdir) / str(rel_path)
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                if not full_path.exists():
+                    full_path.write_text("print('ok')\n", encoding="utf-8")
 
         plan_titles = [plan_title]
         plan_items = [{"id": 1, "brief": "t", "status": "pending"}]
@@ -186,6 +199,7 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         detail, workdir = self._run_react_loop_once(
             plan_title="shell_command:运行脚本",
             allow=["shell_command"],
+            prepare_files=["backend/.agent/workspace/parse_gold_price.py"],
             llm_actions=[
                 {
                     "action": {
@@ -220,6 +234,7 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         detail, workdir = self._run_react_loop_once(
             plan_title="script_run:backend/.agent/workspace/validate_gold_csv.py",
             allow=["shell_command"],
+            prepare_files=["backend/.agent/workspace/validate_gold_csv.py"],
             llm_actions=[
                 {
                     "action": {
@@ -238,6 +253,32 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         self.assertEqual(obj["payload"]["args"], ["--csv", "data/gold.csv"])
         self.assertEqual(obj["payload"]["expected_outputs"], ["data/gold.csv"])
         self.assertEqual(obj["payload"]["workdir"], workdir)
+
+    def test_shell_command_script_python_token_in_script_field_is_recovered_from_args(self):
+        detail, _workdir = self._run_react_loop_once(
+            plan_title="shell_command:运行脚本",
+            allow=["shell_command"],
+            prepare_files=["backend/.agent/workspace/build_gold_csv.py"],
+            llm_actions=[
+                {
+                    "action": {
+                        "type": "shell_command",
+                        "payload": {
+                            "script": "python",
+                            "args": [
+                                "backend/.agent/workspace/build_gold_csv.py",
+                                "--help",
+                            ],
+                        },
+                    }
+                }
+            ],
+        )
+        obj = json.loads(detail)
+        self.assertEqual(obj["type"], "shell_command")
+        self.assertEqual(obj["payload"]["script"], "backend/.agent/workspace/build_gold_csv.py")
+        self.assertEqual(obj["payload"]["args"], ["--help"])
+        self.assertNotIn("command", obj["payload"])
 
     def test_file_write_missing_path_is_coerced_from_title_before_validation(self):
         detail, _ = self._run_react_loop_once(
@@ -277,6 +318,60 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         self.assertEqual(obj["type"], "file_write")
         self.assertEqual(obj["payload"]["path"], "test/out.txt")
         self.assertEqual(obj["payload"]["content"], "hello")
+
+    def test_file_write_rejects_title_and_payload_path_conflict(self):
+        from backend.src.agent.runner.react_helpers import validate_and_normalize_action_text
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        _obj, _action_type, _payload, err = validate_and_normalize_action_text(
+            action_text=json.dumps(
+                {
+                    "action": {
+                        "type": "file_write",
+                        "payload": {
+                            "path": "backend/.agent/workspace/gold_price_fetcher.py",
+                            "content": "print('ok')",
+                        },
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            step_title="file_write:artifacts/gold_price_last_3_months_cny_per_g.csv 写入文件",
+            workdir=self._tmp.name,
+        )
+
+        self.assertEqual(extract_task_error_code(str(err)), "file_write_path_conflict")
+
+    def test_shell_command_script_run_forces_contract_discovery_even_when_model_sets_false(self):
+        from backend.src.agent.runner.react_helpers import validate_and_normalize_action_text
+
+        script_path = Path(self._tmp.name) / "backend/.agent/workspace/build_gold_csv.py"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text("print('ok')\n", encoding="utf-8")
+
+        action_obj, action_type, payload_obj, err = validate_and_normalize_action_text(
+            action_text=json.dumps(
+                {
+                    "action": {
+                        "type": "shell_command",
+                        "payload": {
+                            "script": "backend/.agent/workspace/build_gold_csv.py",
+                            "args": [],
+                            "discover_required_args": False,
+                        },
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            step_title="shell_command:运行脚本",
+            workdir=self._tmp.name,
+        )
+
+        self.assertIsNone(err)
+        self.assertEqual(action_type, "shell_command")
+        self.assertIsInstance(action_obj, dict)
+        self.assertIsInstance(payload_obj, dict)
+        self.assertTrue(bool(payload_obj.get("discover_required_args")))
 
     def test_file_read_alias_read_file_missing_path_is_coerced_from_title_before_validation(self):
         """
@@ -593,6 +688,107 @@ class TestReactLoopActionNormalization(unittest.TestCase):
         self.assertEqual(result.run_status, RUN_STATUS_WAITING)
         self.assertTrue(any("请选择口径" in c for c in chunks))
         self.assertTrue(any("knowledge_sufficiency" in c for c in chunks))
+
+
+    def test_tool_call_runtime_contract_blocks_missing_script_before_execution(self):
+        from backend.src.agent.runner.react_helpers import validate_runtime_action_contracts
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        task_id, run_id = self._create_task_and_run()
+        error = validate_runtime_action_contracts(
+            task_id=task_id,
+            run_id=run_id,
+            step_title="tool_call:创建工具 gold_price_fetcher",
+            action_type="tool_call",
+            payload_obj={
+                "tool_name": "gold_price_fetcher",
+                "input": "self_test",
+                "output": "",
+                "tool_metadata": {
+                    "exec": {
+                        "command": "python backend/.agent/workspace/gold_price_fetcher.py {input}",
+                        "workdir": self._tmp.name,
+                        "timeout_ms": 5000,
+                    }
+                },
+            },
+            workdir=self._tmp.name,
+        )
+
+        self.assertEqual(extract_task_error_code(str(error)), "script_missing")
+        self.assertIn("请先执行 file_write/file_append", str(error))
+
+    def test_tool_call_runtime_contract_blocks_unbound_existing_script_before_execution(self):
+        from backend.src.agent.runner.react_helpers import validate_runtime_action_contracts
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        task_id, run_id = self._create_task_and_run()
+        script_path = Path(self._tmp.name) / "backend/.agent/workspace/gold_price_fetcher.py"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text("print('ok')\n", encoding="utf-8")
+
+        rows = [
+            {
+                "id": 1,
+                "status": "done",
+                "detail": json.dumps(
+                    {"type": "file_write", "payload": {"path": "backend/.agent/workspace/other.py"}},
+                    ensure_ascii=False,
+                ),
+                "result": json.dumps(
+                    {"path": str((Path(self._tmp.name) / "backend/.agent/workspace/other.py").resolve())},
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+
+        with patch(
+            "backend.src.actions.handlers.tool_call.list_task_steps_for_run",
+            return_value=rows,
+        ):
+            error = validate_runtime_action_contracts(
+                task_id=task_id,
+                run_id=run_id,
+                step_title="tool_call:执行工具 gold_price_fetcher",
+                action_type="tool_call",
+                payload_obj={
+                    "tool_name": "gold_price_fetcher",
+                    "input": "self_test",
+                    "output": "",
+                    "tool_metadata": {
+                        "exec": {
+                            "command": "python backend/.agent/workspace/gold_price_fetcher.py {input}",
+                            "workdir": self._tmp.name,
+                            "timeout_ms": 5000,
+                        }
+                    },
+                },
+                workdir=self._tmp.name,
+            )
+
+        self.assertEqual(extract_task_error_code(str(error)), "script_dependency_unbound")
+        self.assertIn("当前 run 未发现对应的 file_write/file_append", str(error))
+
+    def test_tool_call_runtime_contract_flags_missing_exec_before_execution(self):
+        from backend.src.agent.runner.react_helpers import validate_runtime_action_contracts
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        task_id, run_id = self._create_task_and_run()
+        error = validate_runtime_action_contracts(
+            task_id=task_id,
+            run_id=run_id,
+            step_title="tool_call:创建工具 gold_price_fetcher",
+            action_type="tool_call",
+            payload_obj={
+                "tool_name": "gold_price_fetcher",
+                "input": "self_test",
+                "output": "",
+            },
+            workdir=self._tmp.name,
+        )
+
+        self.assertEqual(extract_task_error_code(str(error)), "missing_tool_exec_spec")
+
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import os
 import json
 import re
 from typing import Callable, Dict, List, Optional, Tuple
@@ -7,15 +8,19 @@ from backend.src.actions.registry import (
     action_types_line,
     normalize_action_type,
 )
-from backend.src.actions.handlers.common_utils import parse_command_tokens
+from backend.src.actions.handlers.common_utils import parse_command_tokens, resolve_path_with_workdir
 from backend.src.agent.support import (
     _extract_json_object,
     coerce_file_write_payload_path_from_title,
+    extract_file_write_target_path,
+    looks_like_file_path,
     _validate_action,
 )
 from backend.src.agent.core.context_budget import apply_context_budget_pipeline
+from backend.src.agent.runner.goal_progress import summarize_task_grounding_for_prompt
 from backend.src.common.errors import AppError
-from backend.src.common.utils import now_iso
+from backend.src.common.task_error_codes import format_task_error
+from backend.src.common.utils import coerce_int, now_iso
 from backend.src.constants import (
     ACTION_TYPE_FILE_APPEND,
     ACTION_TYPE_FILE_DELETE,
@@ -51,6 +56,17 @@ def _extract_prefixed_value(title: str, prefix: str) -> str:
         value = value[1:-1].strip()
     return value
 
+
+
+def _truncate_sample_text_for_prompt(text: str, max_chars: int = 2200) -> str:
+    raw = str(text or "").strip()
+    if not raw or len(raw) <= max_chars:
+        return raw
+    head = max(320, int((max_chars - 8) / 2))
+    tail = head
+    if head + tail >= len(raw):
+        return raw
+    return f"{raw[:head]}\n...\n{raw[-tail:]}"
 
 def normalize_allow_actions(raw_actions: object) -> list[str]:
     """
@@ -130,6 +146,11 @@ def _looks_like_url(value: str) -> bool:
 def _looks_like_python_script_token(value: str) -> bool:
     token = str(value or "").strip().lower()
     return bool(token) and token.endswith(".py")
+
+
+def _is_python_executable_token(value: str) -> bool:
+    token = os.path.splitext(os.path.basename(str(value or "").strip()))[0].lower()
+    return token in {"python", "python3", "py"}
 
 
 def _extract_script_run_from_command(command: object) -> Tuple[str, List[str]]:
@@ -226,6 +247,8 @@ def call_llm_for_text(
     model: str,
     parameters: dict,
     variables: Optional[dict] = None,
+    retry_max_attempts: Optional[int] = None,
+    hard_timeout_seconds: Optional[int] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     统一 LLM 调用 + 错误收敛，避免在 react_loop 里重复 try/except。
@@ -238,6 +261,8 @@ def call_llm_for_text(
         model=model,
         parameters=parameters,
         variables=variables,
+        retry_max_attempts=retry_max_attempts,
+        hard_timeout_seconds=hard_timeout_seconds,
     )
     return text, err
 
@@ -251,21 +276,26 @@ def call_llm_for_text_with_id(
     model: str,
     parameters: dict,
     variables: Optional[dict] = None,
+    retry_max_attempts: Optional[int] = None,
+    hard_timeout_seconds: Optional[int] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """
     call_llm_for_text 的扩展版本：额外返回 llm_records.id，便于链路调试与溯源。
     """
     try:
-        resp = llm_call(
-            {
-                "prompt": prompt,
-                "task_id": int(task_id),
-                "run_id": int(run_id),
-                "model": model,
-                "parameters": parameters,
-                "variables": variables or {},
-            }
-        )
+        payload = {
+            "prompt": prompt,
+            "task_id": int(task_id),
+            "run_id": int(run_id),
+            "model": model,
+            "parameters": parameters,
+            "variables": variables or {},
+        }
+        if retry_max_attempts is not None:
+            payload["retry_max_attempts"] = int(retry_max_attempts)
+        if hard_timeout_seconds is not None:
+            payload["hard_timeout_seconds"] = int(hard_timeout_seconds)
+        resp = llm_call(payload)
         return extract_llm_call_text_and_id(resp)
     except AppError as exc:
         return None, str(exc.message or "").strip() or ERROR_MESSAGE_LLM_CALL_FAILED, None
@@ -287,10 +317,16 @@ def build_react_step_prompt(
     tools: str,
     skills: str,
     memories: str,
+    latest_parse_input_text: str = "",
+    latest_external_url: str = "",
     now_utc: Optional[str] = None,
     disallow_plan_patch: bool = False,
     capability_hint: str = "",
+    execution_hint: str = "",
     budget_meta_sink: Optional[dict] = None,
+    recent_step_feedback: str = "",
+    retry_requirements: str = "",
+    failure_guidance: str = "",
 ) -> str:
     """
     构建 ReAct step prompt（统一模板与运行时 action 契约注入）。
@@ -337,7 +373,114 @@ def build_react_step_prompt(
     capability_text = str(capability_hint or "").strip()
     if capability_text:
         prompt += f"\n额外约束：本步骤能力标签为「{capability_text}」，优先选择与该能力匹配的 action。\n"
+    execution_text = str(execution_hint or "").strip()
+    if execution_text:
+        prompt += f"\n执行修复约束：\n{execution_text}\n"
+    feedback_text = str(recent_step_feedback or "").strip()
+    if feedback_text:
+        prompt += f"\n最近步骤反馈（用于避免重复失败）：\n{feedback_text}\n"
+    retry_text = str(retry_requirements or "").strip()
+    if retry_text:
+        prompt += f"\n当前重试约束（下一轮必须满足）：\n{retry_text}\n"
+    failure_guidance_text = str(failure_guidance or "").strip()
+    if failure_guidance_text:
+        prompt += f"\n失败修复策略提示（保留自主选择空间）：\n{failure_guidance_text}\n"
+
+    task_grounding_text = summarize_task_grounding_for_prompt(message)
+    if task_grounding_text and task_grounding_text != "(无)":
+        prompt += f"\n原任务不可变约束：\n{task_grounding_text}\n"
+
+    file_write_target = str(extract_file_write_target_path(step_title) or "").strip()
+    if file_write_target and os.path.splitext(file_write_target)[1].lower() in {".py", ".js", ".ts", ".mjs", ".cjs", ".sh", ".ps1", ".bat", ".cmd", ".rb", ".php"}:
+        prompt += (
+            "\n脚本 file_write 额外约束：\n"
+            "- 只能写入基于最近真实观测可直接运行的真实脚本；禁止 skeleton/TODO/placeholder/sample source。\n"
+            "- 禁止写‘假设数据结构’‘需根据观测调整’这类占位解析逻辑。\n"
+            "- 若当前没有足够样本支撑脚本实现，优先通过 plan_patch 在前置步骤获取真实样本后再写脚本。\n"
+        )
+
+    allow_text = str(allowed_actions or "").lower()
+    title_text = str(step_title or "").lower()
+    sample_sensitive = any(
+        token in allow_text or title_text.startswith(f"{token}:")
+        for token in (ACTION_TYPE_FILE_WRITE, ACTION_TYPE_SHELL_COMMAND, ACTION_TYPE_JSON_PARSE, ACTION_TYPE_LLM_CALL)
+    )
+    latest_sample = str(latest_parse_input_text or "").strip()
+    latest_url = str(latest_external_url or "").strip()
+    if sample_sensitive and latest_sample:
+        prompt += (
+            "\n最近真实样本（自动注入，优先使用）：\n"
+            f"{_truncate_sample_text_for_prompt(latest_sample)}\n"
+            "样本使用约束：\n"
+            "- 当前动作若要写脚本、解析数据或生成中间结果，必须直接基于上述真实样本实现。\n"
+            "- 禁止输出‘假设数据结构’‘需根据观测调整’‘先尝试常见结构’这类占位逻辑。\n"
+            "- 若上述样本仍不足以支持当前动作，请不要编造；改为 plan_patch 增补更具体的抓取/读取/转换步骤。\n"
+        )
+        if latest_url:
+            prompt += f"- 最近样本来源：{latest_url}\n"
     return prompt
+
+
+def build_execution_constraints_hint(
+    *,
+    agent_state: Optional[Dict],
+    step_order: int,
+) -> str:
+    """
+    将 agent_state.execution_constraints 转换为 prompt 约束文本。
+
+    目标：
+    - 在“失败后重规划”场景持续施加修复约束，避免重复生成高耦合脚本；
+    - 约束带有 step 有效期，到期后自动失效。
+    """
+    if not isinstance(agent_state, dict):
+        return ""
+    constraints = agent_state.get("execution_constraints")
+    if not isinstance(constraints, dict):
+        return ""
+
+    current_step = coerce_int(step_order, default=0)
+    hints: List[str] = []
+
+    low_param_until = coerce_int(constraints.get("prefer_low_param_scripts_until_step"), default=0)
+    if low_param_until >= current_step > 0:
+        hints.append(
+            "- 若需要写脚本：优先低参数设计（必填参数 <= 2），避免生成需要大量手工参数映射的脚本。"
+        )
+
+    materialize_until = coerce_int(constraints.get("require_script_materialization_until_step"), default=0)
+    if materialize_until >= current_step > 0:
+        hints.append(
+            "- shell_command/tool_call 若引用本地脚本，必须先执行 file_write/file_append 落盘该脚本。"
+        )
+
+    exclusive_until = coerce_int(constraints.get("enforce_exclusive_input_args_until_step"), default=0)
+    if exclusive_until >= current_step > 0:
+        hints.append(
+            "- 若脚本参数存在互斥输入（如 --in-json/--in-csv），只能选择其一，禁止同时传入。"
+        )
+
+    compact_action_until = coerce_int(constraints.get("prefer_compact_action_prompt_until_step"), default=0)
+    if compact_action_until >= current_step > 0:
+        hints.append(
+            "- 当前阶段动作生成需极简：只输出单个 JSON，payload 仅保留必要字段，禁止解释和冗余内容。"
+        )
+
+    grounded_script_until = coerce_int(constraints.get("require_grounded_script_file_write_until_step"), default=0)
+    if grounded_script_until >= current_step > 0:
+        hints.append(
+            "- 若当前是脚本类 file_write：只能写入基于最近真实观测可直接运行的真实脚本；禁止 skeleton/TODO/placeholder/假设结构。若缺少样本，优先先获取样本或切换到更轻量路径。"
+        )
+
+    switch_action_path_until = coerce_int(constraints.get("prefer_action_path_switch_until_step"), default=0)
+    if switch_action_path_until >= current_step > 0:
+        hints.append(
+            "- 若同类动作连续超时，请优先通过 plan_patch 切换到更轻量路径（tool_call/shell_command）产出中间结果后再继续。"
+        )
+
+    if not hints:
+        return ""
+    return "\n".join(hints)
 
 
 def normalize_action_obj_for_execution(
@@ -401,17 +544,30 @@ def normalize_action_obj_for_execution(
             script_value = _extract_prefixed_value(step_title, "script_run")
         command_value = payload_obj.get("command")
         extracted_script, extracted_args = _extract_script_run_from_command(command_value)
-        if not script_value and extracted_script:
+
+        args_value = payload_obj.get("args")
+        normalized_args: List[str] = []
+        if isinstance(args_value, str) and args_value.strip():
+            normalized_args = parse_command_tokens(args_value)
+        elif isinstance(args_value, list):
+            normalized_args = [str(item) for item in args_value if str(item).strip()]
+
+        # 纠正模型常见错误：script 写成 python，可从 command/args 中回收真实脚本路径。
+        if extracted_script and (not script_value or _is_python_executable_token(script_value)):
             script_value = extracted_script
+        if script_value and _is_python_executable_token(script_value) and normalized_args:
+            first_arg = str(normalized_args[0] or "").strip()
+            if _looks_like_python_script_token(first_arg):
+                script_value = first_arg
+                normalized_args = [str(item) for item in normalized_args[1:] if str(item).strip()]
         if script_value:
+            if normalized_args and str(normalized_args[0] or "").strip() == script_value:
+                normalized_args = normalized_args[1:]
+            if extracted_args and not normalized_args:
+                normalized_args = list(extracted_args)
+
             payload_obj["script"] = script_value
-            args_value = payload_obj.get("args")
-            if isinstance(args_value, str) and args_value.strip():
-                payload_obj["args"] = parse_command_tokens(args_value)
-            elif not isinstance(args_value, list):
-                payload_obj["args"] = []
-            if extracted_args and isinstance(payload_obj.get("args"), list) and not payload_obj.get("args"):
-                payload_obj["args"] = list(extracted_args)
+            payload_obj["args"] = list(normalized_args)
 
             required_args = payload_obj.get("required_args")
             if isinstance(required_args, str) and required_args.strip():
@@ -419,7 +575,7 @@ def normalize_action_obj_for_execution(
             elif not isinstance(required_args, list):
                 payload_obj.pop("required_args", None)
 
-            payload_obj.setdefault("discover_required_args", True)
+            payload_obj["discover_required_args"] = True
             payload_obj.pop("command", None)
 
     if action_type == ACTION_TYPE_TASK_OUTPUT:
@@ -450,6 +606,24 @@ def normalize_action_obj_for_execution(
     if action_type == ACTION_TYPE_FILE_WRITE:
         payload_obj.setdefault("encoding", "utf-8")
         payload_obj = coerce_file_write_payload_path_from_title(step_title, payload_obj)
+
+        title_target = extract_file_write_target_path(step_title)
+        current_path = str(payload_obj.get("path") or "").strip()
+        if (
+            title_target
+            and current_path
+            and looks_like_file_path(title_target)
+            and looks_like_file_path(current_path)
+            and title_target != current_path
+        ):
+            return None, None, None, format_task_error(
+                code="file_write_path_conflict",
+                message=(
+                    "file_write.title 与 payload.path 冲突；"
+                    f"title={title_target}，payload.path={current_path}。"
+                    "请保持同一步只写一个目标文件，并确保 title 与 payload.path 一致。"
+                ),
+            )
 
     if action_type == ACTION_TYPE_JSON_PARSE:
         # 兼容：模型可能用 json/content/raw 字段而非 text。
@@ -561,7 +735,83 @@ def validate_and_normalize_action_text(
     if action_validate_error:
         return None, None, None, action_validate_error
 
+    # 运行前置契约校验：尽早拦截“shell_command 引用不存在脚本”，
+    # 让模型在同一步重生成为 file_write/shell_command 的正确顺序，而不是先执行失败再 replan。
+    if action_type == ACTION_TYPE_SHELL_COMMAND and isinstance(payload_obj, dict):
+        script_path = str(payload_obj.get("script") or "").strip()
+        if script_path:
+            resolved = resolve_path_with_workdir(script_path, workdir)
+            if resolved and not os.path.exists(resolved):
+                return (
+                    None,
+                    None,
+                    None,
+                    format_task_error(
+                        code="script_missing",
+                        message=f"shell_command 引用脚本不存在：{resolved}（请先 file_write 再执行）",
+                    ),
+                )
+
     return action_obj, action_type, payload_obj, None
+
+
+def _map_tool_exec_dependency_error_code(error_text: str) -> str:
+    lowered = str(error_text or "").strip().lower()
+    if "依赖未绑定" in lowered or "unbound" in lowered:
+        return "script_dependency_unbound"
+    if "脚本不存在" in lowered or "not found" in lowered or "missing" in lowered:
+        return "script_missing"
+    return "tool_exec_contract_error"
+
+
+def validate_runtime_action_contracts(
+    *,
+    task_id: int,
+    run_id: int,
+    step_title: str,
+    action_type: str,
+    payload_obj: Optional[dict],
+    workdir: str,
+) -> Optional[str]:
+    """
+    在步骤真正落库/执行前做运行时契约校验，尽早把结构性错误收敛为 action_invalid。
+
+    目前覆盖：
+    - tool_call 缺少 exec 定义
+    - tool_call.exec 引用本地脚本，但脚本未落盘或未被当前 run 的 file_write/file_append 绑定
+    """
+    if action_type != ACTION_TYPE_TOOL_CALL or not isinstance(payload_obj, dict):
+        return None
+
+    from backend.src.actions.handlers.tool_call import (
+        _enforce_tool_exec_script_dependency,
+        _resolve_tool_exec_spec,
+    )
+
+    exec_spec = _resolve_tool_exec_spec(payload_obj)
+    if exec_spec is None:
+        return format_task_error(
+            code="missing_tool_exec_spec",
+            message=(
+                "tool_call 缺少可执行定义：请在 tool_metadata.exec 中提供 "
+                "type=shell，且包含 command(str) 或 args(list)，可选 timeout_ms，建议 workdir；"
+                "并把 output 留空让系统真实执行"
+            ),
+        )
+
+    dependency_error = _enforce_tool_exec_script_dependency(
+        task_id=int(task_id),
+        run_id=int(run_id),
+        step_row={"id": None, "title": str(step_title or "")},
+        exec_spec=exec_spec,
+        tool_input=str(payload_obj.get("input") or ""),
+    )
+    if not dependency_error:
+        return None
+    return format_task_error(
+        code=_map_tool_exec_dependency_error_code(dependency_error),
+        message=str(dependency_error),
+    )
 
 
 def needs_nonempty_task_output_content(payload_obj: dict, context: Dict) -> bool:
@@ -600,4 +850,5 @@ __all__ = [
     "needs_nonempty_task_output_content",
     "normalize_action_obj_for_execution",
     "validate_and_normalize_action_text",
+    "validate_runtime_action_contracts",
 ]

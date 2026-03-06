@@ -37,6 +37,7 @@ from backend.src.agent.runner.react_step_executor import (
     yield_visible_result,
 )
 from backend.src.agent.runner.react_helpers import (
+    build_execution_constraints_hint,
     build_react_step_prompt,
     resolve_direct_user_prompt_payload,
 )
@@ -922,6 +923,12 @@ def run_think_parallel_loop(
         )
 
         budget_meta: dict = {}
+        execution_hint = build_execution_constraints_hint(
+            agent_state=agent_state,
+            step_order=step_order,
+        )
+        latest_parse_input_text = str((step_context or {}).get("latest_parse_input_text") or "").strip()
+        latest_external_url = str((step_context or {}).get("latest_external_url") or "").strip()
         react_prompt = build_react_step_prompt(
             now_utc=now_iso(),
             workdir=workdir,
@@ -936,6 +943,8 @@ def run_think_parallel_loop(
             tools=tools_hint,
             skills=skills_hint,
             memories=memories_hint,
+            latest_parse_input_text=latest_parse_input_text,
+            latest_external_url=latest_external_url,
             disallow_plan_patch=True,
             capability_hint=build_capability_hint(
                 capability=resolve_step_capability(
@@ -943,6 +952,7 @@ def run_think_parallel_loop(
                     step_title=title,
                 )
             ),
+            execution_hint=execution_hint,
             budget_meta_sink=budget_meta,
         )
         with state_lock:
@@ -961,6 +971,7 @@ def run_think_parallel_loop(
             model=step_model,
             react_params=step_params,
             variables_source=variables_source,
+            allowed_actions_text=allow_text,
         )
 
         if action_validate_error or not action_obj or not action_type:

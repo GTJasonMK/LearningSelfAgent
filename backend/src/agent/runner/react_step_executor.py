@@ -7,7 +7,11 @@ ReAct 循环步骤执行模块。
 
 import json
 import logging
-from typing import Callable, Dict, Generator, List, Optional, Tuple
+import os
+import re
+import time
+import threading
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, TypeVar
 
 from backend.src.agent.contracts.stream_events import (
     build_need_input_payload,
@@ -50,6 +54,7 @@ from backend.src.constants import (
     TASK_OUTPUT_TYPE_USER_PROMPT,
 )
 from backend.src.services.llm.llm_client import sse_json
+from backend.src.services.llm.llm_client import classify_llm_error_text
 from backend.src.services.output.output_format import format_visible_result
 from backend.src.services.tasks.task_queries import (
     create_task_output,
@@ -62,12 +67,510 @@ from backend.src.services.tasks.task_queries import (
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
+
+def _read_int_env(name: str, default: int, *, min_value: int = 1) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(float(raw))
+    except Exception:
+        return int(default)
+    if value < int(min_value):
+        return int(min_value)
+    return int(value)
+
+
+REACT_LLM_INNER_RETRY_MAX_ATTEMPTS = _read_int_env(
+    "AGENT_REACT_LLM_INNER_RETRY_MAX_ATTEMPTS",
+    1,
+    min_value=1,
+)
+REACT_LLM_INNER_HARD_TIMEOUT_SECONDS = _read_int_env(
+    "AGENT_REACT_LLM_INNER_HARD_TIMEOUT_SECONDS",
+    45,
+    min_value=5,
+)
+REACT_LLM_ERROR_MAX_ATTEMPTS = _read_int_env(
+    "AGENT_REACT_LLM_ERROR_MAX_ATTEMPTS",
+    2,
+    min_value=1,
+)
+REACT_ACTION_MAX_TOKENS = _read_int_env(
+    "AGENT_REACT_ACTION_MAX_TOKENS",
+    512,
+    min_value=64,
+)
+REACT_ACTION_RETRY_MAX_TOKENS = _read_int_env(
+    "AGENT_REACT_ACTION_RETRY_MAX_TOKENS",
+    256,
+    min_value=64,
+)
+SCRIPT_FILE_WRITE_TOKEN_FLOOR = 3072
+SCRIPT_FILE_WRITE_RETRY_TOKEN_FLOOR = 2048
+LLM_CALL_ACTION_TOKEN_FLOOR = 1024
+LLM_CALL_ACTION_RETRY_TOKEN_FLOOR = 768
+TEXT_OUTPUT_ACTION_TOKEN_FLOOR = 768
+TEXT_OUTPUT_ACTION_RETRY_TOKEN_FLOOR = 512
+REACT_BLOCKING_PROGRESS_INTERVAL_SECONDS = _read_int_env(
+    "AGENT_REACT_BLOCKING_PROGRESS_INTERVAL_SECONDS",
+    10,
+    min_value=1,
+)
+
+
+def build_step_progress_payload(
+    *,
+    task_id: int,
+    run_id: int,
+    step_order: int,
+    title: str,
+    phase: str,
+    status: str = "running",
+    action_type: str = "",
+    message: str = "",
+    elapsed_ms: Optional[int] = None,
+    tick: Optional[int] = None,
+    attempt: Optional[int] = None,
+    total_attempts: Optional[int] = None,
+) -> dict:
+    payload = {
+        "type": "step_progress",
+        "task_id": int(task_id),
+        "run_id": int(run_id),
+        "step_order": int(step_order),
+        "title": str(title or ""),
+        "phase": str(phase or "").strip() or "step",
+        "status": str(status or "running").strip() or "running",
+    }
+    action_type_text = str(action_type or "").strip()
+    if action_type_text:
+        payload["action_type"] = action_type_text
+    message_text = str(message or "").strip()
+    if message_text:
+        payload["message"] = message_text
+    if elapsed_ms is not None:
+        try:
+            payload["elapsed_ms"] = int(elapsed_ms)
+        except Exception:
+            pass
+    if tick is not None:
+        try:
+            payload["tick"] = int(tick)
+        except Exception:
+            pass
+    if attempt is not None:
+        try:
+            payload["attempt"] = int(attempt)
+        except Exception:
+            pass
+    if total_attempts is not None:
+        try:
+            payload["total_attempts"] = int(total_attempts)
+        except Exception:
+            pass
+    return payload
+
+
+def run_blocking_call_with_progress(
+    *,
+    func: Callable[[], T],
+    start_payload: Optional[dict] = None,
+    progress_payload_builder: Optional[Callable[[int, int], Optional[dict]]] = None,
+    interval_seconds: Optional[float] = None,
+    drain_events: Optional[Callable[[], List[dict]]] = None,
+) -> Generator[str, None, T]:
+    """在线程中执行阻塞调用，并周期性发出 step_progress 与子线程业务事件。"""
+    if isinstance(start_payload, dict) and start_payload:
+        yield sse_json(start_payload)
+
+    box: Dict[str, Any] = {}
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            box["result"] = func()
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+        finally:
+            done.set()
+
+    def _yield_drained_events() -> Generator[str, None, None]:
+        if not callable(drain_events):
+            return
+        try:
+            payloads = drain_events() or []
+        except Exception:
+            return
+        for payload in payloads:
+            if isinstance(payload, dict) and payload:
+                yield sse_json(payload)
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    interval = float(interval_seconds or REACT_BLOCKING_PROGRESS_INTERVAL_SECONDS or 0)
+    interval = interval if interval > 0 else float(REACT_BLOCKING_PROGRESS_INTERVAL_SECONDS)
+    tick = 0
+    started_at = time.monotonic()
+    next_emit_at = started_at + interval
+
+    while not done.wait(timeout=min(0.25, interval)):
+        yield from _yield_drained_events()
+        if not callable(progress_payload_builder):
+            continue
+        now_value = time.monotonic()
+        if now_value < next_emit_at:
+            continue
+        tick += 1
+        payload = progress_payload_builder(int(max(0.0, (now_value - started_at) * 1000)), tick)
+        if isinstance(payload, dict) and payload:
+            yield sse_json(payload)
+        next_emit_at = now_value + interval
+
+    yield from _yield_drained_events()
+    error = box.get("error")
+    if error is not None:
+        raise error
+    return box.get("result")
+
+
+def _normalize_warning_items(raw_warnings: object) -> List[str]:
+    if not isinstance(raw_warnings, list):
+        return []
+    items: List[str] = []
+    for item in raw_warnings:
+        text = str(item or "").strip()
+        if not text or text in items:
+            continue
+        items.append(text)
+    return items
+
+
+def build_step_warning_payload(
+    *,
+    task_id: int,
+    run_id: int,
+    step_id: int,
+    step_order: int,
+    title: str,
+    action_type: str,
+    result: Optional[dict],
+) -> Optional[dict]:
+    if not isinstance(result, dict):
+        return None
+
+    warnings = _normalize_warning_items(result.get("warnings"))
+    result_contract = result.get("result_contract") if isinstance(result.get("result_contract"), dict) else {}
+    contract_status = str(result_contract.get("status") or "").strip().lower()
+    if contract_status == "warn" and not warnings:
+        warnings = [f"{str(action_type or '').strip() or 'step'} result_contract=warn"]
+    if not warnings:
+        return None
+
+    payload = {
+        "type": "step_warning",
+        "level": "warning",
+        "task_id": int(task_id),
+        "run_id": int(run_id),
+        "step_id": int(step_id),
+        "step_order": int(step_order),
+        "title": str(title or ""),
+        "action_type": str(action_type or ""),
+        "warning_count": len(warnings),
+        "primary_warning": warnings[0],
+        "warnings": warnings,
+    }
+
+    if str(action_type or "") == ACTION_TYPE_TOOL_CALL:
+        tool_name = str(result.get("tool_name") or result.get("tool_id") or "").strip()
+        if tool_name:
+            payload["tool"] = tool_name
+        attempts = result.get("attempts") if isinstance(result.get("attempts"), list) else []
+        normalized_attempts = []
+        failed_count = 0
+        ok_count = 0
+        for item in attempts[:5]:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            if status == "failed":
+                failed_count += 1
+            elif status == "ok":
+                ok_count += 1
+            normalized_attempts.append(
+                {
+                    "host": str(item.get("host") or "").strip(),
+                    "status": status,
+                    "error_code": str(item.get("error_code") or "").strip(),
+                    "reason": str(item.get("reason") or "").strip(),
+                }
+            )
+        if normalized_attempts:
+            payload["attempts"] = normalized_attempts
+            payload["attempt_count"] = len(normalized_attempts)
+            payload["failed_attempt_count"] = int(failed_count)
+            payload["successful_attempt_count"] = int(ok_count)
+            payload["fallback_used"] = bool(failed_count > 0 and ok_count > 0)
+        protocol = result.get("protocol") if isinstance(result.get("protocol"), dict) else None
+        if protocol:
+            payload["protocol_source"] = str(protocol.get("source") or "").strip()
+
+    return payload
+
 
 def _run_with_optional_lock(db_lock: Optional[object], fn: Callable[[], object]) -> object:
     if db_lock is not None:
         with db_lock:
             return fn()
     return fn()
+
+
+def _extract_declared_action_from_step_title(step_title: str) -> str:
+    raw = str(step_title or "").strip()
+    if not raw:
+        return ""
+    match = re.match(r"^([a-zA-Z_]+)\s*[:：]", raw)
+    if not match:
+        return ""
+    token = str(match.group(1) or "").strip().lower()
+    allowed = {
+        ACTION_TYPE_FILE_WRITE,
+        ACTION_TYPE_FILE_READ,
+        ACTION_TYPE_FILE_APPEND,
+        ACTION_TYPE_FILE_LIST,
+        ACTION_TYPE_FILE_DELETE,
+        ACTION_TYPE_HTTP_REQUEST,
+        ACTION_TYPE_LLM_CALL,
+        ACTION_TYPE_JSON_PARSE,
+        ACTION_TYPE_MEMORY_WRITE,
+        ACTION_TYPE_SHELL_COMMAND,
+        ACTION_TYPE_TASK_OUTPUT,
+        ACTION_TYPE_TOOL_CALL,
+        ACTION_TYPE_USER_PROMPT,
+    }
+    return token if token in allowed else ""
+
+
+def _extract_file_write_path_from_title(step_title: str) -> str:
+    raw = str(step_title or "").strip()
+    if not raw:
+        return ""
+    match = re.match(r"^file_write\s*[:：]\s*(\"[^\"]+\"|'[^']+'|\S+)", raw, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    path = str(match.group(1) or "").strip()
+    if (path.startswith('"') and path.endswith('"')) or (path.startswith("'") and path.endswith("'")):
+        path = path[1:-1].strip()
+    return path
+
+
+def _looks_like_script_file_path(path: str) -> bool:
+    suffix = os.path.splitext(str(path or "").strip().lower())[1]
+    return suffix in {
+        ".py",
+        ".js",
+        ".ts",
+        ".mjs",
+        ".cjs",
+        ".sh",
+        ".ps1",
+        ".bat",
+        ".cmd",
+        ".rb",
+        ".php",
+    }
+
+
+def _collect_allowed_action_tokens(allowed_actions_text: str, step_title: str) -> set[str]:
+    tokens: set[str] = set()
+    declared = _extract_declared_action_from_step_title(step_title)
+    if declared:
+        tokens.add(declared)
+    allowed_text = str(allowed_actions_text or "").strip().lower()
+    if not allowed_text:
+        return tokens
+    for item in re.split(r"[\s,/|]+", allowed_text):
+        token = str(item or "").strip().lower()
+        if token:
+            tokens.add(token)
+    return tokens
+
+
+def _allow_includes_action(allowed_actions_text: str, step_title: str, action_type: str) -> bool:
+    token = str(action_type or "").strip().lower()
+    if not token:
+        return False
+    return token in _collect_allowed_action_tokens(allowed_actions_text, step_title)
+
+
+def _resolve_action_token_caps(
+    *,
+    step_title: str,
+    allowed_actions_text: str,
+    react_prompt: str,
+) -> tuple[int, int]:
+    initial_cap = int(REACT_ACTION_MAX_TOKENS)
+    retry_cap = int(REACT_ACTION_RETRY_MAX_TOKENS)
+    allowed_tokens = _collect_allowed_action_tokens(allowed_actions_text, step_title)
+    file_write_path = _extract_file_write_path_from_title(step_title)
+
+    if ACTION_TYPE_LLM_CALL in allowed_tokens:
+        initial_cap = max(initial_cap, int(LLM_CALL_ACTION_TOKEN_FLOOR))
+        retry_cap = max(retry_cap, int(LLM_CALL_ACTION_RETRY_TOKEN_FLOOR))
+    if ACTION_TYPE_TASK_OUTPUT in allowed_tokens or ACTION_TYPE_MEMORY_WRITE in allowed_tokens:
+        initial_cap = max(initial_cap, int(TEXT_OUTPUT_ACTION_TOKEN_FLOOR))
+        retry_cap = max(retry_cap, int(TEXT_OUTPUT_ACTION_RETRY_TOKEN_FLOOR))
+    if ACTION_TYPE_FILE_WRITE in allowed_tokens:
+        initial_cap = max(initial_cap, int(LLM_CALL_ACTION_TOKEN_FLOOR))
+        retry_cap = max(retry_cap, int(LLM_CALL_ACTION_RETRY_TOKEN_FLOOR))
+        if _looks_like_script_file_path(file_write_path):
+            initial_cap = max(initial_cap, int(SCRIPT_FILE_WRITE_TOKEN_FLOOR))
+            retry_cap = max(retry_cap, int(SCRIPT_FILE_WRITE_RETRY_TOKEN_FLOOR))
+
+    prompt_chars = len(str(react_prompt or ""))
+    if prompt_chars >= 12000 and ACTION_TYPE_LLM_CALL in allowed_tokens:
+        initial_cap = max(initial_cap, 1536)
+        retry_cap = max(retry_cap, 1024)
+
+    return int(initial_cap), int(retry_cap)
+
+
+def _build_llm_call_contract_fallback_action(
+    *,
+    step_title: str,
+    workdir: str,
+    allowed_actions_text: str,
+) -> Tuple[Optional[dict], Optional[str], Optional[dict], Optional[str]]:
+    if not _allow_includes_action(allowed_actions_text, step_title, ACTION_TYPE_LLM_CALL):
+        return None, None, None, "llm_call_not_allowed"
+
+    step_goal = str(step_title or "").strip()
+    for prefix in (f"{ACTION_TYPE_LLM_CALL}:", f"{ACTION_TYPE_LLM_CALL}："):
+        if step_goal.startswith(prefix):
+            step_goal = step_goal[len(prefix):].strip()
+            break
+    if not step_goal:
+        step_goal = "分析最近一次真实观测并给出下一步所需结果"
+
+    fallback_prompt = (
+        f"请完成当前步骤：{step_goal}。\n"
+        "系统会自动注入最近一次真实观测，请不要重复粘贴原文。\n"
+        "要求：只基于真实观测分析；若数据不足，请明确指出缺失信息；禁止编造。"
+    )
+    fallback_obj = {
+        "action": {
+            "type": ACTION_TYPE_LLM_CALL,
+            "payload": {
+                "prompt": fallback_prompt,
+            },
+        }
+    }
+    normalized_obj, normalized_type, normalized_payload, normalized_err = validate_and_normalize_action_text(
+        action_text=json.dumps(fallback_obj, ensure_ascii=False),
+        step_title=step_title,
+        workdir=workdir,
+    )
+    if normalized_err or not normalized_obj or not normalized_type:
+        return None, None, None, str(normalized_err or "fallback_action_invalid")
+    return normalized_obj, normalized_type, normalized_payload or {}, None
+
+
+def _build_compact_action_retry_prompt(
+    *,
+    step_order: int,
+    step_title: str,
+    workdir: str,
+    allowed_actions_text: str,
+    last_error: str,
+) -> str:
+    declared_action = _extract_declared_action_from_step_title(step_title)
+    file_write_path = _extract_file_write_path_from_title(step_title)
+    allowed_text = str(allowed_actions_text or "").strip() or (declared_action or "按步骤允许动作")
+
+    file_write_hint = ""
+    if declared_action == ACTION_TYPE_FILE_WRITE:
+        file_write_hint = (
+            "- 当前步骤优先使用 file_write。若目标是脚本，必须直接输出可运行的真实脚本。\n"
+            "- 禁止输出 skeleton/TODO/placeholder/sample source/假设数据结构/需根据观测调整 这类占位内容。\n"
+            "- 若当前缺少足够真实样本支撑脚本实现，优先通过 plan_patch 在前置步骤补充样本或切换到更轻量路径；不要用骨架脚本假装完成。\n"
+        )
+        if file_write_path:
+            file_write_hint += f"- file_write.path 优先使用：`{file_write_path}`。\n"
+
+    llm_call_hint = ""
+    if declared_action == ACTION_TYPE_LLM_CALL:
+        llm_call_hint = (
+            "- llm_call.prompt 只写分析指令，不要把网页正文/CSV/JSON 原文再次粘贴进 prompt。\n"
+            "- 系统会自动注入最近一次真实观测；若观测不足，只需说明缺失信息。\n"
+        )
+
+    return (
+        "你是本地 Agent 的动作生成器，当前处于超时降载重试模式。\n"
+        "只输出单个 JSON 对象，禁止解释、禁止代码块。\n"
+        "输出格式：{\"action\":{\"type\":\"...\",\"payload\":{...}},\"plan_patch\":null}\n"
+        f"当前步骤序号：{int(step_order)}\n"
+        f"当前步骤标题：{step_title}\n"
+        f"允许动作：{allowed_text}\n"
+        f"workdir：{workdir}\n"
+        f"上次错误：{last_error}\n"
+        "硬约束：\n"
+        "- action.type 必须在允许动作中。\n"
+        "- payload 只保留最少必要字段，避免冗余。\n"
+        "- 如果是 shell_command，payload 必须包含 workdir。\n"
+        f"{file_write_hint}"
+        f"{llm_call_hint}"
+        "现在请直接输出 JSON。"
+    )
+
+
+def _allow_includes_file_write(allowed_actions_text: str, step_title: str) -> bool:
+    return _allow_includes_action(allowed_actions_text, step_title, ACTION_TYPE_FILE_WRITE)
+
+
+def _build_file_write_timeout_fallback_action(
+    *,
+    step_title: str,
+    workdir: str,
+    allowed_actions_text: str,
+) -> Tuple[Optional[dict], Optional[str], Optional[dict], Optional[str]]:
+    if not _allow_includes_file_write(allowed_actions_text, step_title):
+        return None, None, None, "file_write_not_allowed"
+    path = _extract_file_write_path_from_title(step_title)
+    if not path:
+        return None, None, None, "missing_file_write_path_in_title"
+
+    abs_path = os.path.normpath(os.path.join(str(workdir or ""), str(path)))
+    content = ""
+    try:
+        if os.path.isfile(abs_path):
+            with open(abs_path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+    except Exception:
+        content = ""
+    if not str(content or "").strip():
+        return None, None, None, "missing_existing_file_content_for_timeout_fallback"
+
+    fallback_obj = {
+        "action": {
+            "type": ACTION_TYPE_FILE_WRITE,
+            "payload": {
+                "path": path,
+                "content": str(content),
+                "encoding": "utf-8",
+            },
+        }
+    }
+    normalized_obj, normalized_type, normalized_payload, normalized_err = validate_and_normalize_action_text(
+        action_text=json.dumps(fallback_obj, ensure_ascii=False),
+        step_title=step_title,
+        workdir=workdir,
+    )
+    if normalized_err or not normalized_obj or not normalized_type:
+        return None, None, None, str(normalized_err or "fallback_action_invalid")
+    return normalized_obj, normalized_type, normalized_payload or {}, None
 
 
 def generate_action_with_retry(
@@ -82,6 +585,7 @@ def generate_action_with_retry(
     model: str,
     react_params: dict,
     variables_source: str,
+    allowed_actions_text: Optional[str] = None,
 ) -> Tuple[Optional[dict], Optional[str], Optional[dict], Optional[str], Optional[str]]:
     """
     生成 Action（支持自动重试）。
@@ -107,6 +611,8 @@ def generate_action_with_retry(
     action_validate_error = None
     last_action_text = None
     prompt_for_attempt = react_prompt
+    compact_prompt = ""
+    transient_retry_count = 0
 
     retries = coerce_int(AGENT_REACT_ACTION_RETRY_MAX_ATTEMPTS or 0, default=0)
     for attempt in range(0, 1 + max(0, retries)):
@@ -115,9 +621,43 @@ def generate_action_with_retry(
             # 重试时强制更稳定：降低温度，减少格式漂移
             attempt_params["temperature"] = 0
 
+        initial_token_cap, retry_token_cap = _resolve_action_token_caps(
+            step_title=str(step_title or ""),
+            allowed_actions_text=str(allowed_actions_text or ""),
+            react_prompt=str(react_prompt or ""),
+        )
+        token_cap = int(initial_token_cap if attempt == 0 else retry_token_cap)
+        raw_max_tokens = attempt_params.get("max_tokens")
+        try:
+            current_max_tokens = int(float(raw_max_tokens))
+        except Exception:
+            current_max_tokens = 0
+        if current_max_tokens <= 0 or current_max_tokens > token_cap:
+            attempt_params["max_tokens"] = int(token_cap)
+
+        # 逐次放宽单次调用硬超时，避免“第一次 30s 卡住 -> 后续仍然 30s 连续超时”。
+        hard_timeout_seconds = int(REACT_LLM_INNER_HARD_TIMEOUT_SECONDS)
+        if attempt > 0:
+            hard_timeout_seconds = min(90, int(hard_timeout_seconds + 15 * attempt))
+
+        prompt_text = compact_prompt or prompt_for_attempt
+        prompt_chars = len(prompt_text)
+        call_started_at = time.monotonic()
+        logger.info(
+            "[agent.react.action_gen.attempt] task_id=%s run_id=%s step_order=%s attempt=%s model=%s prompt_chars=%s max_tokens=%s timeout_s=%s compact=%s",
+            int(task_id),
+            int(run_id),
+            int(step_order),
+            int(attempt),
+            str(model or ""),
+            int(prompt_chars),
+            int(coerce_int(attempt_params.get("max_tokens"), default=0)),
+            int(hard_timeout_seconds),
+            bool(compact_prompt),
+        )
         action_text, action_error = call_llm_for_text(
             llm_call,
-            prompt=prompt_for_attempt,
+            prompt=prompt_text,
             task_id=int(task_id),
             run_id=int(run_id),
             model=model,
@@ -127,12 +667,61 @@ def generate_action_with_retry(
                 "step_order": int(step_order),
                 "attempt": int(attempt),
             },
+            retry_max_attempts=int(REACT_LLM_INNER_RETRY_MAX_ATTEMPTS),
+            hard_timeout_seconds=int(hard_timeout_seconds),
         )
+        elapsed_ms = int(max(0.0, (time.monotonic() - call_started_at) * 1000))
         last_action_text = action_text
 
         if action_error or not action_text:
             action_validate_error = action_error or "empty_response"
+            if action_error:
+                error_kind = classify_llm_error_text(str(action_error or ""))
+                logger.warning(
+                    "[agent.react.action_gen.error] task_id=%s run_id=%s step_order=%s attempt=%s kind=%s elapsed_ms=%s error=%s",
+                    int(task_id),
+                    int(run_id),
+                    int(step_order),
+                    int(attempt),
+                    str(error_kind or "unknown"),
+                    int(elapsed_ms),
+                    str(action_error or ""),
+                )
+                if error_kind in {"rate_limit", "transient"}:
+                    # LLM 传输类错误由 create_llm_call 内部重试处理；
+                    # 外层动作重试默认不再放大时延，避免单步进入“长时间心跳”。
+                    max_attempts = coerce_int(REACT_LLM_ERROR_MAX_ATTEMPTS, default=1)
+                    if (attempt + 1) >= max(1, int(max_attempts)):
+                        break
+                    transient_retry_count += 1
+                    compact_prompt = _build_compact_action_retry_prompt(
+                        step_order=int(step_order),
+                        step_title=str(step_title or ""),
+                        workdir=str(workdir or ""),
+                        allowed_actions_text=str(allowed_actions_text or ""),
+                        last_error=str(action_error or ""),
+                    )
+                    # 传输抖动类错误：继续重试当前步骤（不做额外提示词惩罚）。
+                    continue
+            else:
+                logger.warning(
+                    "[agent.react.action_gen.empty] task_id=%s run_id=%s step_order=%s attempt=%s elapsed_ms=%s",
+                    int(task_id),
+                    int(run_id),
+                    int(step_order),
+                    int(attempt),
+                    int(elapsed_ms),
+                )
         else:
+            logger.info(
+                "[agent.react.action_gen.ok] task_id=%s run_id=%s step_order=%s attempt=%s elapsed_ms=%s text_chars=%s",
+                int(task_id),
+                int(run_id),
+                int(step_order),
+                int(attempt),
+                int(elapsed_ms),
+                int(len(str(action_text or ""))),
+            )
             action_obj, action_type, payload_obj, action_validate_error = validate_and_normalize_action_text(
                 action_text=action_text,
                 step_title=step_title,
@@ -143,10 +732,65 @@ def generate_action_with_retry(
             break
 
         if attempt < retries:
-            prompt_for_attempt = (
-                react_prompt
-                + f"\n上一次输出不合法（{action_validate_error}）。请严格只输出 JSON（不要代码块、不要解释）。\n"
+            if compact_prompt:
+                compact_prompt = _build_compact_action_retry_prompt(
+                    step_order=int(step_order),
+                    step_title=str(step_title or ""),
+                    workdir=str(workdir or ""),
+                    allowed_actions_text=str(allowed_actions_text or ""),
+                    last_error=str(action_validate_error or "invalid_action"),
+                )
+            else:
+                prompt_for_attempt = (
+                    react_prompt
+                    + f"\n上一次输出不合法（{action_validate_error}）。请严格只输出 JSON（不要代码块、不要解释）。\n"
+                )
+
+    # LLM 连续超时后的 file_write 兜底：
+    # - 仅在发生过 transient 重试时触发，避免吞掉一次性偶发错误；
+    # - 只允许复用“已存在且非空”的真实文件内容，禁止凭空生成占位脚本/占位数据，
+    #   否则会把 timeout 伪装成成功步骤并污染后续执行。
+    if (
+        (not action_obj or action_validate_error)
+        and transient_retry_count > 0
+        and _allow_includes_file_write(str(allowed_actions_text or ""), str(step_title or ""))
+    ):
+        fallback_obj, fallback_type, fallback_payload, fallback_err = _build_file_write_timeout_fallback_action(
+            step_title=str(step_title or ""),
+            workdir=str(workdir or ""),
+            allowed_actions_text=str(allowed_actions_text or ""),
+        )
+        if fallback_obj and fallback_type and not fallback_err:
+            logger.warning(
+                "[agent.react.action_gen.fallback] task_id=%s run_id=%s step_order=%s reason=%s fallback_type=%s",
+                int(task_id),
+                int(run_id),
+                int(step_order),
+                str(action_validate_error or "transient_timeout"),
+                str(fallback_type),
             )
+            return fallback_obj, fallback_type, fallback_payload or {}, None, last_action_text
+
+    if (not action_obj or action_validate_error) and _allow_includes_action(
+        str(allowed_actions_text or ""),
+        str(step_title or ""),
+        ACTION_TYPE_LLM_CALL,
+    ):
+        fallback_obj, fallback_type, fallback_payload, fallback_err = _build_llm_call_contract_fallback_action(
+            step_title=str(step_title or ""),
+            workdir=str(workdir or ""),
+            allowed_actions_text=str(allowed_actions_text or ""),
+        )
+        if fallback_obj and fallback_type and not fallback_err:
+            logger.warning(
+                "[agent.react.action_gen.fallback] task_id=%s run_id=%s step_order=%s reason=%s fallback_type=%s",
+                int(task_id),
+                int(run_id),
+                int(step_order),
+                str(action_validate_error or "invalid_action"),
+                str(fallback_type),
+            )
+            return fallback_obj, fallback_type, fallback_payload or {}, None, last_action_text
 
     return action_obj, action_type, payload_obj, action_validate_error, last_action_text
 
@@ -239,6 +883,8 @@ def build_observation_line(
         path = str(result.get("path") or "").strip()
         size = result.get("bytes")
         tail = f"{size} bytes" if isinstance(size, int) else ""
+        if path:
+            context["latest_file_write_path"] = path
         warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
         warn_tail = ""
         if warnings:
@@ -270,13 +916,33 @@ def build_observation_line(
         obs_line = f"{title}: file_delete deleted={deleted}".strip()
 
     elif action_type == ACTION_TYPE_TOOL_CALL and isinstance(result, dict):
-        tool_name = str(result.get("tool_id") or "")
+        tool_name = str(result.get("tool_name") or result.get("tool_id") or "")
         out = str(result.get("output") or "")
-        warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+        warnings = _normalize_warning_items(result.get("warnings"))
         warn_tail = ""
         if warnings:
             warn_tail = f" warn={_truncate_observation(str(warnings[0] or ''))}"
-        obs_line = f"{title}: tool#{tool_name} output={_truncate_observation(out)}{warn_tail}"
+        attempts = result.get("attempts") if isinstance(result.get("attempts"), list) else []
+        attempt_tail = ""
+        if attempts:
+            failed_count = 0
+            ok_count = 0
+            hosts = []
+            for item in attempts[:5]:
+                if not isinstance(item, dict):
+                    continue
+                status = str(item.get("status") or "").strip().lower()
+                host = str(item.get("host") or "").strip()
+                if host and host not in hosts:
+                    hosts.append(host)
+                if status == "failed":
+                    failed_count += 1
+                elif status == "ok":
+                    ok_count += 1
+            attempt_tail = f" attempts={len(attempts)} failed={failed_count} ok={ok_count}"
+            if hosts:
+                attempt_tail += f" hosts={','.join(hosts[:3])}"
+        obs_line = f"{title}: tool#{tool_name} output={_truncate_observation(out)}{warn_tail}{attempt_tail}"
         if out.strip():
             context["latest_parse_input_text"] = out.strip()
         tool_input = str(result.get("input") or "").strip()
@@ -625,6 +1291,8 @@ def handle_task_output_fallback(
             "source": f"{variables_source}_force_task_output",
             "step_order": int(step_order),
         },
+        retry_max_attempts=int(REACT_LLM_INNER_RETRY_MAX_ATTEMPTS),
+        hard_timeout_seconds=int(REACT_LLM_INNER_HARD_TIMEOUT_SECONDS),
     )
 
     forced_obj, forced_type, forced_payload, forced_validate_error = validate_and_normalize_action_text(

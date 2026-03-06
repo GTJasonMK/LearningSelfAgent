@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  applyWorldConvergenceEventState,
   applyWorldAgentPlanDeltaState,
   applyWorldAgentPlanState,
   applyWorldAgentStageState,
@@ -90,6 +91,133 @@ test("applyWorldAgentPlanDeltaState should overwrite items while keeping other p
   assert.equal(next.currentAgentPlan.items[0].title, "new-1");
   assert.equal(next.currentAgentSnapshot.stage, "running");
   assert.deepEqual(next.currentAgentSnapshot.plan, { total: 2, done: 1, running: 1 });
+});
+
+test("applyWorldConvergenceEventState should merge convergence fields and keep existing snapshot fields", () => {
+  const prev = {
+    currentRun: { run_id: 10, task_id: 8, status: "running" },
+    currentAgentSnapshot: {
+      stage: "execute",
+      plan: { total: 3, done: 1 },
+      convergence: { progress_score: 40, attempt_index: 1 }
+    },
+    currentAgentState: { step_order: 2 }
+  };
+  const next = applyWorldConvergenceEventState(prev, {
+    runId: 10,
+    taskId: 8,
+    convergencePatch: {
+      progress_score: 55,
+      strategy_fingerprint: "fp_x",
+      no_progress_streak: 2
+    },
+    statePatch: { last_failure_class: "llm_rate_limit" }
+  });
+
+  assert.equal(next.currentRun.run_id, 10);
+  assert.equal(next.currentAgentSnapshot.stage, "execute");
+  assert.deepEqual(next.currentAgentSnapshot.plan, { total: 3, done: 1 });
+  assert.equal(next.currentAgentSnapshot.convergence.progress_score, 55);
+  assert.equal(next.currentAgentSnapshot.convergence.attempt_index, 1);
+  assert.equal(next.currentAgentSnapshot.convergence.strategy_fingerprint, "fp_x");
+  assert.equal(next.currentAgentSnapshot.convergence.no_progress_streak, 2);
+  assert.equal(next.currentAgentState.step_order, 2);
+  assert.equal(next.currentAgentState.last_failure_class, "llm_rate_limit");
+});
+
+test("applyWorldConvergenceEventState should bootstrap run placeholder when no current run exists", () => {
+  const next = applyWorldConvergenceEventState({}, {
+    runId: 77,
+    taskId: 6,
+    convergencePatch: { proof_id: "proof_77", last_failure_class: "source_unavailable" }
+  });
+  assert.equal(next.currentRun.run_id, 77);
+  assert.equal(next.currentRun.task_id, 6);
+  assert.equal(next.currentRun.status, "running");
+  assert.equal(next.currentAgentSnapshot.convergence.proof_id, "proof_77");
+  assert.equal(next.currentAgentSnapshot.convergence.last_failure_class, "source_unavailable");
+});
+
+test("applyWorldConvergenceEventState should preserve structured step warning fields", () => {
+  const next = applyWorldConvergenceEventState({}, {
+    runId: 88,
+    taskId: 7,
+    convergencePatch: {
+      last_step_warning: {
+        step_order: 3,
+        primary_warning: "已自动切换到备用源",
+        tool: "web_fetch",
+        attempt_count: 2,
+        failed_attempt_count: 1,
+        successful_attempt_count: 1,
+        fallback_used: true,
+        protocol_source: "fallback"
+      }
+    }
+  });
+  assert.equal(next.currentRun.run_id, 88);
+  assert.equal(next.currentAgentSnapshot.convergence.last_step_warning.step_order, 3);
+  assert.equal(next.currentAgentSnapshot.convergence.last_step_warning.primary_warning, "已自动切换到备用源");
+  assert.equal(next.currentAgentSnapshot.convergence.last_step_warning.tool, "web_fetch");
+  assert.equal(next.currentAgentSnapshot.convergence.last_step_warning.fallback_used, true);
+});
+
+
+test("applyWorldConvergenceEventState should merge nested search state", () => {
+  const prev = {
+    currentAgentSnapshot: {
+      convergence: {
+        search: {
+          status: "running",
+          query: "黄金 价格",
+          candidates: [{ host: "a.example.com", url: "https://a.example.com" }]
+        }
+      }
+    }
+  };
+  const next = applyWorldConvergenceEventState(prev, {
+    runId: 90,
+    taskId: 8,
+    convergencePatch: {
+      search: {
+        status: "selected",
+        selected: { host: "b.example.com", url: "https://b.example.com", score: 28 }
+      }
+    }
+  });
+
+  assert.equal(next.currentAgentSnapshot.convergence.search.query, "黄金 价格");
+  assert.equal(next.currentAgentSnapshot.convergence.search.status, "selected");
+  assert.equal(next.currentAgentSnapshot.convergence.search.candidates.length, 1);
+  assert.equal(next.currentAgentSnapshot.convergence.search.selected.host, "b.example.com");
+});
+
+test("applyWorldRunDetailState should preserve local search convergence when detail snapshot omits it", () => {
+  const prev = {
+    currentAgentSnapshot: {
+      stage: "execute",
+      convergence: {
+        search: {
+          status: "candidates",
+          query: "黄金 价格",
+          total_candidates: 3
+        }
+      }
+    }
+  };
+  const next = applyWorldRunDetailState(prev, {
+    detail: {
+      agent_plan: { items: [] },
+      agent_state: { paused: null },
+      snapshot: { stage: "execute", plan: { total: 4, done: 1 } }
+    },
+    lastRunMeta: { run_id: 9, task_id: 2, updated_at: "2026-02-27", status: "running" }
+  });
+
+  assert.equal(next.currentAgentSnapshot.stage, "execute");
+  assert.deepEqual(next.currentAgentSnapshot.plan, { total: 4, done: 1 });
+  assert.equal(next.currentAgentSnapshot.convergence.search.query, "黄金 价格");
+  assert.equal(next.currentAgentSnapshot.convergence.search.total_candidates, 3);
 });
 
 test("applyWorldRunDetailState should set detail fields and meta", () => {

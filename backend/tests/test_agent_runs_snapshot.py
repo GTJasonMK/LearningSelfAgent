@@ -58,7 +58,18 @@ class TestAgentRunsSnapshot(unittest.IsolatedAsyncioTestCase):
             {"id": 2, "brief": "输出", "status": "waiting"},
         ]
         agent_plan = {"titles": plan_titles, "items": plan_items, "allows": plan_allows, "artifacts": []}
-        agent_state = {"mode": "do", "stage": "execute", "step_order": 2, "paused": {"question": "ok?"}}
+        agent_state = {
+            "mode": "do",
+            "stage": "execute",
+            "step_order": 2,
+            "paused": {"question": "ok?"},
+            "progress_score": 68,
+            "no_progress_streak": 2,
+            "strategy_fingerprint": "fp_test_001",
+            "attempt_index": 3,
+            "last_failure_class": "source_unavailable",
+            "unreachable_proof": {"proof_id": "proof_abc123"},
+        }
 
         update_task_run(run_id=int(run_id), status="waiting", agent_plan=agent_plan, agent_state=agent_state, updated_at=now_iso())
 
@@ -139,6 +150,14 @@ class TestAgentRunsSnapshot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(plan.get("total") or 0), 2)
         cur = plan.get("current_step") or {}
         self.assertEqual(int(cur.get("step_order") or 0), 2)
+
+        convergence = snapshot.get("convergence") or {}
+        self.assertEqual(int(convergence.get("progress_score") or 0), 68)
+        self.assertEqual(int(convergence.get("no_progress_streak") or 0), 2)
+        self.assertEqual(str(convergence.get("strategy_fingerprint") or ""), "fp_test_001")
+        self.assertEqual(int(convergence.get("attempt_index") or 0), 3)
+        self.assertEqual(str(convergence.get("last_failure_class") or ""), "source_unavailable")
+        self.assertEqual(str(convergence.get("proof_id") or ""), "proof_abc123")
 
         counters = snapshot.get("counters") or {}
         self.assertTrue(bool(counters.get("ok")))

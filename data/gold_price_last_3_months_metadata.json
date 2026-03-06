@@ -1,0 +1,59 @@
+{
+  "task": "gold_price_last_3_months",
+  "generated_at_utc": "2026-03-04T04:58:11.514696Z",
+  "time_window": {
+    "start_date": "2025-12-04",
+    "end_date": "2026-03-03",
+    "timezone": "UTC"
+  },
+  "target_unit": "CNY_per_gram",
+  "frequency": "daily",
+  "price_definition": {
+    "instrument": "gold",
+    "field": "daily_close_or_equivalent",
+    "notes": "Planned output is daily gold price normalized to CNY/gram. Upstream gold price source not successfully obtained in this run; only FX series was fetched successfully."
+  },
+  "data_sources": {
+    "fx_usd_cny": {
+      "provider": "exchangerate.host",
+      "endpoint": "timeseries",
+      "base": "USD",
+      "quote": "CNY",
+      "start_date": "2025-12-04",
+      "end_date": "2026-03-03",
+      "status": "ok",
+      "observed_sample": {
+        "2025-12-04": 7.0717,
+        "2025-12-05": 7.0702
+      }
+    },
+    "gold_price": {
+      "provider": "unknown",
+      "status": "blocked_or_unavailable",
+      "last_observation": "web_fetch returned unrelated HTML (Shanghai government portal), indicating the intended gold JSON source was not reached."
+    }
+  },
+  "conversion": {
+    "path": "USD_per_oz_to_CNY_per_g",
+    "formula": "price_cny_per_g = price_usd_per_oz * usd_cny / 31.1034768",
+    "constants": {
+      "troy_ounce_to_gram": 31.1034768
+    },
+    "requires": [
+      "gold_price_usd_per_oz",
+      "usd_cny"
+    ]
+  },
+  "quality": {
+    "coverage": {
+      "fx_series": "partial_ok (response truncated in logs but contains multiple dates)",
+      "gold_series": "missing"
+    },
+    "gaps_policy": "leave blank / omit dates with missing upstream values",
+    "validation": [
+      "check non-negative prices",
+      "check reasonable range",
+      "check date monotonicity and duplicates"
+    ]
+  }
+}

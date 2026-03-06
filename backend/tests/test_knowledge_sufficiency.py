@@ -168,5 +168,42 @@ class TestKnowledgeSufficiency(unittest.TestCase):
         self.assertEqual(str(result.suggestion), "ask_user")
 
 
+    def test_assess_autonomous_research_task_overrides_ask_user_to_proceed(self):
+        """
+        回归：对可自主外部搜索完成的任务，不要因为“来源/口径未定”就 ask_user。
+        这类任务应先 proceed，交给规划/执行阶段通过搜索、抓取、验证收敛。
+        """
+        import json
+
+        from backend.src.agent.retrieval import _assess_knowledge_sufficiency
+
+        llm_json = json.dumps(
+            {
+                "sufficient": False,
+                "reason": "需要确认价格口径频率与来源路径",
+                "missing_knowledge": "domain_knowledge",
+                "suggestion": "ask_user",
+            },
+            ensure_ascii=False,
+        )
+
+        with patch(
+            "backend.src.agent.retrieval._cached_call_openai",
+            return_value=(llm_json, 0, None),
+        ):
+            result = _assess_knowledge_sufficiency(
+                message="请帮我收集最近三个月的黄金价格数据并保存为 CSV",
+                skills=[],
+                graph_nodes=[],
+                memories=[],
+                model="base-model",
+                parameters={"temperature": 0},
+            )
+
+        self.assertFalse(bool(result.sufficient))
+        self.assertEqual(str(result.suggestion), "proceed")
+        self.assertIn("自主搜索", str(result.reason))
+
+
 if __name__ == "__main__":
     unittest.main()

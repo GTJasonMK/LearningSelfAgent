@@ -1,0 +1,10 @@
+INFO:     Started server process [23304]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8127 (Press CTRL+C to quit)
+INFO:     127.0.0.1:60578 - "POST /api/agent/command/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60979 - "POST /api/agent/command/resume/stream HTTP/1.1" 200 OK
+plan_step[2] 非法状态转移: done -> running（已忽略）
+plan_step[2] 非法状态转移: done -> failed（已忽略）
+[agent.react.step_failed] task_id=1 run_id=1 step_id=3 step_order=3 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=命令执行失败:{"ok": false, "source": "auto_generated_missing_script_fallback", "script": "fetch_gold_last_3m.py", "rows": 0, "numeric_rows": 0, "numeric_ratio": 0.0, "error": "missing_input"}
+[agent.react.step_failed] task_id=1 run_id=1 step_id=6 step_order=5 action_type=shell_command code=script_args_missing non_retriable=False budget_exceeded=False error=[code=script_args_missing] 命令执行失败: 脚本参数缺失（--source-name, --source-url）；脚本=backend/.agent/workspace/fetch_gold_last_3m.py；LLM补齐未生效: 缺少必填参数 --source-name 和 --source-url；提供信息中仅有 --out，且未给出可复用的来源名称与URL，无法在不杜撰参数值的情况下构造可执行 args。

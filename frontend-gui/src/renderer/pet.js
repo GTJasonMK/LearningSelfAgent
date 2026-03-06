@@ -1368,7 +1368,22 @@ async function streamAndShow(makeRequest, options = {}) {
           }
           return;
         }
-        if (obj?.type === "memory_item" || obj?.type === "agent_stage" || obj?.type === "plan" || obj?.type === "plan_delta") {
+        if (
+          obj?.type === "memory_item"
+          || obj?.type === "agent_stage"
+          || obj?.type === "plan"
+          || obj?.type === "plan_delta"
+          || obj?.type === "strategy_update"
+          || obj?.type === "progress_update"
+          || obj?.type === "unreachable_proof"
+          || obj?.type === "step_error"
+          || obj?.type === "step_progress"
+          || obj?.type === "step_warning"
+          || obj?.type === "search_progress"
+          || obj?.type === "search_candidates"
+          || obj?.type === "search_rejected"
+          || obj?.type === "search_selected"
+        ) {
           emitAgentEvent(obj, { broadcast: true });
         }
       },

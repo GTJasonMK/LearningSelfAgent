@@ -20,6 +20,34 @@ from rich.table import Table
 
 console = Console()
 
+
+def _stdout_prefers_ascii_escape() -> bool:
+    encoding = str(getattr(sys.stdout, "encoding", "") or "").strip().lower()
+    if not encoding:
+        return False
+    return "utf" not in encoding and "65001" not in encoding
+
+
+def _safe_stdout_write(text: str) -> None:
+    value = str(text or "")
+    try:
+        sys.stdout.write(value)
+        sys.stdout.flush()
+        return
+    except UnicodeEncodeError:
+        pass
+
+    encoding = str(getattr(sys.stdout, "encoding", "") or "utf-8").strip() or "utf-8"
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(value.encode(encoding, errors="replace"))
+        buffer.flush()
+        return
+
+    sys.stdout.write(value.encode(encoding, errors="replace").decode(encoding, errors="ignore"))
+    sys.stdout.flush()
+
+
 # 状态颜色映射
 _STATUS_COLORS = {
     "done": "green",
@@ -43,7 +71,12 @@ def _status_style(status: str) -> str:
 
 def print_json(data: Any) -> None:
     """JSON 格式输出。"""
-    console.print_json(json.dumps(data, ensure_ascii=False, default=str))
+    json_text = json.dumps(
+        data,
+        ensure_ascii=_stdout_prefers_ascii_escape(),
+        default=str,
+    )
+    _safe_stdout_write(json_text + "\n")
 
 
 def print_error(message: str, code: Optional[str] = None) -> None:
@@ -64,8 +97,7 @@ def print_warning(message: str) -> None:
 
 def print_sse_delta(text: str) -> None:
     """SSE 增量文本输出（打字机效果）。"""
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    _safe_stdout_write(str(text or ""))
 
 
 def print_sse_status(label: str, message: str, style: str = "cyan") -> None:

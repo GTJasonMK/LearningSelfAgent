@@ -3,6 +3,7 @@ import re
 from typing import List, Optional
 
 from backend.src.actions.registry import normalize_action_type
+from backend.src.common.text_sanitize import contains_illustrative_example_clause, strip_illustrative_example_clauses
 from backend.src.constants import (
     ACTION_TYPE_FILE_APPEND,
     ACTION_TYPE_FILE_DELETE,
@@ -19,10 +20,11 @@ from backend.src.constants import (
     ACTION_TYPE_USER_PROMPT,
     AGENT_EXPERIMENT_DIR_REL,
     AGENT_PLAN_BRIEF_MAX_CHARS,
+    AGENT_TASK_FEEDBACK_STEP_TITLE,
 )
 
 
-def _looks_like_file_path(value: str) -> bool:
+def looks_like_file_path(value: str) -> bool:
     """
     判断一个字符串是否“像路径”：
     - 目的：避免 LLM 把 file_write 的 title 写成自然语言（如“编写”），却被当作文件名强行覆盖 payload.path，
@@ -48,6 +50,107 @@ def _looks_like_file_path(value: str) -> bool:
         return True
     if "." in base:
         return True
+    return False
+
+
+_SCRIPT_FILE_WRITE_EXTS = {".py", ".sh", ".ps1", ".js", ".ts", ".cmd", ".bat", ".rb", ".php", ".mjs", ".cjs"}
+_SCRIPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_./\:-]+(?:\.py|\.sh|\.ps1|\.js|\.ts|\.cmd|\.bat|\.rb|\.php|\.mjs|\.cjs)", re.IGNORECASE)
+def is_bootstrap_script_file_write_step(*, title: str, brief: str = "") -> bool:
+    target = extract_file_write_target_path(str(title or ""))
+    basename = os.path.basename(str(target or "")).lower()
+    merged = " ".join([str(title or ""), str(brief or ""), basename]).lower()
+
+    blocked_tokens = (
+        "parse",
+        "parser",
+        "format",
+        "formatter",
+        "validate",
+        "validator",
+        "verify",
+        "check",
+        "analysis",
+        "analyze",
+        "summary",
+        "summarize",
+        "merge",
+        "convert",
+        "extract",
+        "解析",
+        "格式",
+        "校验",
+        "验证",
+        "分析",
+        "汇总",
+        "合并",
+        "转换",
+        "提取",
+    )
+    if any(token in merged for token in blocked_tokens):
+        return False
+
+    acquire_tokens = (
+        "fetch",
+        "crawl",
+        "scrape",
+        "request",
+        "download",
+        "discover",
+        "search",
+        "read",
+        "sample",
+        "grab",
+        "query",
+        "pull",
+        "获取",
+        "抓取",
+        "搜索",
+        "发现",
+        "下载",
+        "查询",
+        "拉取",
+        "读取",
+        "采集",
+        "样本",
+    )
+    return any(token in merged for token in acquire_tokens)
+
+
+def _is_script_file_write_target(path: str) -> bool:
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    return bool(ext and ext in _SCRIPT_FILE_WRITE_EXTS)
+
+
+def _extract_script_tokens(text: str) -> set[str]:
+    raw = str(text or "").replace("\\", "/")
+    return {str(item or "").strip().lower() for item in _SCRIPT_TOKEN_RE.findall(raw) if str(item or "").strip()}
+
+
+def is_script_file_write_needed_for_exec_step(
+    *,
+    title: str,
+    brief: str = "",
+    exec_title: str,
+    exec_allow: Optional[List[str]] = None,
+) -> bool:
+    target = extract_file_write_target_path(str(title or "")).replace("\\", "/")
+    if not _is_script_file_write_target(target):
+        return False
+
+    exec_allow_set = set(exec_allow or [])
+    if ACTION_TYPE_TOOL_CALL in exec_allow_set:
+        return is_bootstrap_script_file_write_step(title=title, brief=brief)
+
+    if ACTION_TYPE_SHELL_COMMAND in exec_allow_set or str(exec_title or "").strip().lower().startswith("shell_command:"):
+        refs = _extract_script_tokens(exec_title)
+        if not refs:
+            return True
+        normalized_target = str(target or "").strip().lower()
+        basename = os.path.basename(normalized_target)
+        if normalized_target and normalized_target in refs:
+            return True
+        return bool(basename and basename in refs)
+
     return False
 
 
@@ -103,6 +206,57 @@ def sanitize_plan_brief(value: str, *, fallback_title: str = "") -> str:
     return text
 
 
+def is_system_user_prompt_step(title: str, allow: Optional[List[str]] = None) -> bool:
+    """识别由编排层注入的系统级 user_prompt（当前仅保留满意度反馈尾步）。"""
+    title_text = str(title or "").strip()
+    if title_text != str(AGENT_TASK_FEEDBACK_STEP_TITLE or "").strip():
+        return False
+    allow_set = set(allow or [])
+    return ACTION_TYPE_USER_PROMPT in allow_set if allow_set else True
+
+
+def find_non_system_user_prompt_steps(
+    titles: List[str],
+    allows: List[List[str]],
+) -> List[tuple[int, str]]:
+    """返回计划中所有不应出现的 user_prompt 步骤（1-based index, title）。"""
+    invalid: List[tuple[int, str]] = []
+    for idx, allow in enumerate(allows, start=1):
+        allow_set = set(allow or [])
+        if ACTION_TYPE_USER_PROMPT not in allow_set:
+            continue
+        title = str(titles[idx - 1] if idx - 1 < len(titles) else "").strip()
+        if is_system_user_prompt_step(title, allow):
+            continue
+        invalid.append((idx, title))
+    return invalid
+
+
+def extract_file_write_declared_paths(step_title: str) -> List[str]:
+    """提取 file_write 标题中显式声明的所有路径 token。"""
+    raw = str(step_title or "").strip()
+    if not raw:
+        return []
+    match = re.match(r"^file_write[:：]\s*(.+)$", raw)
+    if not match:
+        return []
+
+    body = str(match.group(1) or "").strip()
+    tokens = re.findall(r""""[^"]+"|'[^']+'|\S+""", body)
+    paths: List[str] = []
+    for token in tokens:
+        value = str(token or "").strip().strip(",;，；")
+        if not value:
+            continue
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1].strip()
+        if not value or not looks_like_file_path(value):
+            continue
+        if value not in paths:
+            paths.append(value)
+    return paths
+
+
 def extract_file_write_target_path(step_title: str) -> str:
     """
     从步骤标题中提取 file_write 的目标路径。
@@ -111,32 +265,38 @@ def extract_file_write_target_path(step_title: str) -> str:
     - title 形如：`file_write:relative/path.md 写入...`
     - 或 `file_write:"path with space.md" ...`
     """
+    targets = extract_file_write_declared_paths(step_title)
+    return str(targets[0] or "").strip() if targets else ""
+
+
+def extract_prefixed_path_token(step_title: str, action_type: str) -> str:
+    """从 `file_read:path 描述` 这类标题中提取第一个路径 token。"""
     raw = str(step_title or "").strip()
-    if not raw:
+    action = str(action_type or "").strip()
+    if not raw or not action:
         return ""
-    match = re.match(r"^file_write[:：]\s*(\"[^\"]+\"|'[^']+'|\S+)", raw)
+    match = re.match(rf"^{re.escape(action)}\s*[:：]\s*(\"[^\"]+\"|'[^']+'|\S+)", raw, flags=re.IGNORECASE)
     if not match:
         return ""
     value = str(match.group(1) or "").strip()
-    if (value.startswith("\"") and value.endswith("\"")) or (
-        value.startswith("'") and value.endswith("'")
-    ):
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
         value = value[1:-1].strip()
-    return value
+    return value if looks_like_file_path(value) else ""
 
 
 def coerce_file_write_payload_path_from_title(step_title: str, payload: dict) -> dict:
     """
     为 file_write action 增加“路径对齐”的兜底：
-    - 如果 payload.path 为空或与 title 中声明的路径不一致，则以 title 为准覆盖 path。
+    - 仅在 payload.path 缺失时，才使用 title 中声明的路径补齐；
+    - 若 payload.path 已存在，则保留原值，后续由校验层显式判断是否与 title 冲突。
     """
     if not isinstance(payload, dict):
         return {}
     target = extract_file_write_target_path(step_title)
-    if not target or not _looks_like_file_path(target):
+    if not target or not looks_like_file_path(target):
         return payload
     current = str(payload.get("path") or "").strip()
-    if not current or current != target:
+    if not current:
         patched = dict(payload)
         patched["path"] = target
         return patched
@@ -207,8 +367,10 @@ def _normalize_plan_titles(
             allow_raw = item.get("allow")
             if allow_raw is None:
                 allow_raw = item.get("allowed") or item.get("allowed_actions")
-        title = str(title).strip()
+        title = strip_illustrative_example_clauses(str(title).strip())
         brief = str(brief).strip()
+        if title and contains_illustrative_example_clause(title):
+            return None, None, None, None, "步骤标题不能包含示例性说明（如 例如/比如/e.g.）；标题必须直接描述待执行动作"
         if title:
             titles.append(title)
             briefs.append(brief or _fallback_brief_from_title(title))
@@ -227,6 +389,31 @@ def _normalize_plan_titles(
     for idx, allow in enumerate(allows, start=1):
         if not allow:
             return None, None, None, None, f"第 {idx} 步 allow 不能为空"
+        title = str(titles[idx - 1] if idx - 1 < len(titles) else "").strip()
+        allow_set = set(allow or [])
+        if ACTION_TYPE_FILE_WRITE in allow_set or title.startswith("file_write:") or title.startswith("file_write："):
+            declared_paths = extract_file_write_declared_paths(title)
+            if len(declared_paths) != 1:
+                return None, None, None, None, (
+                    f"第 {idx} 步 file_write 标题必须且只能声明一个目标路径，当前检测到 {len(declared_paths)} 个"
+                )
+
+        for action_name in (ACTION_TYPE_FILE_READ, ACTION_TYPE_FILE_LIST, ACTION_TYPE_FILE_APPEND, ACTION_TYPE_FILE_DELETE):
+            if title.startswith(f"{action_name}:") or title.startswith(f"{action_name}："):
+                prefixed_path = extract_prefixed_path_token(title, action_name)
+                if not prefixed_path:
+                    return None, None, None, None, f"第 {idx} 步 {action_name} 标题必须显式声明目标路径"
+
+    # 规划/重规划阶段不允许输出普通 user_prompt：
+    # - 需要用户补充信息时，应在 planning enrich 阶段收敛为 pending_planning；
+    # - 执行计划本身必须保持自动动作闭环，避免中途 ask_user 破坏跨端一致性。
+    invalid_user_prompts = find_non_system_user_prompt_steps(titles, allows)
+    if invalid_user_prompts:
+        invalid_idx, _invalid_title = invalid_user_prompts[0]
+        return None, None, None, None, (
+            f"第 {invalid_idx} 步不允许 user_prompt；如需用户补充请走 pending_planning，"
+            "执行计划仅允许自动动作与最终反馈尾步"
+        )
 
     # 兜底：如果步骤标题显式声明了 file_write，则强制该步只允许 file_write。
     # 目的：避免 LLM 在“写文件步骤”里选择 llm_call/task_output 等动作，导致 artifacts 校验失败。
@@ -234,6 +421,14 @@ def _normalize_plan_titles(
         value = str(title or "").strip()
         if value.startswith("file_write:") or value.startswith("file_write："):
             allows[idx] = [ACTION_TYPE_FILE_WRITE]
+        elif value.startswith("file_read:") or value.startswith("file_read："):
+            allows[idx] = [ACTION_TYPE_FILE_READ]
+        elif value.startswith("file_list:") or value.startswith("file_list："):
+            allows[idx] = [ACTION_TYPE_FILE_LIST]
+        elif value.startswith("file_append:") or value.startswith("file_append："):
+            allows[idx] = [ACTION_TYPE_FILE_APPEND]
+        elif value.startswith("file_delete:") or value.startswith("file_delete："):
+            allows[idx] = [ACTION_TYPE_FILE_DELETE]
 
     return titles, briefs, allows, artifacts, None
 
@@ -378,17 +573,12 @@ def reorder_script_file_writes_before_exec_steps(
     allows: List[List[str]],
 ) -> tuple[List[str], List[str], List[List[str]], int]:
     """
-    计划修复：将“脚本类文件”的 file_write 步骤尽量前置到首个可执行步骤（tool_call/shell_command）之前。
+    计划修复：仅在首个 exec 步骤缺少其必需脚本时，前置一个脚本类 file_write。
 
-    背景：
-    - 模型经常把 tool_call/shell_command 放在写脚本之前，导致执行时报：
-      python: can't open file '.../xxx.py'（脚本尚未落盘）
-    - 虽然后续可能通过 replan 自愈，但会产生一次失败记录并影响观感与评估证据。
-
-    策略：
-    - 找到计划中第一个“可执行步骤”（allow 含 tool_call 或 shell_command）
-    - 将其后的“脚本类 file_write”（.py/.sh/.ps1/.js/.ts 等）移动到该步骤之前
-    - 仅重排顺序，不增减步骤数
+    规则：
+    - 若首个 exec 是 tool_call，只允许前置“来源发现/读取”类 bootstrap 脚本；
+    - 若首个 exec 是 shell_command，只允许前置该 shell 所需脚本；
+    - 不再把解析/校验脚本一刀切前移到来源发现之前。
     """
     if not titles or not allows:
         return titles, briefs, allows, 0
@@ -402,29 +592,49 @@ def reorder_script_file_writes_before_exec_steps(
     if first_exec_idx is None:
         return titles, briefs, allows, 0
 
-    script_exts = {".py", ".sh", ".ps1", ".js", ".ts", ".cmd", ".bat"}
-    movable: List[int] = []
+    first_exec_title = str(titles[first_exec_idx] or "")
+    first_exec_allow = list(allows[first_exec_idx] or [])
+
+    for idx in range(0, int(first_exec_idx)):
+        allow_set = set(allows[idx] or []) if idx < len(allows) else set()
+        if ACTION_TYPE_FILE_WRITE not in allow_set:
+            continue
+        brief_value = briefs[idx] if idx < len(briefs) else ""
+        if is_script_file_write_needed_for_exec_step(
+            title=titles[idx],
+            brief=str(brief_value or ""),
+            exec_title=first_exec_title,
+            exec_allow=first_exec_allow,
+        ):
+            return titles, briefs, allows, 0
+
+    move_idx = None
     for idx in range(int(first_exec_idx) + 1, len(titles)):
         allow_set = set(allows[idx] or []) if idx < len(allows) else set()
         if ACTION_TYPE_FILE_WRITE not in allow_set:
             continue
-        path = extract_file_write_target_path(titles[idx])
-        ext = os.path.splitext(str(path or ""))[1].lower()
-        if ext and ext in script_exts:
-            movable.append(idx)
+        brief_value = briefs[idx] if idx < len(briefs) else ""
+        if not is_script_file_write_needed_for_exec_step(
+            title=titles[idx],
+            brief=str(brief_value or ""),
+            exec_title=first_exec_title,
+            exec_allow=first_exec_allow,
+        ):
+            continue
+        move_idx = idx
+        break
 
-    if not movable:
+    if move_idx is None:
         return titles, briefs, allows, 0
 
-    prefix = list(range(0, int(first_exec_idx)))
-    moved = list(movable)
-    rest = [idx for idx in range(int(first_exec_idx), len(titles)) if idx not in set(movable)]
-    new_order = prefix + moved + rest
+    new_order = list(range(len(titles)))
+    moved_value = new_order.pop(move_idx)
+    new_order.insert(int(first_exec_idx), moved_value)
 
     new_titles = [titles[i] for i in new_order]
     new_briefs = [briefs[i] for i in new_order] if len(briefs) == len(titles) else briefs
     new_allows = [allows[i] for i in new_order]
-    return new_titles, new_briefs, new_allows, len(movable)
+    return new_titles, new_briefs, new_allows, 1
 
 
 def drop_non_artifact_file_write_steps(
@@ -681,6 +891,11 @@ def apply_next_step_patch(
             step_allow = _normalize_allow_list(raw.get("allow"))
             if not step_allow:
                 return f"plan_patch.insert_steps[{i}].allow 不能为空"
+            if ACTION_TYPE_USER_PROMPT in set(step_allow or []) and not is_system_user_prompt_step(step_title, step_allow):
+                return (
+                    f"plan_patch.insert_steps[{i}] 不允许 user_prompt；"
+                    "如需用户补充请收敛为 pending_planning，执行链路不得中途 ask_user"
+                )
             step_brief = str(raw.get("brief") or "").strip() or _fallback_brief_from_title(step_title)
             step_brief = _sanitize_brief(step_brief)
             if not step_brief:
@@ -694,43 +909,44 @@ def apply_next_step_patch(
                 }
             )
 
-        # 约束：插入步骤里若存在“脚本 file_write”，必须排在首个 shell/tool 执行步骤之前。
-        # 背景：模型经常把 shell_command 放在写脚本之前，导致运行时报脚本不存在。
-        script_exts = {".py", ".sh", ".ps1", ".js", ".ts", ".cmd", ".bat"}
-
-        def _is_exec_step(allow_list: List[str]) -> bool:
-            allow_set = set(allow_list or [])
-            return ACTION_TYPE_SHELL_COMMAND in allow_set or ACTION_TYPE_TOOL_CALL in allow_set
-
-        def _is_script_file_write_step(step_obj: dict) -> bool:
-            allow_set = set(step_obj.get("allow") or [])
-            if ACTION_TYPE_FILE_WRITE not in allow_set:
-                return False
-            target = extract_file_write_target_path(str(step_obj.get("title") or ""))
-            ext = os.path.splitext(str(target or ""))[1].lower()
-            return bool(ext and ext in script_exts)
-
-        first_exec_idx = None
+        # 约束：插入步骤里若存在脚本 file_write，只需要保证它出现在“首个 shell_command”之前。
+        # 这里不再把脚本一律顶到 tool_call 前面，避免把解析脚本提前到来源发现之前。
+        first_shell_idx = None
         for idx, step_obj in enumerate(normalized_insert_steps):
-            if _is_exec_step(step_obj.get("allow") or []):
-                first_exec_idx = idx
+            allow_set = set(step_obj.get("allow") or [])
+            if ACTION_TYPE_SHELL_COMMAND in allow_set:
+                first_shell_idx = idx
                 break
-        if first_exec_idx is not None:
-            movable = [
-                idx
-                for idx in range(int(first_exec_idx) + 1, len(normalized_insert_steps))
-                if _is_script_file_write_step(normalized_insert_steps[idx])
-            ]
-            if movable:
-                prefix = list(range(0, int(first_exec_idx)))
-                moved = list(movable)
-                rest = [
-                    idx
-                    for idx in range(int(first_exec_idx), len(normalized_insert_steps))
-                    if idx not in set(movable)
-                ]
-                new_order = prefix + moved + rest
-                normalized_insert_steps = [normalized_insert_steps[i] for i in new_order]
+        if first_shell_idx is not None:
+            first_shell = normalized_insert_steps[first_shell_idx]
+            shell_title = str(first_shell.get("title") or "")
+            shell_allow = list(first_shell.get("allow") or [])
+            script_ready = False
+            for idx in range(0, int(first_shell_idx)):
+                step_obj = normalized_insert_steps[idx]
+                if is_script_file_write_needed_for_exec_step(
+                    title=str(step_obj.get("title") or ""),
+                    brief=str(step_obj.get("brief") or ""),
+                    exec_title=shell_title,
+                    exec_allow=shell_allow,
+                ):
+                    script_ready = True
+                    break
+            if not script_ready:
+                move_idx = None
+                for idx in range(int(first_shell_idx) + 1, len(normalized_insert_steps)):
+                    step_obj = normalized_insert_steps[idx]
+                    if is_script_file_write_needed_for_exec_step(
+                        title=str(step_obj.get("title") or ""),
+                        brief=str(step_obj.get("brief") or ""),
+                        exec_title=shell_title,
+                        exec_allow=shell_allow,
+                    ):
+                        move_idx = idx
+                        break
+                if move_idx is not None:
+                    moved = normalized_insert_steps.pop(move_idx)
+                    normalized_insert_steps.insert(int(first_shell_idx), moved)
 
         offset = 0
         for step_obj in normalized_insert_steps:
@@ -754,6 +970,8 @@ def apply_next_step_patch(
             allow_list = _normalize_allow_list(allow_raw)
             if not allow_list:
                 return "plan_patch.allow 不能为空"
+            if ACTION_TYPE_USER_PROMPT in set(allow_list or []) and not is_system_user_prompt_step(title_value, allow_list):
+                return "plan_patch 不允许插入 user_prompt；如需用户补充请走 pending_planning"
             if limit is not None and len(titles) + 1 > limit:
                 return f"plan_patch 超出 max_steps={limit}"
 
@@ -779,6 +997,9 @@ def apply_next_step_patch(
             allow_list = _normalize_allow_list(allow_raw)
             if not allow_list:
                 return "plan_patch.allow 不能为空"
+            title_for_allow = str(titles[next_index - 1] if next_index - 1 < len(titles) else "").strip()
+            if ACTION_TYPE_USER_PROMPT in set(allow_list or []) and not is_system_user_prompt_step(title_for_allow, allow_list):
+                return "plan_patch 不允许把执行步骤改成 user_prompt；如需用户补充请走 pending_planning"
             if next_index - 1 < len(allows):
                 allows[next_index - 1] = allow_list
 

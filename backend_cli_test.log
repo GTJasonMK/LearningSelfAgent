@@ -1,0 +1,10 @@
+INFO:     Started server process [12972]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8123 (Press CTRL+C to quit)
+INFO:     127.0.0.1:65149 - "POST /api/agent/command/stream HTTP/1.1" 200 OK
+[agent.react.step_failed] task_id=2 run_id=2 step_id=1 step_order=1 action_type=tool_call code=tool_exec_contract_error non_retriable=True budget_exceeded=True error=[code=tool_exec_contract_error] 工具执行失败: 脚本不存在: E:\Code\LearningSelfAgent\backend\.agent\workspace\gold_price_fetcher.py（请先执行 file_write/file_append 并确认落盘）
+INFO:     127.0.0.1:51737 - "POST /api/agent/command/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49710 - "GET /api/agent/runs/1 HTTP/1.1" 200 OK
+[agent.react.step_failed] task_id=1 run_id=1 step_id=4 step_order=4 action_type=file_write code=step_failed non_retriable=False budget_exceeded=False error=file_write 拒绝写入空 CSV：请先完成数据抓取/换算后再写入结果文件。
+INFO:     127.0.0.1:51773 - "GET /api/agent/runs/1 HTTP/1.1" 200 OK

@@ -1,0 +1,14 @@
+INFO:     Started server process [22672]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8123 (Press CTRL+C to quit)
+[agent.react.action_gen.error] task_id=1 run_id=1 step_order=8 attempt=0 kind=transient elapsed_ms=45047 error=LLM call timeout after 45s
+[agent.react.step_failed] task_id=1 run_id=1 step_id=9 step_order=9 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=ÃüÁîÖ´ĞĞÊ§°Ü:{"ok": false, "error": "unknown url type: '--self-test'", "source_url": "--self-test"}
+[agent.react.step_failed] task_id=1 run_id=1 step_id=12 step_order=11 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=ÃüÁîÖ´ĞĞÊ§°Ü:ERROR: --url is required unless --self-test is set
+[agent.react.action_gen.error] task_id=1 run_id=1 step_order=12 attempt=0 kind=transient elapsed_ms=45031 error=LLM call timeout after 45s
+[agent.react.step_failed] task_id=1 run_id=1 step_id=16 step_order=14 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=ÃüÁîÖ´ĞĞÊ§°Ü:return dt.datetime.utcnow().date()
+[agent.react.step_failed] task_id=1 run_id=1 step_id=20 step_order=18 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=ÃüÁîÖ´ĞĞÊ§°Ü:return dt.datetime.utcnow().date()
+[agent.react.step_failed] task_id=1 run_id=1 step_id=21 step_order=19 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=ÃüÁîÖ´ĞĞÊ§°Ü:return dt.datetime.utcnow().date()
+[agent.react.step_failed] task_id=1 run_id=1 step_id=23 step_order=21 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=ÃüÁîÖ´ĞĞÊ§°Ü:return dt.datetime.utcnow().date()
+[agent.react.step_failed] task_id=1 run_id=1 step_id=24 step_order=22 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=ÃüÁîÖ´ĞĞÊ§°Ü:return dt.datetime.utcnow().date()
+[agent.react.step_failed] task_id=1 run_id=1 step_id=25 step_order=23 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=True error=ÃüÁîÖ´ĞĞÊ§°Ü:return dt.datetime.utcnow().date()

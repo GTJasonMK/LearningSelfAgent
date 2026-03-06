@@ -15,6 +15,7 @@ from backend.src.agent.plan_utils import (
     apply_next_step_patch,
     coerce_file_write_payload_path_from_title,
     extract_file_write_target_path,
+    looks_like_file_path,
     repair_plan_artifacts_with_file_write_steps,
 )
 from backend.src.agent.retrieval import (
@@ -48,6 +49,7 @@ __all__ = [
     "apply_next_step_patch",
     "coerce_file_write_payload_path_from_title",
     "extract_file_write_target_path",
+    "looks_like_file_path",
     "repair_plan_artifacts_with_file_write_steps",
     "_assess_knowledge_sufficiency",
     "_collect_tools_from_solutions",

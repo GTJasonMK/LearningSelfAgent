@@ -64,7 +64,7 @@ class TestReactArtifactsGateHardFail(unittest.TestCase):
         self.assertEqual(agent_state.get("prior_failed_steps_before_output"), [1])
         self.assertTrue(bool(agent_state.get("output_risk_has_failed_steps")))
 
-    def test_missing_artifacts_before_task_output_hard_fail(self):
+    def test_missing_artifacts_before_task_output_autofix_even_when_unlimited(self):
         plan_struct = PlanStructure.from_legacy(
             plan_titles=["task_output:输出结果"],
             plan_items=[{"status": "pending"}],
@@ -96,8 +96,12 @@ class TestReactArtifactsGateHardFail(unittest.TestCase):
         )
         chunks, outcome = self._collect_outcome(gen)
 
-        self.assertEqual(outcome.run_status, RUN_STATUS_FAILED)
-        self.assertTrue(any("缺少必需产物" in str(item) for item in chunks))
+        self.assertIsNone(outcome.run_status)
+        self.assertEqual(outcome.next_idx, 0)
+        self.assertTrue(outcome.plan_changed)
+        self.assertTrue(any("已补齐写文件步骤" in str(item) for item in chunks))
+        titles = plan_struct.get_titles()
+        self.assertTrue(any(str(item).startswith("file_write:artifacts/out.csv") for item in titles))
 
 
 if __name__ == "__main__":

@@ -271,6 +271,34 @@ class TestStreamCommands(unittest.TestCase):
         self.assertIn("默认方案", result.output)
         self.assertIn("prompt_token: tok_1", result.output)
 
+    def test_ask_stream_renders_step_warning(self):
+        events = [
+            SseEvent(
+                event="message",
+                data='{"type":"step_warning","run_id":2,"task_id":1,"step_order":1,"tool":"web_fetch","primary_warning":"已自动切换到备用源","attempt_count":2,"failed_attempt_count":1,"successful_attempt_count":1,"fallback_used":true,"protocol_source":"fallback"}',
+                json_data={
+                    "type": "step_warning",
+                    "run_id": 2,
+                    "task_id": 1,
+                    "step_order": 1,
+                    "tool": "web_fetch",
+                    "primary_warning": "已自动切换到备用源",
+                    "attempt_count": 2,
+                    "failed_attempt_count": 1,
+                    "successful_attempt_count": 1,
+                    "fallback_used": True,
+                    "protocol_source": "fallback",
+                },
+            ),
+            SseEvent(event="done", data='{"type":"stream_end","run_status":"done"}', json_data={"type": "stream_end", "run_status": "done"}),
+        ]
+        result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("步骤告警", result.output)
+        self.assertIn("web_fetch", result.output)
+        self.assertIn("已自动切换到备用源", result.output)
+        self.assertIn("fallback=yes", result.output)
+
     def test_ask_stream_without_done_fails(self):
         events = [
             SseEvent(event="message", data='{"delta":"still running"}', json_data={"delta": "still running"}),
@@ -297,6 +325,48 @@ class TestStreamCommands(unittest.TestCase):
         )
         self.assertEqual(result.exit_code, 0)
         self.assertIn("恢复执行完毕", result.output)
+
+    def test_ask_stream_failed_status_exits_nonzero(self):
+        events = [
+            SseEvent(
+                event="done",
+                data='{"type":"stream_end","task_id":1,"run_id":2,"run_status":"failed"}',
+                json_data={"type": "stream_end", "task_id": 1, "run_id": 2, "run_status": "failed"},
+            ),
+        ]
+        result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("执行失败", result.output)
+        self.assertNotIn("执行完毕", result.output)
+
+    def test_ask_stream_waiting_status_returns_zero_and_not_done_message(self):
+        events = [
+            SseEvent(
+                event="done",
+                data='{"type":"stream_end","task_id":1,"run_id":2,"run_status":"waiting"}',
+                json_data={"type": "stream_end", "task_id": 1, "run_id": 2, "run_status": "waiting"},
+            ),
+        ]
+        result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("等待输入", result.output)
+        self.assertNotIn("执行完毕", result.output)
+
+    def test_resume_stream_failed_status_exits_nonzero(self):
+        events = [
+            SseEvent(
+                event="done",
+                data='{"type":"stream_end","task_id":1,"run_id":2,"run_status":"failed"}',
+                json_data={"type": "stream_end", "task_id": 1, "run_id": 2, "run_status": "failed"},
+            ),
+        ]
+        result = _invoke(
+            ["resume", "12", "继续执行", "--prompt-token", "tok", "--session-key", "sess"],
+            responses={"/agent/command/resume/stream": events},
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("执行失败", result.output)
+        self.assertNotIn("恢复执行完毕", result.output)
 
     def test_ask_stream_payload_supports_parameters_and_think_config(self):
         events = [SseEvent(event="done", data='{"type":"done"}', json_data={"type": "done"})]
@@ -450,6 +520,78 @@ class TestStreamCommands(unittest.TestCase):
         result = _invoke(["task", "execute", "9"], responses={"/tasks/9/execute/stream": events})
         self.assertEqual(result.exit_code, 1)
         self.assertIn("未收到 done/stream_end 事件", result.output)
+
+    def test_ask_stream_renders_search_events(self):
+        events = [
+            SseEvent(
+                event="message",
+                data='{"type":"search_progress","stage":"search_query","query":"黄金 价格 元/克"}',
+                json_data={"type": "search_progress", "stage": "search_query", "query": "黄金 价格 元/克"},
+            ),
+            SseEvent(
+                event="message",
+                data='{"type":"search_candidates","total_candidates":2,"candidates":[{"host":"data.example.com","url":"https://data.example.com/gold.csv","initial_score":8}]}',
+                json_data={
+                    "type": "search_candidates",
+                    "total_candidates": 2,
+                    "candidates": [{"host": "data.example.com", "url": "https://data.example.com/gold.csv", "initial_score": 8}],
+                },
+            ),
+            SseEvent(
+                event="message",
+                data='{"type":"search_rejected","total_rejected":1,"rejected":[{"host":"forum.example.com","reason":"low_relevance","detail":"缺少日期信号"}]}',
+                json_data={
+                    "type": "search_rejected",
+                    "total_rejected": 1,
+                    "rejected": [{"host": "forum.example.com", "reason": "low_relevance", "detail": "缺少日期信号"}],
+                },
+            ),
+            SseEvent(
+                event="message",
+                data='{"type":"search_selected","selected":{"host":"data.example.com","url":"https://data.example.com/gold.csv","score":28,"evidence":["required_fields=2","units=1"]}}',
+                json_data={
+                    "type": "search_selected",
+                    "selected": {
+                        "host": "data.example.com",
+                        "url": "https://data.example.com/gold.csv",
+                        "score": 28,
+                        "evidence": ["required_fields=2", "units=1"],
+                    },
+                },
+            ),
+            SseEvent(event="done", data='{"type":"stream_end","run_status":"done"}', json_data={"type": "stream_end", "run_status": "done"}),
+        ]
+        result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("搜索", result.output)
+        self.assertIn("候选", result.output)
+        self.assertIn("拒绝", result.output)
+        self.assertIn("命中", result.output)
+        self.assertIn("data.example.com", result.output)
+
+    def test_ask_stream_renders_search_events_with_markup_like_detail(self):
+        events = [
+            SseEvent(
+                event="message",
+                data='{"type":"search_rejected","total_rejected":1,"rejected":[{"host":"unsafe.example.com","reason":"cloudflare","detail":"[blocked] <script>alert(1)</script> [retry]"}]}',
+                json_data={
+                    "type": "search_rejected",
+                    "total_rejected": 1,
+                    "rejected": [
+                        {
+                            "host": "unsafe.example.com",
+                            "reason": "cloudflare",
+                            "detail": "[blocked] <script>alert(1)</script> [retry]",
+                        }
+                    ],
+                },
+            ),
+            SseEvent(event="done", data='{"type":"stream_end","run_status":"done"}', json_data={"type": "stream_end", "run_status": "done"}),
+        ]
+        result = _invoke(["ask", "测试"], responses={"/agent/command/stream": events})
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("unsafe.example.com", result.output)
+        self.assertIn("[blocked]", result.output)
 
 
 class TestConfigCommands(unittest.TestCase):

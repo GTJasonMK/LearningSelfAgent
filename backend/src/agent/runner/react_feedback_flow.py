@@ -410,7 +410,9 @@ def handle_task_feedback_step(
         created_at = now_iso()
 
         plan_struct.set_step_status(idx, "waiting")
-        yield sse_plan_delta(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload(), indices=[idx])
+        # 首次进入反馈提问时，需要广播全量 plan：此前尾部 pending feedback 会被计划事件隐藏，
+        # 仅发 delta 会导致前端/CLI/桌宠看不到新出现的反馈步骤。
+        yield sse_plan(task_id=task_id, run_id=run_id, plan_items=plan_struct.get_items_payload())
 
         try:
             create_task_output(

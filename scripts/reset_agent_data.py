@@ -355,6 +355,20 @@ def _now_tag() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def _looks_like_corrupt_db_error(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "database disk image is malformed",
+        "file is not a database",
+        "database or disk is full",
+        "malformed",
+        "corrupt",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _probe_fts(cur: sqlite3.Cursor, table_name: str) -> bool:
     """
     探测 FTS 虚拟表是否可用（避免 vtable constructor failed）。
@@ -530,6 +544,8 @@ def main() -> None:
     # 清理 SQLite 数据库（仅保留配置）
     db_path = resolve_target_db_path()
     if db_path.exists():
+        con: sqlite3.Connection | None = None
+        preserved_config_rows: list[dict] = []
         try:
             # 设置超时与 busy_timeout：在后端短暂占用 DB 时，等待锁释放而不是直接失败。
             con = sqlite3.connect(db_path, timeout=10)
@@ -542,7 +558,6 @@ def main() -> None:
             cur.execute("PRAGMA foreign_keys = OFF")
 
             # 先读取需要保留的少量表，以便在 DB 损坏时走“重建回灌”路径
-            preserved_config_rows: list[dict] = []
             need_rebuild = False
             try:
                 preserved_config_rows = [dict(r) for r in cur.execute("SELECT * FROM config_store").fetchall()]
@@ -611,16 +626,34 @@ def main() -> None:
                 )
         except Exception as exc:
             try:
-                con.close()
+                if con is not None:
+                    con.close()
             except Exception:
                 pass
-            msg = (
-                "数据库清理失败，已跳过删除 agent.db 以避免丢失历史/配置。"
-                f"\n原因: {exc}"
-                "\n建议: 请先退出后端/Electron（确保没有进程占用 backend/data/agent.db），再重试 reset。"
-            )
-            print(msg)
-            warnings.append(f"db_cleanup_failed: {exc}")
+            recovered = False
+            if _looks_like_corrupt_db_error(exc):
+                try:
+                    _rebuild_db_with_preserved_tables(
+                        db_path=db_path,
+                        preserved_config_rows=preserved_config_rows,
+                        removed=removed,
+                        warnings=warnings,
+                    )
+                    removed.append(str(db_path) + " (检测到数据库损坏，已自动重建)")
+                    recovered = True
+                except Exception as recover_exc:
+                    warnings.append(f"db_recover_failed: {recover_exc}")
+
+            if recovered:
+                print("检测到数据库损坏，已自动执行重建并继续后续清理。")
+            else:
+                msg = (
+                    "数据库清理失败，已跳过删除 agent.db 以避免丢失历史/配置。"
+                    f"\n原因: {exc}"
+                    "\n建议: 请先退出后端/Electron（确保没有进程占用 backend/data/agent.db），再重试 reset。"
+                )
+                print(msg)
+                warnings.append(f"db_cleanup_failed: {exc}")
     else:
         print("未发现 agent.db，跳过数据库清理。")
     # WAL/SHM 不再强制删除：数据库占用时删除 WAL/SHM 可能导致误清理或行为不确定

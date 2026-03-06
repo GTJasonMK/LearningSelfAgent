@@ -2,7 +2,7 @@ import json
 import os
 import time
 import threading
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 from backend.src.common.app_error_utils import invalid_request_error, not_found_error
 from backend.src.common.errors import AppError
@@ -42,6 +42,54 @@ LLM_CALL_MAX_ATTEMPTS = _read_int_env("LLM_CALL_MAX_ATTEMPTS", 3, min_value=1)
 LLM_CALL_RETRY_BASE_SECONDS = 0.6
 # create_llm_call 级硬超时（秒）：防止供应商 SDK 在少数情况下长期阻塞导致 run 永久 running。
 LLM_CALL_HARD_TIMEOUT_SECONDS = _read_int_env("LLM_CALL_HARD_TIMEOUT_SECONDS", 30, min_value=5)
+
+
+def _coerce_positive_int(value: Any, *, default: int, min_value: int) -> int:
+    try:
+        parsed = int(float(value))
+    except Exception:
+        return int(default)
+    if parsed < int(min_value):
+        return int(min_value)
+    return int(parsed)
+
+
+def _resolve_call_budget(data: dict, *, parameters: Optional[dict]) -> tuple[int, int]:
+    """
+    解析单次 create_llm_call 的预算覆盖项：
+    - retry_max_attempts / max_attempts
+    - hard_timeout_seconds
+
+    说明：
+    - 默认沿用全局配置；
+    - 允许调用方按链路做“紧预算”覆盖（例如 ReAct 外层已经有重试时）。
+    """
+    payload = data if isinstance(data, dict) else {}
+    params = parameters if isinstance(parameters, dict) else {}
+
+    attempts_override = payload.get("retry_max_attempts")
+    if attempts_override is None:
+        attempts_override = payload.get("max_attempts")
+    if attempts_override is None:
+        attempts_override = params.get("retry_max_attempts")
+    if attempts_override is None:
+        attempts_override = params.get("max_attempts")
+
+    timeout_override = payload.get("hard_timeout_seconds")
+    if timeout_override is None:
+        timeout_override = params.get("hard_timeout_seconds")
+
+    attempts = _coerce_positive_int(
+        attempts_override,
+        default=int(LLM_CALL_MAX_ATTEMPTS),
+        min_value=1,
+    )
+    hard_timeout_seconds = _coerce_positive_int(
+        timeout_override,
+        default=int(LLM_CALL_HARD_TIMEOUT_SECONDS),
+        min_value=5,
+    )
+    return attempts, hard_timeout_seconds
 
 
 def _fetch_llm_record_by_id(conn, record_id: int):
@@ -189,6 +237,7 @@ def create_llm_call(payload: Any) -> dict:
         return {"record": llm_record_from_row(row)}
 
     parameters = data.get("parameters") if isinstance(data.get("parameters"), dict) else None
+    call_max_attempts, call_hard_timeout_seconds = _resolve_call_budget(data, parameters=parameters)
     def _should_retry_llm_error(error_text: str) -> bool:
         kind = classify_llm_error_text(error_text)
         return kind in ("rate_limit", "transient")
@@ -196,14 +245,14 @@ def create_llm_call(payload: Any) -> dict:
     response_text = None
     tokens = None
     error_message = None
-    for attempt in range(1, int(LLM_CALL_MAX_ATTEMPTS) + 1):
+    for attempt in range(1, int(call_max_attempts) + 1):
         try:
             call_result = _call_llm_with_hard_timeout(
                 prompt_text=prompt_text,
                 model=model,
                 parameters=parameters,
                 provider=provider,
-                timeout_seconds=int(LLM_CALL_HARD_TIMEOUT_SECONDS),
+                timeout_seconds=int(call_hard_timeout_seconds),
             )
             if isinstance(call_result, tuple) and len(call_result) >= 2:
                 response_text, tokens = call_result[0], call_result[1]
@@ -216,7 +265,7 @@ def create_llm_call(payload: Any) -> dict:
         except Exception as exc:
             error_message = str(exc) or ERROR_MESSAGE_LLM_CALL_FAILED
 
-        if attempt >= int(LLM_CALL_MAX_ATTEMPTS):
+        if attempt >= int(call_max_attempts):
             break
         if not _should_retry_llm_error(error_message):
             break

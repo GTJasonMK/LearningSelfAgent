@@ -983,6 +983,68 @@ def _select_relevant_graph_nodes(message: str, model: str, parameters: Optional[
     return _load_graph_nodes_by_ids(selected_ids)
 
 
+def _looks_like_user_private_requirement(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    markers = (
+        "api key",
+        "apikey",
+        "token",
+        "cookie",
+        "password",
+        "账号",
+        "密码",
+        "凭证",
+        "授权",
+        "私有",
+        "本地文件",
+        "本地路径",
+        "上传",
+        "数据库连接",
+        "仓库权限",
+        "ssh",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _looks_like_autonomous_research_task(message: str) -> bool:
+    text = str(message or "")
+    lowered = text.lower()
+    if not lowered.strip():
+        return False
+    # 显式本地路径/文件依赖不属于“可自主外部搜索完成”的任务。
+    if re.search(r"[A-Za-z]:[\/]|/mnt/[a-z]/|\.(csv|xlsx|json|txt|md|docx?)\b", text, re.IGNORECASE):
+        return False
+    verbs = (
+        "搜索", "查找", "收集", "抓取", "爬取", "调研", "统计", "汇总", "整理", "分析",
+        "search", "find", "collect", "fetch", "crawl", "scrape", "research", "analyze",
+    )
+    subjects = (
+        "网页", "页面", "网站", "新闻", "价格", "数据", "行情", "资料", "接口", "汇率",
+        "web", "page", "site", "news", "price", "data", "market", "api",
+    )
+    has_verb = any(token in lowered for token in verbs)
+    has_subject = any(token in lowered for token in subjects)
+    return has_verb and has_subject
+
+
+def _should_force_proceed_for_autonomous_research(
+    *,
+    message: str,
+    reason: str,
+    missing_knowledge: str,
+    suggestion: str,
+) -> bool:
+    if suggestion != "ask_user":
+        return False
+    if missing_knowledge != "domain_knowledge":
+        return False
+    if _looks_like_user_private_requirement(reason) or _looks_like_user_private_requirement(message):
+        return False
+    return _looks_like_autonomous_research_task(message)
+
+
 def _assess_knowledge_sufficiency(
     message: str,
     skills: List[dict],
@@ -1079,6 +1141,21 @@ def _assess_knowledge_sufficiency(
             reason = f"{reason}（冷启动：改为先草拟技能）"
         else:
             reason = "冷启动：无可用知识，改为先草拟技能"
+
+    # 自主外部信息任务兜底：
+    # - 对“搜索/抓取/调研公开外部信息”的任务，source/frequency/output_path 等不应默认转成 ask_user；
+    # - 这类任务优先应继续规划并通过工具搜索、抓取、验证推进。
+    if (not bool(sufficient)) and _should_force_proceed_for_autonomous_research(
+        message=message,
+        reason=reason,
+        missing_knowledge=missing_knowledge,
+        suggestion=suggestion,
+    ):
+        suggestion = "proceed"
+        if reason:
+            reason = f"{reason}（外部信息任务：改为先自主搜索与验证）"
+        else:
+            reason = "外部信息任务：改为先自主搜索与验证"
 
     return KnowledgeSufficiencyResult(
         sufficient=sufficient,

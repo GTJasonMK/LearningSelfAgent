@@ -1,0 +1,8 @@
+INFO:     Started server process [32088]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:18141 (Press CTRL+C to quit)
+INFO:     127.0.0.1:56486 - "POST /api/agent/command/stream HTTP/1.1" 200 OK
+[agent.react.step_failed] task_id=1 run_id=1 step_id=1 step_order=1 action_type=tool_call code=low_relevance_candidates non_retriable=False budget_exceeded=False error=[code=low_relevance_candidates] web_fetch 候选页弱相关，未发现满足字段/时间/单位信号的来源：最近三个月黄金价格 元/克 数据 | 三个月黄金价格 元/克 三个月 CSV JSON API | 三个月黄金价格 元/克 三个月 表格 | 三个月黄金价格 元/克 三个月 | 三个月黄金价格 元/克；尝试摘要：www.macroview.club:weak:candidate_missing_required_fields | api.patientonlineportal.com:weak:candidate_missing_required_fields | cloud.tencent.com:weak:candidate_missing_required_fields | www.macroview.club:weak:candidate_missing_required_fields | www.bilibili.com:weak:candidate_missing_required_fields | www.cngold.org:weak:candidate_missing_required_fields
+[agent.react.step_failed] task_id=1 run_id=1 step_id=2 step_order=1 action_type=file_write code=file_write_placeholder_script non_retriable=False budget_exceeded=False error=[code=file_write_placeholder_script] file_write.py 拒绝写入明显占位脚本；检测到占位函数：parse_html。请先补齐可执行的真实逻辑，再把该步骤标记为完成。
+[agent.react.step_failed] task_id=1 run_id=1 step_id=4 step_order=2 action_type=file_write code=file_write_placeholder_script non_retriable=False budget_exceeded=False error=[code=file_write_placeholder_script] file_write.py 拒绝写入明显占位脚本；检测到占位标记：期望格式。请先补齐可执行的真实逻辑，再把该步骤标记为完成。

@@ -142,6 +142,24 @@ class TestActionValidatePayloadAlignment(unittest.TestCase):
         )
         self.assertIsNone(err)
 
+    def test_file_write_rejects_code_content_written_to_csv_path(self):
+        from backend.src.actions.registry import validate_action_object
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        err = validate_action_object(
+            {
+                "action": {
+                    "type": "file_write",
+                    "payload": {
+                        "path": "artifacts/gold.csv",
+                        "content": "#!/usr/bin/env python3\nimport csv\n",
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(extract_task_error_code(str(err)), "file_write_content_path_mismatch")
+
     def test_script_run_alias_accepts_structured_payload(self):
         from backend.src.actions.registry import validate_action_object
 

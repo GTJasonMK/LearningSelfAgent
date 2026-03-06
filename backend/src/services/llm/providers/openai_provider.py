@@ -78,6 +78,10 @@ class OpenAIProvider(LLMProvider):
         """
         raw = dict(parameters or {})
 
+        # 这些字段属于 Agent/调用层预算控制，不应透传给 OpenAI 兼容接口。
+        for transient_key in ("retry_max_attempts", "max_attempts", "hard_timeout_seconds", "timeout_seconds"):
+            raw.pop(transient_key, None)
+
         if raw.get("max_tokens") is None and raw.get("max_output_tokens") is not None:
             max_output_tokens = raw.pop("max_output_tokens")
             try:

@@ -15,12 +15,31 @@ from __future__ import annotations
 
 from typing import Iterable, List
 
+from backend.src.agent.runner.feedback import is_task_feedback_step_title
 from backend.src.services.llm.llm_client import sse_json
+
+
+def _is_hidden_pending_feedback_tail(item: object, *, is_last: bool) -> bool:
+    if not is_last or not isinstance(item, dict):
+        return False
+    status = str(item.get("status") or "").strip().lower()
+    if status != "pending":
+        return False
+    kind = str(item.get("kind") or "").strip().lower()
+    title = str(item.get("title") or item.get("brief") or "").strip()
+    return kind == "task_feedback" or is_task_feedback_step_title(title)
+
+
+def _public_plan_items(plan_items: List[dict]) -> List[dict]:
+    items = [dict(item) if isinstance(item, dict) else {} for item in (plan_items or [])]
+    if items and _is_hidden_pending_feedback_tail(items[-1], is_last=True):
+        return items[:-1]
+    return items
 
 
 def sse_plan(*, task_id: int, run_id: int, plan_items: List[dict]) -> str:
     """全量计划栏快照事件。"""
-    return sse_json({"type": "plan", "task_id": int(task_id), "run_id": int(run_id), "items": plan_items})
+    return sse_json({"type": "plan", "task_id": int(task_id), "run_id": int(run_id), "items": _public_plan_items(plan_items)})
 
 
 def sse_plan_delta(*, task_id: int, run_id: int, plan_items: List[dict], indices: Iterable[int]) -> str:

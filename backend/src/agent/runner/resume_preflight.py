@@ -9,6 +9,11 @@ from typing import Callable, List, Optional, Tuple
 
 from backend.src.agent.core.run_context import AgentRunContext
 from backend.src.agent.core.checkpoint_store import persist_checkpoint_async
+from backend.src.agent.runner.finalization_pipeline import (
+    check_and_report_missing_artifacts,
+    enforce_done_visible_output_contract,
+)
+from backend.src.agent.runner.plan_events import sse_plan
 from backend.src.agent.runner.run_stage import persist_run_stage
 from backend.src.common.sql import is_sqlite_locked_error, sqlite_retry_sleep_seconds
 from backend.src.common.utils import coerce_int, now_iso, parse_optional_int, parse_positive_int
@@ -27,18 +32,76 @@ from backend.src.constants import (
     STEP_STATUS_SKIPPED,
     STEP_STATUS_WAITING,
     STREAM_TAG_EXEC,
-    STREAM_TAG_FAIL,
     TASK_OUTPUT_TYPE_USER_ANSWER,
 )
 from backend.src.services.tasks.task_queries import create_task_output, mark_task_step_done, update_task
 from backend.src.services.tasks.task_run_lifecycle import (
-    check_missing_artifacts,
     enqueue_postprocess_thread,
     finalize_run_and_task_status,
 )
 
 logger = logging.getLogger(__name__)
 _RESUME_SYNC_OP_TIMEOUT_SECONDS = 3.0
+
+
+def _normalize_paused_choices(paused: object) -> List[dict]:
+    if not isinstance(paused, dict):
+        return []
+    raw_choices = paused.get("choices")
+    if not isinstance(raw_choices, list):
+        return []
+    out: List[dict] = []
+    for idx, item in enumerate(raw_choices, start=1):
+        label = ""
+        value = ""
+        if isinstance(item, dict):
+            label = str(item.get("label") or "").strip()
+            raw_value = item.get("value")
+            value = str(raw_value if raw_value is not None else label).strip()
+        elif isinstance(item, str):
+            label = str(item or "").strip()
+            value = label
+        if not label or not value:
+            continue
+        out.append({"index": int(idx), "label": label, "value": value})
+    return out
+
+
+def resolve_resume_user_input(*, user_input: str, paused: object) -> Tuple[str, Optional[dict]]:
+    """
+    统一解析 resume 用户输入：
+    - 支持编号（1/2/3）
+    - 支持按 label/value 精确匹配
+    """
+    raw = str(user_input or "").strip()
+    if not raw:
+        return "", None
+
+    choices = _normalize_paused_choices(paused)
+    if not choices:
+        return raw, None
+
+    selected_index = parse_optional_int(raw, default=None)
+    if selected_index is not None and int(selected_index) >= 1:
+        idx0 = int(selected_index) - 1
+        if 0 <= idx0 < len(choices):
+            matched = dict(choices[idx0])
+            matched["matched_by"] = "index"
+            return str(matched.get("value") or raw), matched
+
+    for item in choices:
+        if raw == str(item.get("value") or ""):
+            matched = dict(item)
+            matched["matched_by"] = "value"
+            return str(matched.get("value") or raw), matched
+
+    for item in choices:
+        if raw == str(item.get("label") or ""):
+            matched = dict(item)
+            matched["matched_by"] = "label"
+            return str(matched.get("value") or raw), matched
+
+    return raw, None
 
 
 async def _run_sync_with_timeout(
@@ -173,15 +236,32 @@ async def apply_resume_user_input(
     - 统一回写 run/task 运行中状态与 checkpoint。
     """
     created_at = now_iso()
+    raw_user_input = str(user_input or "")
+    resolved_user_input, resolved_choice = resolve_resume_user_input(
+        user_input=raw_user_input,
+        paused=paused,
+    )
     resume_step_order_value = coerce_int(resume_step_order, default=1)
     paused_step_order_value = parse_optional_int(paused_step_order, default=None)
+    if isinstance(resolved_choice, dict):
+        safe_write_debug(
+            task_id,
+            run_id,
+            message="agent.resume.user_input.choice_resolved",
+            data={
+                "raw": str(raw_user_input or ""),
+                "resolved": str(resolved_user_input or ""),
+                "choice": dict(resolved_choice),
+            },
+            level="info",
+        )
     try:
         await _run_sync_with_timeout(
             create_task_output,
             task_id=int(task_id),
             run_id=int(run_id),
             output_type=TASK_OUTPUT_TYPE_USER_ANSWER,
-            content=str(user_input or ""),
+            content=str(raw_user_input or ""),
             created_at=created_at,
         )
     except Exception as exc:
@@ -199,7 +279,12 @@ async def apply_resume_user_input(
         step_id = int(parse_positive_int(paused_step_id, default=0) or 0)
         if step_id > 0:
             result_value = json.dumps(
-                {"question": str(question or ""), "answer": str(user_input or "")},
+                {
+                    "question": str(question or ""),
+                    "answer": str(raw_user_input or ""),
+                    "resolved_answer": str(resolved_user_input or ""),
+                    "choice": dict(resolved_choice) if isinstance(resolved_choice, dict) else None,
+                },
                 ensure_ascii=False,
             )
             try:
@@ -262,7 +347,9 @@ async def apply_resume_user_input(
                 )
 
     state_obj["paused"] = None
-    state_obj["last_user_input"] = str(user_input or "")
+    state_obj["last_user_input_raw"] = str(raw_user_input or "")
+    state_obj["last_user_input"] = str(resolved_user_input or "")
+    state_obj["last_user_choice"] = dict(resolved_choice) if isinstance(resolved_choice, dict) else None
     state_obj["last_user_prompt"] = str(question or "")
     state_obj["observations"] = list(observations or [])
     state_obj["context"] = dict(context or {})
@@ -350,16 +437,7 @@ async def finalize_skip_execution_resume(
                 continue
             if item.get("status") not in {"done", "skipped"}:
                 item["status"] = "done"
-        events.append(
-            sse_json(
-                {
-                    "type": "plan",
-                    "task_id": int(task_id),
-                    "run_id": int(run_id),
-                    "items": plan_items,
-                }
-            )
-        )
+        events.append(sse_plan(task_id=int(task_id), run_id=int(run_id), plan_items=plan_items))
     events.append(sse_json({"delta": f"{STREAM_TAG_EXEC} 计划已全部完成，开始收尾…\n"}))
 
     state_obj["step_order"] = int(plan_total_steps)
@@ -386,18 +464,25 @@ async def finalize_skip_execution_resume(
             level="warning",
         )
 
-    if run_status == RUN_STATUS_DONE and plan_artifacts:
-        missing = check_missing_artifacts(artifacts=plan_artifacts, workdir=workdir)
-        if missing:
-            run_status = RUN_STATUS_FAILED
-            safe_write_debug(
-                task_id,
-                run_id,
-                message="agent.artifacts.missing",
-                data={"missing": missing},
-                level="error",
-            )
-            events.append(sse_json({"delta": f"{STREAM_TAG_FAIL} 未生成文件：{', '.join(missing)}\n"}))
+    def _collect_event(chunk: str) -> None:
+        text = str(chunk or "")
+        if text:
+            events.append(text)
+
+    run_status = await check_and_report_missing_artifacts(
+        run_status=str(run_status),
+        plan_artifacts=list(plan_artifacts or []),
+        workdir=str(workdir or ""),
+        yield_func=_collect_event,
+        task_id=int(task_id),
+        run_id=int(run_id),
+    )
+    run_status = await enforce_done_visible_output_contract(
+        run_status=str(run_status),
+        task_id=int(task_id),
+        run_id=int(run_id),
+        yield_func=_collect_event,
+    )
 
     await _run_sync_with_timeout(
         finalize_run_and_task_status,

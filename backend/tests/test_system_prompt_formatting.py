@@ -60,6 +60,32 @@ class TestSystemPromptFormatting(unittest.TestCase):
         self.assertIn("\"label\":\"快速\"", text)
         self.assertIn("\"value\":\"fast\"", text)
 
+    def test_agent_replan_prompt_template_can_format_without_keyerror(self):
+        from backend.src.constants import AGENT_REPLAN_PROMPT_TEMPLATE
+
+        text = AGENT_REPLAN_PROMPT_TEMPLATE.format(
+            message="test",
+            workdir=".",
+            agent_workspace="backend/.agent/workspace",
+            plan='["step1"]',
+            done_steps='[]',
+            error="source_http_timeout",
+            observations="- FAIL source_http_timeout",
+            recent_source_failures="(无)",
+            real_sample_status="- sample_available=no",
+            recent_step_feedback="(无)",
+            retry_requirements="(无)",
+            failure_guidance="(无)",
+            tools="(无)",
+            skills="(无)",
+            solutions="(无)",
+            memories="(无)",
+            graph="(无)",
+            action_types_line="tool_call,task_output",
+        )
+        self.assertIn("最近步骤反馈", text)
+        self.assertIn("当前重试约束", text)
+
 
 if __name__ == "__main__":
     unittest.main()

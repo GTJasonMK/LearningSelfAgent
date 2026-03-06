@@ -60,6 +60,32 @@ class TestLlmCallsRetry(unittest.TestCase):
         self.assertEqual(str(result["record"].get("status") or ""), "error")
         self.assertIn("timeout", str(result["record"].get("error") or "").lower())
 
+    def test_retry_budget_override_limits_attempts(self):
+        from backend.src.services.llm.llm_calls import create_llm_call
+
+        attempts = {"count": 0}
+
+        def fake_call_llm(prompt: str, model: str, parameters: dict, provider: str = ""):
+            _ = prompt, model, parameters, provider
+            attempts["count"] += 1
+            raise Exception("connection reset by peer")
+
+        with patch("backend.src.services.llm.llm_calls.call_llm", side_effect=fake_call_llm), patch(
+            "backend.src.services.llm.llm_calls.time.sleep", return_value=None
+        ):
+            result = create_llm_call(
+                {
+                    "prompt": "hello",
+                    "provider": "openai",
+                    "model": "deepseek-chat",
+                    "retry_max_attempts": 1,
+                }
+            )
+
+        self.assertEqual(attempts["count"], 1)
+        self.assertEqual(str(result["record"].get("status") or ""), "error")
+        self.assertIn("connection reset", str(result["record"].get("error") or "").lower())
+
 
 if __name__ == "__main__":
     unittest.main()

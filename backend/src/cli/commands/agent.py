@@ -17,7 +17,10 @@ from backend.src.cli.output import (
     console,
     print_error,
 )
-from backend.src.cli.commands.stream_session import run_stream_session
+from backend.src.cli.commands.stream_session import (
+    resolve_terminal_run_status,
+    run_stream_session,
+)
 
 
 def _parse_json_option(raw: str | None, option_name: str) -> dict | None:
@@ -90,8 +93,11 @@ def ask(
         )
         # 流结束后换行
         console.print()
-        if result.seen_error:
+        terminal_status = resolve_terminal_run_status(result)
+        if terminal_status in {"failed", "stopped", "cancelled"}:
             sys.exit(1)
+        if terminal_status == "waiting":
+            return
         if not result.seen_done:
             print_error("流式请求已结束，但未收到 done/stream_end 事件（执行状态不可信）")
             sys.exit(1)
@@ -136,8 +142,11 @@ def resume(
             enable_agent_replay=True,
         )
         console.print()
-        if result.seen_error:
+        terminal_status = resolve_terminal_run_status(result)
+        if terminal_status in {"failed", "stopped", "cancelled"}:
             sys.exit(1)
+        if terminal_status == "waiting":
+            return
         if not result.seen_done:
             print_error("恢复流已结束，但未收到 done/stream_end 事件（执行状态不可信）")
             sys.exit(1)

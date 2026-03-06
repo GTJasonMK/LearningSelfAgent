@@ -62,6 +62,60 @@ class TestPlanScriptFileWriteReorder(unittest.TestCase):
         self.assertEqual(new_allows[1], ["file_write"])
 
 
+    def test_reorder_does_not_move_late_parser_script_when_bootstrap_script_already_exists(self):
+        from backend.src.agent.plan_utils import reorder_script_file_writes_before_exec_steps
+
+        titles = [
+            "file_write:backend/.agent/workspace/fetch.py 写入",
+            "shell_command:执行抓取脚本获取样本",
+            "file_write:backend/.agent/workspace/parse.py 写入",
+            "shell_command:执行解析脚本",
+            "task_output:输出",
+        ]
+        briefs = ["写抓取", "取样本", "写解析", "执行解析", "输出"]
+        allows = [
+            ["file_write"],
+            ["shell_command"],
+            ["file_write"],
+            ["shell_command"],
+            ["task_output"],
+        ]
+
+        new_titles, new_briefs, new_allows, moved = reorder_script_file_writes_before_exec_steps(
+            titles=titles,
+            briefs=briefs,
+            allows=allows,
+        )
+        self.assertEqual(moved, 0)
+        self.assertEqual(new_titles, titles)
+        self.assertEqual(new_briefs, briefs)
+        self.assertEqual(new_allows, allows)
+
+    def test_reorder_does_not_move_parser_script_before_source_discovery(self):
+        from backend.src.agent.plan_utils import reorder_script_file_writes_before_exec_steps
+
+        titles = [
+            "tool_call:web_fetch 发现来源",
+            "file_write:backend/.agent/workspace/parse_gold.py 写入",
+            "http_request:抓取已发现来源",
+            "shell_command:执行解析脚本",
+            "task_output:输出",
+        ]
+        briefs = ["发现来源", "写解析", "抓取来源", "执行解析", "输出"]
+        allows = [["tool_call"], ["file_write"], ["http_request"], ["shell_command"], ["task_output"]]
+
+        new_titles, new_briefs, new_allows, moved = reorder_script_file_writes_before_exec_steps(
+            titles=titles,
+            briefs=briefs,
+            allows=allows,
+        )
+        self.assertEqual(moved, 0)
+        self.assertEqual(new_titles, titles)
+        self.assertEqual(new_briefs, briefs)
+        self.assertEqual(new_allows, allows)
+
+
+
 if __name__ == "__main__":
     unittest.main()
 

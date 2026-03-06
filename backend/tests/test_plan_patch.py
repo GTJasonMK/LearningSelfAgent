@@ -206,6 +206,46 @@ class TestPlanPatch(unittest.TestCase):
         self.assertEqual(plan_allows[1], ["file_write"])
         self.assertEqual(plan_allows[2], ["shell_command"])
 
+    def test_apply_next_step_patch_does_not_move_parser_script_before_tool_call(self):
+        from backend.src.agent.support import apply_next_step_patch
+
+        plan_titles = ["步骤1", "task_output:输出结果"]
+        plan_items = [
+            {"id": 1, "brief": "一", "status": "pending"},
+            {"id": 2, "brief": "输出", "status": "pending"},
+        ]
+        plan_allows = [["llm_call"], ["task_output"]]
+        plan_artifacts = []
+
+        err = apply_next_step_patch(
+            current_step_index=1,
+            patch_obj={
+                "step_index": 2,
+                "insert_steps": [
+                    {"title": "tool_call:web_fetch 继续发现来源", "brief": "找源", "allow": ["tool_call"]},
+                    {
+                        "title": "shell_command:执行解析脚本",
+                        "brief": "解析",
+                        "allow": ["shell_command"],
+                    },
+                    {
+                        "title": "file_write:backend/.agent/workspace/parse_gold.py",
+                        "brief": "写解析",
+                        "allow": ["file_write"],
+                    },
+                ],
+            },
+            plan_titles=plan_titles,
+            plan_items=plan_items,
+            plan_allows=plan_allows,
+            plan_artifacts=plan_artifacts,
+        )
+
+        self.assertIsNone(err)
+        self.assertEqual(plan_titles[1], "tool_call:web_fetch 继续发现来源")
+        self.assertEqual(plan_titles[2], "file_write:backend/.agent/workspace/parse_gold.py")
+        self.assertEqual(plan_titles[3], "shell_command:执行解析脚本")
+
     def test_apply_next_step_patch_keeps_experiment_file_write_not_compacted(self):
         """
         回归：当 artifacts 已覆盖时，实验目录脚本 file_write 也不能被压缩移除，

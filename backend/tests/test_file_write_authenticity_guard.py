@@ -86,6 +86,23 @@ class TestFileWriteAuthenticityGuard(unittest.TestCase):
         self.assertIn("空 CSV", str(error_message))
         mocked_write.assert_not_called()
 
+    def test_rejects_python_script_content_written_to_csv_path(self):
+        from backend.src.actions.handlers.file_write import execute_file_write
+        from backend.src.common.task_error_codes import extract_task_error_code
+
+        with patch("backend.src.actions.handlers.file_write.write_text_file") as mocked_write:
+            result, error_message = execute_file_write(
+                {
+                    "path": "artifacts/business.csv",
+                    "content": "#!/usr/bin/env python3\nimport csv\n",
+                },
+                context={"enforce_csv_artifact_quality": True},
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(extract_task_error_code(str(error_message)), "file_write_content_path_mismatch")
+        mocked_write.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

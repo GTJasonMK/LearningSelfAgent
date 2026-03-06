@@ -1,0 +1,9 @@
+INFO:     Started server process [26504]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:18135 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58965 - "POST /api/agent/command/stream HTTP/1.1" 200 OK
+[agent.react.step_failed] task_id=1 run_id=1 step_id=1 step_order=1 action_type=tool_call code=low_relevance_candidates non_retriable=False budget_exceeded=False error=[code=low_relevance_candidates] web_fetch 候选页弱相关，未发现满足字段/时间/单位信号的来源：黄金价格 元/克 最近三个月 | 黄金 价格 元/克 人民币/克 日度 daily | 黄金 价格 元/克 人民币/克 日度 daily 表格 | 黄金 价格 元/克 人民币/克 日度 daily CSV JSON API | 黄金 价格 元/克 人民币/克 历史 | gold price cny gram historical daily table c…；尝试摘要：finance.sina.com.cn:weak:candidate_missing_required_fields | gold.cnfol.com:weak:candidate_missing_required_fields | gold.cnfol.com:weak:candidate_missing_required_fields | k.sina.com.cn:weak:candidate_missing_required_fields | finance.sina.com.cn:weak:candidate_missing_required_fields | www.163.com:weak:candidate_missing_required_fields
+[agent.react.step_failed] task_id=1 run_id=1 step_id=4 step_order=3 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=命令执行失败:ERROR: 未解析出任何价格数据
+[agent.react.step_failed] task_id=1 run_id=1 step_id=7 step_order=5 action_type=shell_command code=step_failed non_retriable=False budget_exceeded=False error=命令执行失败:ERROR: 未解析出任何价格数据
+[agent.react.step_failed] task_id=1 run_id=1 step_id=10 step_order=8 action_type=file_write code=csv_artifact_quality_failed non_retriable=False budget_exceeded=False error=[code=csv_artifact_quality_failed] file_write.csv 缺少可解析的数值行：请先完成真实数据抓取/换算，再写入结果文件。

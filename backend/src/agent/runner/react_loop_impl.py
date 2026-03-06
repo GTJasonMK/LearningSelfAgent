@@ -9,6 +9,8 @@ ReAct 执行循环核心实现。
 """
 
 import json
+import os
+import queue
 from dataclasses import dataclass
 from typing import Callable, Dict, Generator, List, Optional, Tuple
 
@@ -18,10 +20,12 @@ from backend.src.agent.support import (
 )
 from backend.src.agent.core.plan_structure import PlanStructure
 from backend.src.agent.runner.react_helpers import (
+    build_execution_constraints_hint,
     build_react_step_prompt,
     call_llm_for_text,
     resolve_direct_user_prompt_payload,
     validate_and_normalize_action_text,
+    validate_runtime_action_contracts,
 )
 from backend.src.agent.runner.capability_router import build_capability_hint, resolve_step_capability
 from backend.src.agent.runner.feedback import is_task_feedback_step_title
@@ -38,20 +42,36 @@ from backend.src.agent.runner.react_state_manager import (
     resolve_executor,
 )
 from backend.src.agent.runner.react_step_executor import (
-    generate_action_with_retry,
     build_observation_line,
+    build_step_progress_payload,
+    build_step_warning_payload,
+    generate_action_with_retry,
     handle_user_prompt_action,
     handle_task_output_fallback,
+    run_blocking_call_with_progress,
     yield_memory_write_event,
     yield_visible_result,
 )
 from backend.src.agent.runner.react_error_handler import (
+    clear_failure_streak,
     handle_action_invalid,
     handle_allow_failure,
     handle_step_failure,
 )
+from backend.src.agent.runner.retry_policy import maybe_enforce_retry_change
+from backend.src.agent.runner.step_feedback import (
+    build_step_feedback,
+    register_step_feedback,
+    summarize_failure_guidance_for_prompt,
+    summarize_recent_step_feedback_for_prompt,
+    summarize_retry_requirements_for_prompt,
+)
+from backend.src.agent.runner.attempt_controller import (
+    ensure_strategy_state,
+    update_progress_state,
+)
 from backend.src.agent.source_failure_summary import summarize_recent_source_failures_for_prompt
-from backend.src.common.utils import now_iso
+from backend.src.common.utils import coerce_int, now_iso
 from backend.src.constants import (
     ACTION_TYPE_MEMORY_WRITE,
     ACTION_TYPE_TASK_OUTPUT,
@@ -75,12 +95,53 @@ from backend.src.services.tasks.task_queries import (
     mark_task_step_failed,
 )
 
+
+def _read_int_env(name: str, default: int, *, min_value: int = 1) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(float(raw))
+    except Exception:
+        return int(default)
+    if value < int(min_value):
+        return int(min_value)
+    return int(value)
+
+
+REACT_LLM_INNER_RETRY_MAX_ATTEMPTS = _read_int_env(
+    "AGENT_REACT_LLM_INNER_RETRY_MAX_ATTEMPTS",
+    1,
+    min_value=1,
+)
+REACT_LLM_INNER_HARD_TIMEOUT_SECONDS = _read_int_env(
+    "AGENT_REACT_LLM_INNER_HARD_TIMEOUT_SECONDS",
+    45,
+    min_value=5,
+)
+REACT_OBSERVATION_PROMPT_MAX_CHARS = _read_int_env(
+    "AGENT_REACT_OBSERVATION_PROMPT_MAX_CHARS",
+    1200,
+    min_value=200,
+)
+
+
 @dataclass
 class ReactLoopResult:
     """ReAct 循环执行结果。"""
     run_status: str
     last_step_order: int
     plan_struct: Optional[PlanStructure] = None
+
+
+def _compact_observation_for_prompt(text: str) -> str:
+    value = _truncate_observation(str(text or ""))
+    if not value:
+        return ""
+    max_chars = int(REACT_OBSERVATION_PROMPT_MAX_CHARS)
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "..."
 
 
 def _enforce_allow_constraints(
@@ -129,6 +190,8 @@ def _enforce_allow_constraints(
             "step_order": int(step_order),
             "allow": allowed_text,
         },
+        retry_max_attempts=int(REACT_LLM_INNER_RETRY_MAX_ATTEMPTS),
+        hard_timeout_seconds=int(REACT_LLM_INNER_HARD_TIMEOUT_SECONDS),
     )
 
     forced_obj, forced_type, forced_payload, forced_validate_error = validate_and_normalize_action_text(
@@ -223,6 +286,24 @@ def run_react_loop_impl(
     max_steps_limit = None
 
     idx = start - 1
+
+    # 运行级策略/进展初始化（用于“重试必须有变化”的可观测收敛）。
+    yield sse_json(
+        ensure_strategy_state(
+            agent_state=agent_state,
+            plan_struct=plan_struct,
+            reason="run_start",
+        )
+    )
+    yield sse_json(
+        update_progress_state(
+            agent_state=agent_state,
+            plan_struct=plan_struct,
+            context=context,
+            reason="run_start",
+            step_order=start,
+        )
+    )
 
     # 主循环
     while idx < plan_struct.step_count:
@@ -404,7 +485,15 @@ def run_react_loop_impl(
             idx += 1
             continue
 
-        obs_text = "\n".join(f"- {_truncate_observation(o)}" for o in observations[-3:]) or "(无)"
+        retry_strategy_event = maybe_enforce_retry_change(
+            agent_state=agent_state,
+            plan_struct=plan_struct,
+            step_order=step_order,
+        )
+        if retry_strategy_event:
+            yield sse_json(retry_strategy_event)
+
+        obs_text = "\n".join(f"- {_compact_observation_for_prompt(o)}" for o in observations[-2:]) or "(无)"
         source_failure_summary = summarize_recent_source_failures_for_prompt(
             observations=list(observations or []),
             failure_signatures=(
@@ -415,6 +504,12 @@ def run_react_loop_impl(
         )
 
         budget_meta: dict = {}
+        execution_hint = build_execution_constraints_hint(
+            agent_state=agent_state,
+            step_order=step_order,
+        )
+        latest_parse_input_text = str((context or {}).get("latest_parse_input_text") or "").strip()
+        latest_external_url = str((context or {}).get("latest_external_url") or "").strip()
         react_prompt = build_react_step_prompt(
             now_utc=now_iso(),
             workdir=workdir,
@@ -429,29 +524,58 @@ def run_react_loop_impl(
             tools=tools_hint,
             skills=skills_hint,
             memories=memories_hint,
+            latest_parse_input_text=latest_parse_input_text,
+            latest_external_url=latest_external_url,
             capability_hint=build_capability_hint(
                 capability=resolve_step_capability(
                     allowed_actions=list(allowed or []),
                     step_title=title,
                 )
             ),
+            execution_hint=execution_hint,
             budget_meta_sink=budget_meta,
+            recent_step_feedback=summarize_recent_step_feedback_for_prompt(agent_state),
+            retry_requirements=summarize_retry_requirements_for_prompt(agent_state),
+            failure_guidance=summarize_failure_guidance_for_prompt(agent_state),
         )
         if isinstance(agent_state, dict):
             agent_state["context_budget_last_meta"] = dict(budget_meta or {})
 
         # 生成 action
-        action_obj, action_type, payload_obj, action_validate_error, last_action_text = generate_action_with_retry(
-            llm_call=llm_call,
-            react_prompt=react_prompt,
-            task_id=task_id,
-            run_id=run_id,
-            step_order=step_order,
-            step_title=title,
-            workdir=workdir,
-            model=step_model,
-            react_params=step_react_params,
-            variables_source=variables_source,
+        action_obj, action_type, payload_obj, action_validate_error, last_action_text = yield from run_blocking_call_with_progress(
+            func=lambda: generate_action_with_retry(
+                llm_call=llm_call,
+                react_prompt=react_prompt,
+                task_id=task_id,
+                run_id=run_id,
+                step_order=step_order,
+                step_title=title,
+                workdir=workdir,
+                model=step_model,
+                react_params=step_react_params,
+                variables_source=variables_source,
+                allowed_actions_text=allowed_text,
+            ),
+            start_payload=build_step_progress_payload(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                step_order=int(step_order),
+                title=str(title or ""),
+                phase="action_generation",
+                status="start",
+                message="正在生成当前步骤动作",
+            ),
+            progress_payload_builder=lambda elapsed_ms, tick: build_step_progress_payload(
+                task_id=int(task_id),
+                run_id=int(run_id),
+                step_order=int(step_order),
+                title=str(title or ""),
+                phase="action_generation",
+                status="running",
+                message="动作生成仍在进行",
+                elapsed_ms=elapsed_ms,
+                tick=tick,
+            ),
         )
 
         # 处理 action 验证失败
@@ -479,6 +603,15 @@ def run_react_loop_impl(
                 max_steps_limit=max_steps_limit,
                 run_replan_and_merge=run_replan_and_merge,
                 safe_write_debug=_safe_write_debug,
+            )
+            yield sse_json(
+                update_progress_state(
+                    agent_state=agent_state,
+                    plan_struct=plan_struct,
+                    context=context,
+                    reason="action_invalid",
+                    step_order=step_order,
+                )
             )
             if status:
                 run_status = status
@@ -508,6 +641,57 @@ def run_react_loop_impl(
             llm_call=llm_call,
         )
 
+        runtime_contract_error = validate_runtime_action_contracts(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            step_title=title,
+            action_type=str(action_type or ""),
+            payload_obj=payload_obj if isinstance(payload_obj, dict) else {},
+            workdir=workdir,
+        )
+        if runtime_contract_error:
+            status, next_idx = yield from handle_action_invalid(
+                task_id=task_id,
+                run_id=run_id,
+                step_order=step_order,
+                idx=idx,
+                title=title,
+                message=message,
+                workdir=workdir,
+                model=step_model,
+                react_params=step_react_params,
+                tools_hint=tools_hint,
+                skills_hint=skills_hint,
+                memories_hint=memories_hint,
+                graph_hint=graph_hint,
+                action_validate_error=runtime_contract_error,
+                last_action_text=last_action_text,
+                plan_struct=plan_struct,
+                agent_state=agent_state,
+                context=context,
+                observations=observations,
+                max_steps_limit=max_steps_limit,
+                run_replan_and_merge=run_replan_and_merge,
+                safe_write_debug=_safe_write_debug,
+            )
+            yield sse_json(
+                update_progress_state(
+                    agent_state=agent_state,
+                    plan_struct=plan_struct,
+                    context=context,
+                    reason="action_runtime_contract_invalid",
+                    step_order=step_order,
+                )
+            )
+            if status:
+                run_status = status
+                break
+            if next_idx is not None:
+                idx = next_idx
+                continue
+            idx += 1
+            continue
+
         if allow_err or not action_obj or not action_type:
             status, next_idx = yield from handle_allow_failure(
                 task_id=task_id,
@@ -531,6 +715,15 @@ def run_react_loop_impl(
                 max_steps_limit=max_steps_limit,
                 run_replan_and_merge=run_replan_and_merge,
                 safe_write_debug=_safe_write_debug,
+            )
+            yield sse_json(
+                update_progress_state(
+                    agent_state=agent_state,
+                    plan_struct=plan_struct,
+                    context=context,
+                    reason="allow_failed",
+                    step_order=step_order,
+                )
             )
             if status:
                 run_status = status
@@ -702,7 +895,68 @@ def run_react_loop_impl(
             break
 
         step_row = {"id": step_id, "title": title, "detail": detail}
-        result, step_error = execute_step_action(int(task_id), int(run_id), step_row, context=context)
+        step_event_queue: "queue.Queue[dict]" = queue.Queue()
+        step_context = context if isinstance(context, dict) else {}
+        injected_context = {
+            "event_sink": lambda payload: step_event_queue.put(dict(payload or {})),
+            "task_id": int(task_id),
+            "run_id": int(run_id),
+            "step_id": int(step_id),
+            "step_order": int(step_order),
+            "step_title": str(title or ""),
+            "model": str(step_model or model or ""),
+        }
+        sentinel = object()
+        previous_context_values = {
+            key: step_context[key] if key in step_context else sentinel
+            for key in injected_context.keys()
+        }
+        step_context.update(injected_context)
+
+        def _drain_step_events() -> List[dict]:
+            items: List[dict] = []
+            while True:
+                try:
+                    payload = step_event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(payload, dict) and payload:
+                    items.append(payload)
+            return items
+
+        try:
+            result, step_error = yield from run_blocking_call_with_progress(
+                func=lambda: execute_step_action(int(task_id), int(run_id), step_row, context=step_context),
+                start_payload=build_step_progress_payload(
+                    task_id=int(task_id),
+                    run_id=int(run_id),
+                    step_order=int(step_order),
+                    title=str(title or ""),
+                    phase="action_execution",
+                    status="start",
+                    action_type=str(action_type or ""),
+                    message=f"正在执行 {str(action_type or '') or 'step'}",
+                ),
+                progress_payload_builder=lambda elapsed_ms, tick: build_step_progress_payload(
+                    task_id=int(task_id),
+                    run_id=int(run_id),
+                    step_order=int(step_order),
+                    title=str(title or ""),
+                    phase="action_execution",
+                    status="running",
+                    action_type=str(action_type or ""),
+                    message=f"{str(action_type or '') or 'step'} 执行中",
+                    elapsed_ms=elapsed_ms,
+                    tick=tick,
+                ),
+                drain_events=_drain_step_events,
+            )
+        finally:
+            for key, previous in previous_context_values.items():
+                if previous is sentinel:
+                    step_context.pop(key, None)
+                else:
+                    step_context[key] = previous
         finished_at = now_iso()
 
         if _is_run_stopped(run_id=int(run_id)):
@@ -734,6 +988,7 @@ def run_react_loop_impl(
                 memories_hint=memories_hint,
                 graph_hint=graph_hint,
                 action_type=action_type,
+                step_detail=detail,
                 step_error=step_error,
                 plan_struct=plan_struct,
                 agent_state=agent_state,
@@ -744,6 +999,15 @@ def run_react_loop_impl(
                 safe_write_debug=_safe_write_debug,
                 mark_task_step_failed=mark_task_step_failed,
                 finished_at=finished_at,
+            )
+            yield sse_json(
+                update_progress_state(
+                    agent_state=agent_state,
+                    plan_struct=plan_struct,
+                    context=context,
+                    reason="step_failed",
+                    step_order=step_order,
+                )
             )
             if status:
                 run_status = status
@@ -768,6 +1032,9 @@ def run_react_loop_impl(
             finished_at=finished_at,
         )
 
+        # 成功后清空失败连击：失败预算应表达“连续失败”，不应跨成功步骤累积。
+        clear_failure_streak(agent_state)
+
         yield sse_json({"delta": f"{STREAM_TAG_OK} {title}\n"})
 
         # 构建观测
@@ -778,6 +1045,36 @@ def run_react_loop_impl(
             context=context,
         )
         observations.append(obs_line)
+
+        feedback = build_step_feedback(
+            message=message,
+            step_order=int(step_order),
+            title=str(title or ""),
+            action_type=str(action_type or ""),
+            status="success",
+            result=result if isinstance(result, dict) else None,
+            visible_content=str(visible_content or ""),
+            context=context,
+            strategy_fingerprint=str(agent_state.get("strategy_fingerprint") or ""),
+            attempt_index=int(coerce_int(agent_state.get("attempt_index"), default=0)),
+            previous_goal_progress_score=coerce_int(
+                ((agent_state.get("goal_progress") if isinstance(agent_state.get("goal_progress"), dict) else {}) or {}).get("score"),
+                default=0,
+            ),
+        )
+        register_step_feedback(agent_state, feedback)
+
+        warning_payload = build_step_warning_payload(
+            task_id=int(task_id),
+            run_id=int(run_id),
+            step_id=int(step_id),
+            step_order=int(step_order),
+            title=str(title or ""),
+            action_type=str(action_type or ""),
+            result=result if isinstance(result, dict) else None,
+        )
+        if warning_payload:
+            yield sse_json(warning_payload)
 
         # 特殊输出处理
         if visible_content:
@@ -803,6 +1100,16 @@ def run_react_loop_impl(
             where="after_step",
             # 步骤结算必须落盘：避免节流吞掉 done/failed 状态，影响可恢复性。
             force=True,
+        )
+
+        yield sse_json(
+            update_progress_state(
+                agent_state=agent_state,
+                plan_struct=plan_struct,
+                context=context,
+                reason="step_done",
+                step_order=step_order,
+            )
         )
 
         idx += 1
